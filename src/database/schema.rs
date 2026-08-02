@@ -7,7 +7,7 @@ use futures::{stream, StreamExt, TryStreamExt};
 use lancedb::connection::Connection;
 use lancedb::index::{scalar::BTreeIndexBuilder, scalar::FtsIndexBuilder, Index as LanceIndex};
 use lancedb::query::{ExecutableQuery, QueryBase};
-use lancedb::table::OptimizeAction;
+use lancedb::table::{OptimizeAction, OptimizeOptions};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -1018,12 +1018,32 @@ impl SchemaManager {
             }
         }
 
+        use lancedb::index::IndexType;
+
         let table = self.connection.open_table("lore").execute().await?;
+        let fts_index_names: Vec<String> = table
+            .list_indices()
+            .await?
+            .into_iter()
+            .filter(|index| index.index_type == IndexType::FTS)
+            .map(|index| index.name)
+            .collect();
+
+        if fts_index_names.is_empty() {
+            tracing::warn!("Skipping lore FTS optimization: no FTS indices found");
+            return Ok(());
+        }
+
         let start_time = std::time::Instant::now();
 
-        tracing::info!("Optimizing lore FTS indices (incremental merge)...");
+        tracing::info!(
+            "Optimizing {} lore FTS indices (incremental merge)...",
+            fts_index_names.len()
+        );
         table
-            .optimize(OptimizeAction::Index(Default::default()))
+            .optimize(OptimizeAction::Index(
+                OptimizeOptions::new().index_names(fts_index_names),
+            ))
             .await?;
 
         let elapsed = start_time.elapsed();
