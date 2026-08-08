@@ -911,43 +911,7 @@ impl TreeSitterAnalyzer {
         function_start_line: u32,
         comments: &[(u32, u32, String)],
     ) -> String {
-        // Find top-of-function comments (comments immediately before the function)
-        let mut top_comments = Vec::new();
-        let mut current_line = function_start_line.saturating_sub(1);
-
-        // Work backwards to find contiguous comments before the function
-        for comment in comments.iter().rev() {
-            let (comment_start_line, comment_end_line, comment_text) = comment;
-
-            // Check if this comment is immediately before the current line we're looking at
-            if *comment_end_line == current_line || (*comment_end_line + 1) == current_line {
-                // Check if the line between comment and function contains only whitespace
-                let lines: Vec<&str> = source.lines().collect();
-                let mut has_non_whitespace = false;
-
-                for line_idx in *comment_end_line as usize..function_start_line as usize - 1 {
-                    if line_idx < lines.len() && !lines[line_idx].trim().is_empty() {
-                        // Stop if we hit a non-comment, non-whitespace line (like #include)
-                        if !lines[line_idx].trim_start().starts_with("//")
-                            && !lines[line_idx].trim_start().starts_with("/*")
-                            && !lines[line_idx].trim_start().starts_with("*")
-                        {
-                            has_non_whitespace = true;
-                            break;
-                        }
-                    }
-                }
-
-                if !has_non_whitespace {
-                    top_comments.insert(0, comment_text.clone());
-                    current_line = comment_start_line.saturating_sub(1);
-                } else {
-                    break;
-                }
-            } else if *comment_end_line < current_line {
-                break;
-            }
-        }
+        let top_comments = collect_leading_comments(source, function_start_line, comments);
 
         // Get the complete function text (including the function body)
         let function_text = &source[function_start_byte..function_end_byte];
@@ -1185,43 +1149,7 @@ impl TreeSitterAnalyzer {
         type_start_line: u32,
         comments: &[(u32, u32, String)],
     ) -> String {
-        // Find top-of-type comments (comments immediately before the type definition)
-        let mut top_comments = Vec::new();
-        let mut current_line = type_start_line.saturating_sub(1);
-
-        // Work backwards to find contiguous comments before the type
-        for comment in comments.iter().rev() {
-            let (comment_start_line, comment_end_line, comment_text) = comment;
-
-            // Check if this comment is immediately before the current line we're looking at
-            if *comment_end_line == current_line || (*comment_end_line + 1) == current_line {
-                // Check if the line between comment and type contains only whitespace
-                let lines: Vec<&str> = source.lines().collect();
-                let mut has_non_whitespace = false;
-
-                for line_idx in *comment_end_line as usize..type_start_line as usize - 1 {
-                    if line_idx < lines.len() && !lines[line_idx].trim().is_empty() {
-                        // Stop if we hit a non-comment, non-whitespace line (like #include)
-                        if !lines[line_idx].trim_start().starts_with("//")
-                            && !lines[line_idx].trim_start().starts_with("/*")
-                            && !lines[line_idx].trim_start().starts_with("*")
-                        {
-                            has_non_whitespace = true;
-                            break;
-                        }
-                    }
-                }
-
-                if !has_non_whitespace {
-                    top_comments.insert(0, comment_text.clone());
-                    current_line = comment_start_line.saturating_sub(1);
-                } else {
-                    break;
-                }
-            } else if *comment_end_line < current_line {
-                break;
-            }
-        }
+        let top_comments = collect_leading_comments(source, type_start_line, comments);
 
         // Get the complete type definition text (including any internal comments)
         let type_text = &source[type_start_byte..type_end_byte];
@@ -2464,5 +2392,255 @@ impl TreeSitterAnalyzer {
         }
 
         false
+    }
+}
+
+/// Maximum number of non-blank lines allowed between a leading comment
+/// block and the entity it documents. One forward declaration is the
+/// common case; a long block of unrelated prototypes means the comment
+/// documents the block, not the definition below it.
+const MAX_INTERVENING_LINES: usize = 3;
+
+/// Collect the comment block that documents the entity starting at
+/// `start_line` (1-based), walking backwards through `comments`.
+///
+/// Shared by `extract_function_with_comments` and
+/// `extract_type_with_comments`, which previously carried two verbatim
+/// copies of this walk and therefore the same defect.
+///
+/// `comments` must be sorted ascending by start line, which
+/// `extract_comments` guarantees.
+fn collect_leading_comments(
+    source: &str,
+    start_line: u32,
+    comments: &[(u32, u32, String)],
+) -> Vec<String> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut top_comments: Vec<String> = Vec::new();
+    // Last source line that may still hold a comment for this entity.
+    let mut current_line = start_line.saturating_sub(1);
+
+    for (comment_start_line, comment_end_line, comment_text) in comments.iter().rev() {
+        // Comments at or below the entity are not leading comments.
+        if *comment_end_line > current_line {
+            continue;
+        }
+        if !gap_is_transparent(&lines, *comment_end_line, current_line) {
+            break;
+        }
+        top_comments.insert(0, comment_text.clone());
+        current_line = comment_start_line.saturating_sub(1);
+    }
+
+    top_comments
+}
+
+/// True when every line strictly after `comment_end_line` and up to and
+/// including `current_line` (both 1-based) may sit between a comment and
+/// the entity it documents without breaking the association.
+fn gap_is_transparent(lines: &[&str], comment_end_line: u32, current_line: u32) -> bool {
+    let mut non_blank = 0usize;
+    // 1-based line N is index N-1, so lines (comment_end_line, current_line]
+    // are indices comment_end_line ..= current_line - 1.
+    for idx in (comment_end_line as usize)..(current_line as usize) {
+        let Some(line) = lines.get(idx) else {
+            return false;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        non_blank += 1;
+        if non_blank > MAX_INTERVENING_LINES || !line_is_association_transparent(line) {
+            return false;
+        }
+    }
+    true
+}
+
+/// A line that does not break the association between a comment above it
+/// and a definition below it.
+///
+/// Continuation lines of the comment itself are transparent, and so is a
+/// forward declaration. The kernel routinely places a prototype between a
+/// comment and the definition it describes — `kernel/sched/fair.c` has
+/// `dequeue_throttled_task()`'s explanatory comment separated from the
+/// definition by `static void detach_task_cfs_rq(struct task_struct *p);`.
+/// Treating that prototype as an unrelated statement silently dropped the
+/// comment, which is the one artifact that says the behaviour is
+/// intentional.
+fn line_is_association_transparent(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+        return true;
+    }
+    is_forward_declaration(line.trim())
+}
+
+/// Recognise `<return type> <name>(<params>) <attrs>;` with no body.
+///
+/// Deliberately strict: one statement, no braces, no assignment, and a
+/// parameter list. That admits prototypes (including attribute-decorated
+/// ones such as `... __releases(&rq->lock);`) and rejects variable
+/// definitions, macro invocations with initialisers, and anything that
+/// opens a block.
+fn is_forward_declaration(trimmed: &str) -> bool {
+    let Some(body) = trimmed.strip_suffix(';') else {
+        return false;
+    };
+    if body.contains('{') || body.contains('}') || body.contains(';') || body.contains('=') {
+        return false;
+    }
+    let Some(open) = body.find('(') else {
+        return false;
+    };
+    let Some(close) = body.rfind(')') else {
+        return false;
+    };
+    if open == 0 || close <= open {
+        return false;
+    }
+
+    // A declarator-shaped statement is also how a file-scope macro
+    // expands — `static DEFINE_MUTEX(some_lock);` parses exactly like a
+    // prototype. Those define an object, so a comment above one documents
+    // the object, not whatever follows it. Two things separate them: the
+    // declared name is not SHOUTY, and a prototype has a return type in
+    // front of it.
+    let head = &body[..open];
+    let name = head
+        .rsplit(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .next()
+        .unwrap_or_default();
+    if name.is_empty() || !name.chars().any(|c| c.is_lowercase()) {
+        return false;
+    }
+    !head[..head.len() - name.len()].trim().is_empty()
+}
+
+#[cfg(test)]
+mod leading_comment_tests {
+    use super::*;
+
+    fn comment(start: u32, end: u32, text: &str) -> (u32, u32, String) {
+        (start, end, text.to_string())
+    }
+
+    #[test]
+    fn adjacent_comment_is_collected() {
+        let source = "/* doc */\nvoid f(void)\n{\n}\n";
+        let comments = vec![comment(1, 1, "/* doc */")];
+        assert_eq!(
+            collect_leading_comments(source, 2, &comments),
+            vec!["/* doc */".to_string()]
+        );
+    }
+
+    /// The kernel/sched/fair.c:6642-6651 shape: comment, forward
+    /// declaration, definition. Before the fix the prototype made the
+    /// comment unreachable.
+    #[test]
+    fn forward_declaration_between_comment_and_definition_is_transparent() {
+        let source = concat!(
+            "/*\n",
+            " * Task is throttled and someone wants to dequeue it again:\n",
+            " * ... task sched class change etc.\n",
+            " */\n",
+            "static void detach_task_cfs_rq(struct task_struct *p);\n",
+            "static void dequeue_throttled_task(struct task_struct *p, int flags)\n",
+            "{\n",
+            "}\n",
+        );
+        let doc = "/*\n * Task is throttled and someone wants to dequeue it again:\n * ... task sched class change etc.\n */";
+        let comments = vec![comment(1, 4, doc)];
+        assert_eq!(
+            collect_leading_comments(source, 6, &comments),
+            vec![doc.to_string()],
+        );
+    }
+
+    #[test]
+    fn blank_line_and_prototype_together_stay_transparent() {
+        let source = concat!(
+            "/* doc */\n",
+            "static int helper(void);\n",
+            "\n",
+            "void f(void)\n",
+            "{\n",
+            "}\n",
+        );
+        let comments = vec![comment(1, 1, "/* doc */")];
+        assert_eq!(
+            collect_leading_comments(source, 4, &comments),
+            vec!["/* doc */".to_string()]
+        );
+    }
+
+    #[test]
+    fn unrelated_statement_still_breaks_the_association() {
+        let source = concat!(
+            "/* doc for the include block */\n",
+            "#include <linux/sched.h>\n",
+            "void f(void)\n",
+            "{\n",
+            "}\n",
+        );
+        let comments = vec![comment(1, 1, "/* doc for the include block */")];
+        assert!(collect_leading_comments(source, 3, &comments).is_empty());
+    }
+
+    #[test]
+    fn variable_definition_breaks_the_association() {
+        let source = concat!(
+            "/* doc */\n",
+            "static DEFINE_MUTEX(some_lock);\n",
+            "void f(void)\n",
+            "{\n",
+            "}\n",
+        );
+        let comments = vec![comment(1, 1, "/* doc */")];
+        assert!(collect_leading_comments(source, 3, &comments).is_empty());
+    }
+
+    #[test]
+    fn a_long_block_of_prototypes_breaks_the_association() {
+        let source = concat!(
+            "/* doc for the whole group */\n",
+            "static void a(void);\n",
+            "static void b(void);\n",
+            "static void c(void);\n",
+            "static void d(void);\n",
+            "void f(void)\n",
+            "{\n",
+            "}\n",
+        );
+        let comments = vec![comment(1, 1, "/* doc for the whole group */")];
+        assert!(collect_leading_comments(source, 6, &comments).is_empty());
+    }
+
+    #[test]
+    fn stacked_comment_blocks_are_collected_in_order() {
+        let source = "/* first */\n/* second */\nvoid f(void)\n{\n}\n";
+        let comments = vec![comment(1, 1, "/* first */"), comment(2, 2, "/* second */")];
+        assert_eq!(
+            collect_leading_comments(source, 3, &comments),
+            vec!["/* first */".to_string(), "/* second */".to_string()]
+        );
+    }
+
+    #[test]
+    fn comments_below_the_entity_are_ignored() {
+        let source = "void f(void)\n{\n}\n/* trailing */\n";
+        let comments = vec![comment(4, 4, "/* trailing */")];
+        assert!(collect_leading_comments(source, 1, &comments).is_empty());
+    }
+
+    #[test]
+    fn attribute_decorated_prototype_is_a_forward_declaration() {
+        assert!(is_forward_declaration(
+            "static void f(struct rq *rq) __releases(rq->lock);"
+        ));
+        assert!(!is_forward_declaration("static int x = f(1);"));
+        assert!(!is_forward_declaration("void f(void) { }"));
+        assert!(!is_forward_declaration("static int counter;"));
     }
 }
