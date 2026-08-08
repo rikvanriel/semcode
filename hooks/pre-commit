@@ -5,6 +5,16 @@
 # This hook checks if the code is properly formatted, compiles, and all tests pass
 # before allowing a commit. If any check fails, it will fail with a helpful message.
 
+# Git exports the repository it is committing to through the
+# environment -- GIT_INDEX_FILE points at .git/next-index-<pid>.lock
+# while the commit is in flight. Any `git` a test spawns inside its own
+# temporary repository inherits that and fails with "An IO error
+# occurred while opening the index", so the whole suite looked broken
+# when run from this hook and passed when run by hand. Drop the
+# repository-location variables before invoking cargo.
+unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE GIT_PREFIX \
+      GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR
+
 # Colors
 GREEN='\033[0;32m'
 RED='\033[0;31m'
