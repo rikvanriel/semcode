@@ -144,6 +144,9 @@ pub enum DispatchKind {
     PointerLocal,
     /// `fp(...)` where `fp` is a function-pointer parameter
     PointerParam,
+    /// A candidate the source itself names, as the kernel's INDIRECT_CALL_n
+    /// macros do to help the branch predictor.
+    MacroDeclared,
 }
 
 impl DispatchKind {
@@ -154,6 +157,7 @@ impl DispatchKind {
             DispatchKind::PointerDeref => "pointer_deref",
             DispatchKind::PointerLocal => "pointer_local",
             DispatchKind::PointerParam => "pointer_param",
+            DispatchKind::MacroDeclared => "macro_declared",
         }
     }
 
@@ -167,6 +171,7 @@ impl DispatchKind {
             "pointer_deref" => Some(DispatchKind::PointerDeref),
             "pointer_local" => Some(DispatchKind::PointerLocal),
             "pointer_param" => Some(DispatchKind::PointerParam),
+            "macro_declared" => Some(DispatchKind::MacroDeclared),
             _ => None,
         }
     }

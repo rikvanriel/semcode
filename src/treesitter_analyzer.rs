@@ -295,6 +295,12 @@ impl TreeSitterAnalyzer {
                     (pointer_expression argument: (_) @pointer_expr)
                 )
             ) @deref_call
+
+
+            (call_expression
+                function: (identifier) @macro_name
+                arguments: (argument_list) @macro_args
+            ) @macro_call
         "#,
         )?;
 
@@ -699,6 +705,8 @@ impl TreeSitterAnalyzer {
         while let Some(call_match) = matches.next() {
             let mut member: Option<tree_sitter::Node> = None;
             let mut receiver: Option<tree_sitter::Node> = None;
+            let mut macro_name: Option<tree_sitter::Node> = None;
+            let mut macro_args: Option<tree_sitter::Node> = None;
 
             for capture in call_match.captures {
                 match queries.call_query.capture_names()[capture.index as usize] {
@@ -710,6 +718,8 @@ impl TreeSitterAnalyzer {
                     }
                     "member_name" => member = Some(capture.node),
                     "receiver" => receiver = Some(capture.node),
+                    "macro_name" => macro_name = Some(capture.node),
+                    "macro_args" => macro_args = Some(capture.node),
                     "pointer_expr" => {
                         // `(*fp)(...)`: a call through a pointer value, which
                         // the plain call pattern does not match at all.
@@ -726,6 +736,19 @@ impl TreeSitterAnalyzer {
                         }
                     }
                     _ => {}
+                }
+            }
+
+            // An indirect-call macro names the targets it expects, which is
+            // the one place the source states the answer outright.
+            if let (Some(name), Some(args)) = (macro_name, macro_args) {
+                let name = &source_code[name.byte_range()];
+                if let Some(candidates) = Self::indirect_call_candidate_count(name) {
+                    extraction.member_sites.extend(Self::indirect_call_sites(
+                        args,
+                        source_code,
+                        candidates,
+                    ));
                 }
             }
 
@@ -835,6 +858,68 @@ impl TreeSitterAnalyzer {
                 None => return false,
             }
         }
+    }
+
+    /// How many candidates an indirect-call macro names before the call's own
+    /// arguments begin. `INDIRECT_CALL_2(f, f2, f1, ...)` names two;
+    /// `INDIRECT_CALL_INET(f, f2, f1, ...)` is a two-candidate alias
+    /// (include/linux/indirect_call_wrapper.h). The count has to come from the
+    /// macro, not from the shape of the arguments: a call's own arguments are
+    /// identifiers just as often as the candidates are.
+    fn indirect_call_candidate_count(name: &str) -> Option<usize> {
+        match name {
+            "INDIRECT_CALL_INET" => Some(2),
+            "INDIRECT_CALL_INET_1" => Some(1),
+            _ => name
+                .strip_prefix("INDIRECT_CALL_")
+                .and_then(|suffix| suffix.parse::<usize>().ok())
+                .filter(|count| *count > 0),
+        }
+    }
+
+    /// One site per candidate the macro names, all pointing at the same
+    /// dispatch: `INDIRECT_CALL_2(ipprot->handler, tcp_v4_rcv, udp_rcv, skb)`
+    /// dispatches through `handler` and names two candidates.
+    fn indirect_call_sites(
+        args: tree_sitter::Node,
+        source: &str,
+        candidates: usize,
+    ) -> Vec<RawDispatchSite> {
+        let mut cursor = args.walk();
+        let arguments: Vec<tree_sitter::Node> = args.named_children(&mut cursor).collect();
+
+        let Some(dispatch) = arguments.first() else {
+            return Vec::new();
+        };
+
+        // The dispatch expression is usually a member: keep the member name
+        // so the site joins with everything installed in that slot.
+        let member = if dispatch.kind() == "field_expression" {
+            dispatch
+                .child_by_field_name("field")
+                .map(|field| source[field.byte_range()].to_string())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let mut sites = Vec::new();
+        for candidate in arguments.iter().skip(1).take(candidates) {
+            if candidate.kind() != "identifier" {
+                continue;
+            }
+
+            sites.push(RawDispatchSite {
+                member: member.clone(),
+                receiver_expr: Some(collapse_whitespace(&source[dispatch.byte_range()])),
+                kind: DispatchKind::MacroDeclared,
+                byte_start: candidate.start_byte(),
+                line: candidate.start_position().row as u32 + 1,
+                target: Some(source[candidate.byte_range()].to_string()),
+            });
+        }
+
+        sites
     }
 
     /// `a->m()` and `a.m()` differ only in the operator between receiver and
@@ -2682,6 +2767,51 @@ mod tests {
             .analyze_source_with_metadata(source, Path::new(path), "testhash", None)
             .unwrap();
         (functions, sites)
+    }
+
+    #[test]
+    fn indirect_call_macro_names_its_candidates() {
+        // The shape of ip_protocol_deliver_rcu: the macro states the targets
+        // it expects, and the dispatch goes through a member.
+        let (_functions, sites) = analyze(
+            "struct net_protocol { int (*handler)(struct sk_buff *); };\n\
+             int deliver(const struct net_protocol *ipprot, struct sk_buff *skb) {\n\
+             \treturn INDIRECT_CALL_2(ipprot->handler, tcp_v4_rcv, udp_rcv, skb);\n\
+             }\n",
+            "test.c",
+        );
+
+        let declared: Vec<&DispatchSite> = sites
+            .iter()
+            .filter(|s| s.kind == DispatchKind::MacroDeclared)
+            .collect();
+
+        let targets: Vec<&str> = declared
+            .iter()
+            .filter_map(|s| s.target.as_deref())
+            .collect();
+        assert_eq!(targets, vec!["tcp_v4_rcv", "udp_rcv"], "sites: {sites:?}");
+
+        // Both candidates describe the same dispatch, through the same member.
+        assert!(declared.iter().all(|s| s.member == "handler"));
+        assert!(declared
+            .iter()
+            .all(|s| s.receiver_expr.as_deref() == Some("ipprot->handler")));
+        assert!(declared.iter().all(|s| s.caller_name == "deliver"));
+    }
+
+    #[test]
+    fn an_ordinary_call_declares_no_candidates() {
+        let (_functions, sites) = analyze(
+            "int helper(int x);\n\
+             int go(int x) { return helper(x); }\n",
+            "test.c",
+        );
+
+        assert!(
+            !sites.iter().any(|s| s.kind == DispatchKind::MacroDeclared),
+            "ordinary call treated as an indirect-call macro: {sites:?}"
+        );
     }
 
     #[test]
