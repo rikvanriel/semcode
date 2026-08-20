@@ -54,6 +54,11 @@ struct LanguageQueries {
     call_query: Query,
 }
 
+/// Collapse runs of whitespace (including newlines) into single spaces.
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 pub struct TreeSitterAnalyzer {
     c_parser: Parser,
     rust_parser: Parser,
@@ -1685,7 +1690,7 @@ impl TreeSitterAnalyzer {
         let mut cursor = body_node.walk();
         for child in body_node.children(&mut cursor) {
             if child.kind() == "field_declaration" {
-                if let Some(field_info) = self.parse_field_declaration_node(child, source) {
+                if let Some(field_info) = self.parse_field_declaration_node(child, source, "") {
                     members.extend(field_info);
                 }
             }
@@ -1703,106 +1708,164 @@ impl TreeSitterAnalyzer {
         &self,
         field_decl_node: tree_sitter::Node,
         source: &str,
+        prefix: &str,
     ) -> Option<Vec<FieldInfo>> {
+        let type_node = field_decl_node.child_by_field_name("type")?;
+        let base_type = Self::render_declaration_type(field_decl_node, type_node, source);
+        let inline_body = Self::inline_aggregate_body(type_node);
+
         let mut fields = Vec::new();
+        let mut cursor = field_decl_node.walk();
+        let declarators: Vec<tree_sitter::Node> = field_decl_node
+            .children_by_field_name("declarator", &mut cursor)
+            .collect();
 
-        // Simple approach: just parse the entire field declaration as text
-        // This ensures we don't miss any types due to overly restrictive filtering
-        let decl_text = source[field_decl_node.byte_range()].trim();
-
-        // Use the string-based parsing which is more reliable
-        fields.extend(self.parse_single_field_declaration(decl_text));
-
-        if !fields.is_empty() {
-            Some(fields)
-        } else {
-            None
+        // An anonymous member declares no name of its own: C makes its members
+        // members of the enclosing struct, reachable as `parent->inner`.
+        if declarators.is_empty() {
+            let body = inline_body?;
+            return Some(self.parse_struct_members_from_node_prefixed(body, source, prefix));
         }
-    }
 
-    fn parse_single_field_declaration(&self, decl_text: &str) -> Vec<FieldInfo> {
-        let mut fields = Vec::new();
-
-        // Handle a single field declaration like "int x, y, z;" or "struct foo *ptr;"
-        for line in decl_text.lines() {
-            let line = line.trim();
-            if line.ends_with(';')
-                && !line.is_empty()
-                && !line.starts_with("//")
-                && !line.starts_with("/*")
-            {
-                let line = line.trim_end_matches(';').trim();
-
-                // Skip empty lines and comments
-                if line.is_empty() {
-                    continue;
-                }
-
-                // Handle comma-separated fields like "int x, y, z;"
-                if line.contains(',') {
-                    fields.extend(self.parse_comma_separated_fields(line));
-                } else {
-                    // Single field declaration
-                    fields.extend(self.parse_single_field_declaration_line(line));
-                }
+        for declarator in declarators {
+            let Some(name_node) = Self::innermost_declarator_name(declarator) else {
+                continue;
+            };
+            let name = source[name_node.byte_range()].to_string();
+            // Error recovery can leave a zero-width identifier behind.
+            if name.is_empty() {
+                continue;
             }
-        }
+            let shape = Self::abstract_declarator(declarator, name_node, source);
 
-        fields
-    }
-
-    fn parse_comma_separated_fields(&self, line: &str) -> Vec<FieldInfo> {
-        let mut fields = Vec::new();
-
-        // Split by comma and parse each field
-        let field_parts: Vec<&str> = line.split(',').collect();
-
-        for (i, field_part) in field_parts.iter().enumerate() {
-            let field_part = field_part.trim();
-
-            if i == 0 {
-                // First field has the complete type
-                fields.extend(self.parse_single_field_declaration_line(field_part));
+            let type_name = if shape.is_empty() {
+                base_type.clone()
             } else {
-                // Subsequent fields share the same base type as the first field
-                if let Some(first_field) = fields.first() {
-                    let (field_name, field_modifiers) =
-                        self.extract_field_name_and_modifiers(field_part);
-                    if !field_name.is_empty() {
-                        // Extract base type from first field (remove any modifiers)
-                        let base_type = self.extract_base_type(&first_field.type_name);
-                        let complete_type = if field_modifiers.is_empty() {
-                            base_type
-                        } else {
-                            format!("{base_type} {field_modifiers}")
-                        };
+                format!("{base_type} {shape}")
+            };
 
-                        fields.push(FieldInfo {
-                            name: field_name,
-                            type_name: complete_type,
-                            offset: None,
-                        });
-                    }
+            fields.push(FieldInfo {
+                name: format!("{prefix}{name}"),
+                type_name,
+                offset: None,
+            });
+
+            // An inline aggregate has no name to look its members up by, so
+            // report them here, qualified by the member that holds them.
+            if let Some(body) = inline_body {
+                let nested_prefix = format!("{prefix}{name}.");
+                fields.extend(self.parse_struct_members_from_node_prefixed(
+                    body,
+                    source,
+                    &nested_prefix,
+                ));
+            }
+        }
+
+        if fields.is_empty() {
+            None
+        } else {
+            Some(fields)
+        }
+    }
+
+    /// The body of an inline `struct`/`union`/`enum` definition, if the type is
+    /// spelled out here rather than referred to by name.
+    fn inline_aggregate_body(type_node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+        match type_node.kind() {
+            "struct_specifier" | "union_specifier" => type_node.child_by_field_name("body"),
+            _ => None,
+        }
+    }
+
+    fn parse_struct_members_from_node_prefixed(
+        &self,
+        body_node: tree_sitter::Node,
+        source: &str,
+        prefix: &str,
+    ) -> Vec<FieldInfo> {
+        let mut members = Vec::new();
+        let mut cursor = body_node.walk();
+        for child in body_node.children(&mut cursor) {
+            if child.kind() == "field_declaration" {
+                if let Some(fields) = self.parse_field_declaration_node(child, source, prefix) {
+                    members.extend(fields);
                 }
             }
         }
 
-        fields
+        members
     }
 
-    fn extract_base_type(&self, full_type: &str) -> String {
-        // Extract base type by removing pointer/array modifiers from the end
-        let parts: Vec<&str> = full_type.split_whitespace().collect();
+    /// Render a declaration's type, including qualifiers that sit beside the
+    /// type node rather than inside it (`const char *x` keeps its `const`).
+    fn render_declaration_type(
+        decl_node: tree_sitter::Node,
+        type_node: tree_sitter::Node,
+        source: &str,
+    ) -> String {
+        let mut parts = Vec::new();
+        let mut cursor = decl_node.walk();
+        for child in decl_node.children(&mut cursor) {
+            if child.start_byte() >= type_node.start_byte() {
+                break;
+            }
+            if matches!(child.kind(), "type_qualifier" | "storage_class_specifier") {
+                parts.push(collapse_whitespace(&source[child.byte_range()]));
+            }
+        }
+        parts.push(Self::render_type_node(type_node, source));
 
-        // Find where modifiers start (*, [, :)
-        for (i, part) in parts.iter().enumerate() {
-            if part.contains('*') || part.contains('[') || part.contains(':') {
-                return parts[..i].join(" ");
+        parts.join(" ")
+    }
+
+    /// Render the type of a declaration, keeping an inline aggregate short.
+    fn render_type_node(type_node: tree_sitter::Node, source: &str) -> String {
+        let keyword = match type_node.kind() {
+            "struct_specifier" => Some("struct"),
+            "union_specifier" => Some("union"),
+            "enum_specifier" => Some("enum"),
+            _ => None,
+        };
+
+        if let Some(keyword) = keyword {
+            if type_node.child_by_field_name("body").is_some() {
+                return match type_node.child_by_field_name("name") {
+                    Some(name) => format!("{keyword} {} {{...}}", &source[name.byte_range()]),
+                    None => format!("{keyword} {{...}}"),
+                };
             }
         }
 
-        // If no modifiers found, return the whole type
-        full_type.to_string()
+        collapse_whitespace(&source[type_node.byte_range()])
+    }
+
+    /// Follow a declarator down to the identifier it declares, without
+    /// descending into a function declarator's parameters.
+    fn innermost_declarator_name(declarator: tree_sitter::Node) -> Option<tree_sitter::Node> {
+        let mut node = declarator;
+
+        loop {
+            match node.kind() {
+                "field_identifier" | "identifier" | "type_identifier" => return Some(node),
+                "parenthesized_declarator" => node = node.named_child(0)?,
+                _ => node = node.child_by_field_name("declarator")?,
+            }
+        }
+    }
+
+    /// The declarator with its identifier removed: `(*read)(struct file *f)`
+    /// becomes `(*)(struct file *f)`, `*next` becomes `*`, `x[4]` becomes `[4]`.
+    fn abstract_declarator(
+        declarator: tree_sitter::Node,
+        name_node: tree_sitter::Node,
+        source: &str,
+    ) -> String {
+        let text = &source[declarator.byte_range()];
+        let start = name_node.start_byte() - declarator.start_byte();
+        let end = name_node.end_byte() - declarator.start_byte();
+
+        collapse_whitespace(&format!("{}{}", &text[..start], &text[end..]))
     }
 
     fn parse_single_field_declaration_line(&self, line: &str) -> Vec<FieldInfo> {
@@ -2464,5 +2527,129 @@ impl TreeSitterAnalyzer {
         }
 
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fields_of(source: &str, type_name: &str) -> Vec<(String, String)> {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let (_functions, types, _macros) = analyzer
+            .analyze_source_with_metadata(source, Path::new("test.c"), "testhash", None)
+            .unwrap();
+
+        let ty = types
+            .iter()
+            .find(|t| t.name.ends_with(type_name))
+            .unwrap_or_else(|| panic!("type {type_name} not extracted"));
+
+        ty.members
+            .iter()
+            .map(|m| (m.name.clone(), m.type_name.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn function_pointer_field_keeps_its_own_name() {
+        let fields = fields_of(
+            "struct file;\n\
+             struct file_operations {\n\
+             \tint (*read)(struct file *f, char *buf);\n\
+             \tint (*write)(struct file *f, const char *buf);\n\
+             };\n",
+            "file_operations",
+        );
+
+        assert_eq!(
+            fields,
+            vec![
+                (
+                    "read".to_string(),
+                    "int (*)(struct file *f, char *buf)".to_string()
+                ),
+                (
+                    "write".to_string(),
+                    "int (*)(struct file *f, const char *buf)".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn anonymous_members_belong_to_the_enclosing_struct() {
+        // C makes the members of an anonymous union members of the parent.
+        let fields = fields_of(
+            "struct wrapper {\n\
+             \tint tag;\n\
+             \tunion { int u1; long u2; };\n\
+             \tunion { int v1; long v2; } named;\n\
+             };\n",
+            "wrapper",
+        );
+
+        let actual: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(n, t)| (n.as_str(), t.as_str()))
+            .collect();
+
+        assert_eq!(
+            actual,
+            vec![
+                ("tag", "int"),
+                // anonymous: reachable as wrapper.u1
+                ("u1", "int"),
+                ("u2", "long"),
+                // named inline aggregate: the member, then what it holds
+                ("named", "union {...}"),
+                ("named.v1", "int"),
+                ("named.v2", "long"),
+            ]
+        );
+    }
+
+    #[test]
+    fn declarator_shapes_round_trip() {
+        let fields = fields_of(
+            "struct file;\n\
+             struct tricky {\n\
+             \tint plain;\n\
+             \tint a, b;\n\
+             \tchar *ptr;\n\
+             \tconst char * const cptr;\n\
+             \tint arr[4];\n\
+             \tint matrix[2][3];\n\
+             \tunsigned int bits : 3;\n\
+             \tvoid (**pptr)(int);\n\
+             \tint (*table[8])(void);\n\
+             \tstruct file *next;\n\
+             \tstruct { int inner; } nested;\n\
+             };\n",
+            "tricky",
+        );
+
+        let expected = vec![
+            ("plain", "int"),
+            ("a", "int"),
+            ("b", "int"),
+            ("ptr", "char *"),
+            ("cptr", "const char * const"),
+            ("arr", "int [4]"),
+            ("matrix", "int [2][3]"),
+            ("bits", "unsigned int"),
+            ("pptr", "void (**)(int)"),
+            ("table", "int (*[8])(void)"),
+            ("next", "struct file *"),
+            ("nested", "struct {...}"),
+            ("nested.inner", "int"),
+        ];
+
+        let actual: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(n, t)| (n.as_str(), t.as_str()))
+            .collect();
+
+        assert_eq!(actual, expected);
     }
 }
