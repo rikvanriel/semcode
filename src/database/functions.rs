@@ -654,11 +654,13 @@ impl FunctionStore {
         Ok(functions)
     }
 
-    /// Get functions by a list of names (batch lookup) - optimized to minimize content queries
+    /// Get functions by a list of names (batch lookup) - optimized to minimize content
+    /// queries. A name maps to every definition carrying it, since C statics in different
+    /// files, and same-named definitions generally, are distinct functions.
     pub async fn get_by_names(
         &self,
         names: &[String],
-    ) -> Result<std::collections::HashMap<String, FunctionInfo>> {
+    ) -> Result<std::collections::HashMap<String, Vec<FunctionInfo>>> {
         if names.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
@@ -666,10 +668,14 @@ impl FunctionStore {
         let (all_function_data, all_body_hashes) = self.fetch_metadata_by_names(names).await?;
         let content_map = self.fetch_bodies_for_hashes(all_body_hashes).await?;
 
-        let mut result = std::collections::HashMap::new();
+        let mut result: std::collections::HashMap<String, Vec<FunctionInfo>> =
+            std::collections::HashMap::new();
         for func_data in all_function_data {
             let name = func_data.name.clone();
-            result.insert(name, Self::metadata_into_function(func_data, &content_map));
+            result
+                .entry(name)
+                .or_default()
+                .push(Self::metadata_into_function(func_data, &content_map));
         }
 
         Ok(result)

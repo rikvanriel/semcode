@@ -2132,7 +2132,7 @@ impl DatabaseManager {
     pub async fn get_functions_by_names(
         &self,
         names: &[String],
-    ) -> Result<std::collections::HashMap<String, FunctionInfo>> {
+    ) -> Result<std::collections::HashMap<String, Vec<FunctionInfo>>> {
         self.function_store.get_by_names(names).await
     }
 
@@ -3600,7 +3600,7 @@ impl DatabaseManager {
         let mut valid_callers = Vec::new();
 
         for caller_name in &all_callers {
-            if let Some(func) = caller_functions.get(caller_name) {
+            if let Some(func) = caller_functions.get(caller_name).and_then(|f| f.first()) {
                 // Check if this function's file SHA matches the git manifest
                 if let Some(expected_hash) = git_manifest.get(&func.file_path) {
                     if &func.git_file_hash == expected_hash {
@@ -3687,7 +3687,16 @@ impl DatabaseManager {
         }
 
         let caller_functions = self.function_store.get_by_names(&all_callers).await?;
-        let callers_vec: Vec<FunctionInfo> = caller_functions.into_values().collect();
+        let callers_vec: Vec<FunctionInfo> = caller_functions
+            .into_values()
+            .filter_map(|mut candidates| {
+                if candidates.is_empty() {
+                    None
+                } else {
+                    Some(candidates.swap_remove(0))
+                }
+            })
+            .collect();
 
         tracing::info!(
             "Found {} callers for '{}' (non-git-aware)",
@@ -6206,6 +6215,55 @@ mod tests {
         let dataset = table.dataset().unwrap().get().await.unwrap();
 
         assert_eq!(dataset.manifest().data_storage_format.version, "2.2");
+    }
+
+    fn test_function(name: &str, file_path: &str, git_file_hash: &str) -> FunctionInfo {
+        FunctionInfo {
+            name: name.to_string(),
+            file_path: file_path.to_string(),
+            git_file_hash: git_file_hash.to_string(),
+            line_start: 1,
+            line_end: 3,
+            return_type: "int".to_string(),
+            parameters: Vec::new(),
+            body: format!("int {name}(void) {{ return 0; }}"),
+            calls: Some(vec!["target".to_string()]),
+            types: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_lookup_returns_every_definition_of_a_name() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = DatabaseManager::new(
+            temp_dir.path().to_str().unwrap(),
+            temp_dir.path().to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        db.create_tables().await.unwrap();
+
+        // Two static functions of the same name in different files, as the
+        // kernel has by the thousand.
+        db.insert_functions(vec![
+            test_function("dup_caller", "a.c", "hash-a"),
+            test_function("dup_caller", "b.c", "hash-b"),
+        ])
+        .await
+        .unwrap();
+
+        let map = db
+            .get_functions_by_names(&["dup_caller".to_string()])
+            .await
+            .unwrap();
+
+        let candidates = map
+            .get("dup_caller")
+            .expect("name missing from bulk lookup");
+        let mut files: Vec<&str> = candidates.iter().map(|f| f.file_path.as_str()).collect();
+        files.sort_unstable();
+
+        assert_eq!(files, vec!["a.c", "b.c"]);
     }
 
     #[tokio::test]

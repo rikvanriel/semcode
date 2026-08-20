@@ -122,7 +122,7 @@ async fn build_reverse_callchain_with_git(
 }
 
 fn build_callchain_recursive_sync(
-    function_map: &HashMap<String, FunctionInfo>,
+    function_map: &HashMap<String, Vec<FunctionInfo>>,
     call_relationships: &CallRelationships,
     func_name: &str,
     remaining_depth: usize,
@@ -148,7 +148,7 @@ fn build_callchain_recursive_sync(
         children: vec![],
     };
 
-    if let Some(func) = function_map.get(func_name) {
+    if let Some(func) = function_map.get(func_name).and_then(|f| f.first()) {
         node.file = func.file_path.clone();
         node.line = func.line_start;
 
@@ -204,7 +204,7 @@ pub fn print_callchain_tree(node: &CallNode, indent: usize) {
 }
 
 fn find_paths_bfs(
-    function_map: &HashMap<String, FunctionInfo>,
+    function_map: &HashMap<String, Vec<FunctionInfo>>,
     call_relationships: &CallRelationships,
     start: &str,
     target: &str,
