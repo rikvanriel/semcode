@@ -55,14 +55,15 @@ struct LanguageQueries {
     call_query: Query,
 }
 
-/// What one file yields: functions, types, macros, and the dispatch sites
-/// whose targets are resolved later.
-pub type FileAnalysis = (
-    Vec<FunctionInfo>,
-    Vec<TypeInfo>,
-    Vec<FunctionInfo>,
-    Vec<DispatchSite>,
-);
+/// What one file yields.
+#[derive(Debug, Default)]
+pub struct FileAnalysis {
+    pub functions: Vec<FunctionInfo>,
+    pub types: Vec<TypeInfo>,
+    pub macros: Vec<FunctionInfo>,
+    /// Calls that dispatch through a value; their targets are resolved later.
+    pub dispatch_sites: Vec<DispatchSite>,
+}
 
 /// Calls found in one file: resolved edges, and dispatch sites whose targets
 /// are not known until query time.
@@ -605,15 +606,19 @@ impl TreeSitterAnalyzer {
         })?;
 
         // Single-pass extraction with optimized call analysis
-        let (raw_functions, mut raw_types, raw_macros, dispatch_sites) = self
-            .extract_all_with_embedded_data(
-                &tree,
-                source_code,
-                file_path,
-                git_hash,
-                source_root,
-                language,
-            )?;
+        let FileAnalysis {
+            functions: raw_functions,
+            types: mut raw_types,
+            macros: raw_macros,
+            dispatch_sites,
+        } = self.extract_all_with_embedded_data(
+            &tree,
+            source_code,
+            file_path,
+            git_hash,
+            source_root,
+            language,
+        )?;
 
         // Extract typedefs as TypeInfo with kind="typedef" and add to types (C only)
         if language == Language::C {
@@ -633,7 +638,12 @@ impl TreeSitterAnalyzer {
 
         // Call relationships are now embedded in function/macro JSON columns
 
-        Ok((functions, types, macros, dispatch_sites))
+        Ok(FileAnalysis {
+            functions,
+            types,
+            macros,
+            dispatch_sites,
+        })
     }
 
     /// Optimized single-pass extraction with embedded JSON data
@@ -683,7 +693,12 @@ impl TreeSitterAnalyzer {
             language,
         )?;
 
-        Ok((functions, types, macros, dispatch_sites))
+        Ok(FileAnalysis {
+            functions,
+            types,
+            macros,
+            dispatch_sites,
+        })
     }
 
     /// Extract all calls in a single tree traversal and return with byte positions
@@ -2780,9 +2795,10 @@ mod tests {
 
     fn fields_of(source: &str, type_name: &str) -> Vec<(String, String)> {
         let mut analyzer = TreeSitterAnalyzer::new().unwrap();
-        let (_functions, types, _macros, _sites) = analyzer
+        let analysis = analyzer
             .analyze_source_with_metadata(source, Path::new("test.c"), "testhash", None)
             .unwrap();
+        let types = analysis.types;
 
         let ty = types
             .iter()
@@ -2797,10 +2813,10 @@ mod tests {
 
     fn analyze(source: &str, path: &str) -> (Vec<FunctionInfo>, Vec<DispatchSite>) {
         let mut analyzer = TreeSitterAnalyzer::new().unwrap();
-        let (functions, _types, _macros, sites) = analyzer
+        let analysis = analyzer
             .analyze_source_with_metadata(source, Path::new(path), "testhash", None)
             .unwrap();
-        (functions, sites)
+        (analysis.functions, analysis.dispatch_sites)
     }
 
     #[test]
@@ -2922,9 +2938,10 @@ mod tests {
         let mut analyzer = TreeSitterAnalyzer::new().unwrap();
         // Macros come back separately; the indexer merges them into the
         // functions table.
-        let (_functions, _types, macros, _sites) = analyzer
+        let macros = analyzer
             .analyze_source_with_metadata(source, Path::new("test.c"), "testhash", None)
-            .unwrap();
+            .unwrap()
+            .macros;
 
         macros
             .iter()
@@ -3083,9 +3100,10 @@ mod tests {
 
     fn params_of(source: &str, func_name: &str) -> Vec<(String, String)> {
         let mut analyzer = TreeSitterAnalyzer::new().unwrap();
-        let (functions, _types, _macros, _sites) = analyzer
+        let functions = analyzer
             .analyze_source_with_metadata(source, Path::new("test.c"), "testhash", None)
-            .unwrap();
+            .unwrap()
+            .functions;
 
         let func = functions
             .iter()

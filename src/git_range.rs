@@ -247,7 +247,10 @@ fn process_git_file_tuple_with_repo(
     }
 
     // Check analysis results
-    let (mut functions, types, macros, dispatch_sites) = analysis_result?;
+    let analysis = analysis_result?;
+    let (mut functions, types, dispatch_sites) =
+        (analysis.functions, analysis.types, analysis.dispatch_sites);
+    let macros = analysis.macros;
 
     // Macros are now stored as functions - combine them
     if !no_macros {
