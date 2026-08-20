@@ -1484,199 +1484,36 @@ impl TreeSitterAnalyzer {
         node: tree_sitter::Node,
         source: &str,
     ) -> Option<ParameterInfo> {
-        let mut type_parts = Vec::new();
-        let mut param_name = String::new();
+        let type_node = node.child_by_field_name("type")?;
+        let base_type = Self::render_declaration_type(node, type_node, source);
 
-        // Walk through the parameter_declaration to extract type and name
-        let mut cursor = node.walk();
-        cursor.goto_first_child();
+        let (name, shape) = match node.child_by_field_name("declarator") {
+            Some(declarator) => match Self::innermost_declarator_name(declarator) {
+                Some(name_node) => (
+                    source[name_node.byte_range()].to_string(),
+                    Self::abstract_declarator(declarator, name_node, source),
+                ),
+                // An abstract declarator names nothing: `int (*)(void)`, `char *`.
+                None => (
+                    String::new(),
+                    collapse_whitespace(&source[declarator.byte_range()]),
+                ),
+            },
+            None => (String::new(), String::new()),
+        };
 
-        loop {
-            let current_node = cursor.node();
-            let node_kind = current_node.kind();
-            let text = &source[current_node.byte_range()];
-
-            match node_kind {
-                // Type specifiers
-                "primitive_type" | "type_identifier" | "sized_type_specifier" => {
-                    type_parts.push(text.to_string());
-                }
-                // Storage class specifiers
-                "storage_class_specifier" => {
-                    type_parts.push(text.to_string());
-                }
-                // Type qualifiers (const, volatile, etc.)
-                "type_qualifier" => {
-                    type_parts.push(text.to_string());
-                }
-                // Struct/union/enum specifiers
-                "struct_specifier" | "union_specifier" | "enum_specifier" => {
-                    type_parts.push(text.to_string());
-                }
-                // Declarators (contain the parameter name)
-                "identifier" => {
-                    // This is likely the parameter name
-                    if param_name.is_empty() {
-                        param_name = text.to_string();
-                    }
-                }
-                "pointer_declarator" => {
-                    // Parse pointer declarator to extract both pointer info and name
-                    self.parse_pointer_declarator(
-                        current_node,
-                        source,
-                        &mut type_parts,
-                        &mut param_name,
-                    );
-                }
-                "array_declarator" => {
-                    // Parse array declarator
-                    self.parse_array_declarator(
-                        current_node,
-                        source,
-                        &mut type_parts,
-                        &mut param_name,
-                    );
-                }
-                "function_declarator" => {
-                    // Function pointer parameter
-                    self.parse_function_declarator(
-                        current_node,
-                        source,
-                        &mut type_parts,
-                        &mut param_name,
-                    );
-                }
-                // Skip punctuation and whitespace
-                "," | "(" | ")" => {}
-                _ => {
-                    // For any other node types, include the text as part of the type
-                    if !text.trim().is_empty() && text != "," && text != "(" && text != ")" {
-                        type_parts.push(text.to_string());
-                    }
-                }
-            }
-
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-
-        // If we have type information, create a ParameterInfo
-        if !type_parts.is_empty() || !param_name.is_empty() {
-            let type_name = if type_parts.is_empty() {
-                "int".to_string() // Default type in C
-            } else {
-                type_parts.join(" ")
-            };
-
-            Some(ParameterInfo {
-                name: param_name,
-                type_name,
-                type_file_path: None, // Will be resolved later in type resolution phase
-                type_git_file_hash: None, // Will be resolved later in type resolution phase
-            })
+        let type_name = if shape.is_empty() {
+            base_type
         } else {
-            None
-        }
-    }
+            format!("{base_type} {shape}")
+        };
 
-    #[allow(clippy::only_used_in_recursion)]
-    fn parse_pointer_declarator(
-        &self,
-        node: tree_sitter::Node,
-        source: &str,
-        type_parts: &mut Vec<String>,
-        param_name: &mut String,
-    ) {
-        let mut cursor = node.walk();
-        cursor.goto_first_child();
-
-        // Count asterisks and find the identifier
-        loop {
-            let current_node = cursor.node();
-            let text = &source[current_node.byte_range()];
-
-            match current_node.kind() {
-                "*" => {
-                    type_parts.push("*".to_string());
-                }
-                "identifier" if param_name.is_empty() => {
-                    *param_name = text.to_string();
-                }
-                "pointer_declarator" => {
-                    // Nested pointer, recurse
-                    self.parse_pointer_declarator(current_node, source, type_parts, param_name);
-                }
-                _ => {}
-            }
-
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-    }
-
-    fn parse_array_declarator(
-        &self,
-        node: tree_sitter::Node,
-        source: &str,
-        type_parts: &mut Vec<String>,
-        param_name: &mut String,
-    ) {
-        let mut cursor = node.walk();
-        cursor.goto_first_child();
-
-        loop {
-            let current_node = cursor.node();
-            let text = &source[current_node.byte_range()];
-
-            match current_node.kind() {
-                "identifier" if param_name.is_empty() => {
-                    *param_name = text.to_string();
-                }
-                "[" | "]" => {
-                    type_parts.push(text.to_string());
-                }
-                "number_literal" => {
-                    type_parts.push(text.to_string());
-                }
-                _ => {}
-            }
-
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-    }
-
-    fn parse_function_declarator(
-        &self,
-        node: tree_sitter::Node,
-        source: &str,
-        type_parts: &mut Vec<String>,
-        param_name: &mut String,
-    ) {
-        // For function pointer parameters, we'll capture the basic structure
-
-        // Extract the identifier if present
-        let mut cursor = node.walk();
-        cursor.goto_first_child();
-
-        loop {
-            let current_node = cursor.node();
-            if current_node.kind() == "identifier" && param_name.is_empty() {
-                *param_name = source[current_node.byte_range()].to_string();
-                break;
-            }
-
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-
-        // For now, just add the function pointer syntax to type
-        type_parts.push("(*)".to_string());
+        Some(ParameterInfo {
+            name,
+            type_name,
+            type_file_path: None, // resolved later in the type resolution phase
+            type_git_file_hash: None, // resolved later in the type resolution phase
+        })
     }
 
     fn parse_struct_members_from_node(
@@ -2573,6 +2410,70 @@ mod tests {
                     "write".to_string(),
                     "int (*)(struct file *f, const char *buf)".to_string()
                 ),
+            ]
+        );
+    }
+
+    fn params_of(source: &str, func_name: &str) -> Vec<(String, String)> {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let (functions, _types, _macros) = analyzer
+            .analyze_source_with_metadata(source, Path::new("test.c"), "testhash", None)
+            .unwrap();
+
+        let func = functions
+            .iter()
+            .find(|f| f.name == func_name)
+            .unwrap_or_else(|| panic!("function {func_name} not extracted"));
+
+        func.parameters
+            .iter()
+            .map(|p| (p.name.clone(), p.type_name.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn function_pointer_parameter_keeps_its_name() {
+        let params = params_of(
+            "struct file;\n\
+             int deref(int (*fp)(struct file *, char *), struct file *f) { return 0; }\n",
+            "deref",
+        );
+
+        assert_eq!(
+            params,
+            vec![
+                (
+                    "fp".to_string(),
+                    "int (*)(struct file *, char *)".to_string()
+                ),
+                ("f".to_string(), "struct file *".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parameter_shapes_round_trip() {
+        let params = params_of(
+            "struct file;\n\
+             int shapes(int plain, const char *name, char buf[16], struct file *f,\n\
+             \t   void (**pp)(int), int) { return 0; }\n",
+            "shapes",
+        );
+
+        let actual: Vec<(&str, &str)> = params
+            .iter()
+            .map(|(n, t)| (n.as_str(), t.as_str()))
+            .collect();
+
+        assert_eq!(
+            actual,
+            vec![
+                ("plain", "int"),
+                ("name", "const char *"),
+                ("buf", "char [16]"),
+                ("f", "struct file *"),
+                ("pp", "void (**)(int)"),
+                ("", "int"),
             ]
         );
     }
