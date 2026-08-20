@@ -564,7 +564,7 @@ impl FunctionStore {
         let calls = if calls_array.is_null(row) {
             None
         } else {
-            serde_json::from_str::<Vec<String>>(calls_array.value(row)).ok()
+            Some(crate::database::parse_call_list(calls_array.value(row))?)
         };
 
         let types = if types_array.is_null(row) {

@@ -1845,14 +1845,13 @@ impl DatabaseManager {
                         names.value(row)
                     );
                     if !calls.is_null(row) {
-                        if let Ok(values) = serde_json::from_str::<Vec<String>>(calls.value(row)) {
-                            for target in values {
-                                if function_targets.contains(&target) {
-                                    function_referrers
-                                        .entry(target)
-                                        .or_default()
-                                        .insert(identity.clone());
-                                }
+                        let values = crate::database::parse_call_list(calls.value(row))?;
+                        for target in values {
+                            if function_targets.contains(&target) {
+                                function_referrers
+                                    .entry(target)
+                                    .or_default()
+                                    .insert(identity.clone());
                             }
                         }
                     }
@@ -2015,10 +2014,9 @@ impl DatabaseManager {
 
                         // Parse JSON and verify it actually contains function_name
                         // (the LIKE filter might have false positives)
-                        if let Ok(calls_list) = serde_json::from_str::<Vec<String>>(calls_json) {
-                            if calls_list.contains(&function_name.to_string()) {
-                                callers.insert(caller_name);
-                            }
+                        let calls_list = crate::database::parse_call_list(calls_json)?;
+                        if calls_list.contains(&function_name.to_string()) {
+                            callers.insert(caller_name);
                         }
                     }
                 }
@@ -2105,13 +2103,12 @@ impl DatabaseManager {
                     // Check if this function makes calls
                     if !calls_array.is_null(i) {
                         let calls_json = calls_array.value(i);
-                        if let Ok(calls_list) = serde_json::from_str::<Vec<String>>(calls_json) {
-                            if !calls_list.is_empty() {
-                                functions_with_calls.insert(function_name.clone());
-                                // Add all called functions to the set
-                                for called_func in calls_list {
-                                    functions_that_are_called.insert(called_func);
-                                }
+                        let calls_list = crate::database::parse_call_list(calls_json)?;
+                        if !calls_list.is_empty() {
+                            functions_with_calls.insert(function_name.clone());
+                            // Add all called functions to the set
+                            for called_func in calls_list {
+                                functions_that_are_called.insert(called_func);
                             }
                         }
                     }
@@ -2377,17 +2374,15 @@ impl DatabaseManager {
 
                     if !calls_array.is_null(i) {
                         let calls_json = calls_array.value(i);
-                        if let Ok(calls_list) = serde_json::from_str::<Vec<String>>(calls_json) {
-                            for callee_name in calls_list {
-                                // For now, we can't easily get callee git hash without additional lookups
-                                // This is a limitation of the new schema - we'd need to do individual lookups
-                                all_relationships.push(CallRelationship {
-                                    caller: caller_name.clone(),
-                                    callee: callee_name,
-                                    caller_git_file_hash: caller_git_file_hash.clone(),
-                                    callee_git_file_hash: None, // Would require lookup
-                                });
-                            }
+                        let calls_list = crate::database::parse_call_list(calls_json)?;
+                        for callee_name in calls_list {
+                            // Getting the callee's git hash would need a lookup per callee.
+                            all_relationships.push(CallRelationship {
+                                caller: caller_name.clone(),
+                                callee: callee_name,
+                                caller_git_file_hash: caller_git_file_hash.clone(),
+                                callee_git_file_hash: None,
+                            });
                         }
                     }
                 }
@@ -3854,7 +3849,7 @@ impl DatabaseManager {
                             let calls = if calls_array.is_null(i) {
                                 None
                             } else {
-                                serde_json::from_str::<Vec<String>>(calls_array.value(i)).ok()
+                                Some(crate::database::parse_call_list(calls_array.value(i))?)
                             };
 
                             // Collect lightweight info for selection
@@ -3950,15 +3945,13 @@ impl DatabaseManager {
                         if git_file_hash == expected_hash {
                             let caller_name = name_array.value(i);
                             if !calls_array.is_null(i) {
-                                if let Ok(calls_list) =
-                                    serde_json::from_str::<Vec<String>>(calls_array.value(i))
-                                {
-                                    for callee in calls_list {
-                                        caller_index
-                                            .entry(callee)
-                                            .or_default()
-                                            .push(caller_name.to_string());
-                                    }
+                                let calls_list =
+                                    crate::database::parse_call_list(calls_array.value(i))?;
+                                for callee in calls_list {
+                                    caller_index
+                                        .entry(callee)
+                                        .or_default()
+                                        .push(caller_name.to_string());
                                 }
                             }
                         }
@@ -4039,12 +4032,9 @@ impl DatabaseManager {
                             // This function exists at the git SHA, verify it actually calls our target
                             if !calls_array.is_null(i) {
                                 let calls_json = calls_array.value(i);
-                                if let Ok(calls_list) =
-                                    serde_json::from_str::<Vec<String>>(calls_json)
-                                {
-                                    if calls_list.contains(&function_name.to_string()) {
-                                        callers.push(caller_name.to_string());
-                                    }
+                                let calls_list = crate::database::parse_call_list(calls_json)?;
+                                if calls_list.contains(&function_name.to_string()) {
+                                    callers.push(caller_name.to_string());
                                 }
                             }
                         }
