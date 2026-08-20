@@ -53,6 +53,10 @@ impl SchemaManager {
             self.create_symbol_filename_table().await?;
         }
 
+        if !table_names.iter().any(|n| n == "dispatch_sites") {
+            self.create_dispatch_sites_table().await?;
+        }
+
         if !table_names.iter().any(|n| n == "git_commits") {
             self.create_git_commits_table().await?;
         }
@@ -103,6 +107,41 @@ impl SchemaManager {
 
         self.connection
             .create_table("functions", vec![empty_batch])
+            .execute()
+            .await?;
+
+        Ok(())
+    }
+
+    /// Calls that dispatch through a value: `ops->read(...)` and friends. The
+    /// candidate targets are resolved by joining against the functions
+    /// installed in that slot, so only what the containing file proves is
+    /// stored here.
+    pub async fn create_dispatch_sites_table(&self) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            // Empty when the site is not inside a function at all: Python
+            // module level and class bodies, C++ and Rust static
+            // initializers. file_path and line always locate it.
+            Field::new("caller_name", DataType::Utf8, true),
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("git_file_hash", DataType::Utf8, false),
+            // Byte offset of the site: unique within a file, stable across a
+            // reindex of unchanged content, so a re-merge is idempotent.
+            Field::new("byte_start", DataType::Int64, false),
+            Field::new("line", DataType::Int64, false),
+            Field::new("member", DataType::Utf8, false),
+            Field::new("receiver_expr", DataType::Utf8, true),
+            Field::new("receiver_type", DataType::Utf8, true),
+            Field::new("kind", DataType::Utf8, false),
+            // Part of the merge key, so it carries "" rather than null: a
+            // null key column matches nothing and the row is dropped.
+            Field::new("target", DataType::Utf8, false),
+        ]));
+
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+
+        self.connection
+            .create_table("dispatch_sites", vec![empty_batch])
             .execute()
             .await?;
 

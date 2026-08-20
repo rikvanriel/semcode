@@ -34,8 +34,8 @@ pub use hash::{compute_content_hash, compute_file_hash};
 pub use text_utils::preprocess_code;
 pub use treesitter_analyzer::TreeSitterAnalyzer;
 pub use types::{
-    FieldInfo, FunctionInfo, GitCommitInfo, GitFileEntry, GitFileManifestEntry, GlobalTypeRegistry,
-    LoreEmailInfo, ParameterInfo, TypeInfo, TypedefInfo,
+    DispatchKind, DispatchSite, FieldInfo, FunctionInfo, GitCommitInfo, GitFileEntry,
+    GitFileManifestEntry, GlobalTypeRegistry, LoreEmailInfo, ParameterInfo, TypeInfo, TypedefInfo,
 };
 pub use vectorizer::CodeVectorizer;
 pub use workdir::WorkdirIndex;

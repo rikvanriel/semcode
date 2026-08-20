@@ -3,6 +3,7 @@ pub mod branches;
 pub mod calls;
 mod connection;
 pub mod content;
+pub mod dispatch_sites;
 mod functions;
 pub mod processed_files;
 mod schema;

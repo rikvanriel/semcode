@@ -41,6 +41,7 @@ pub struct DatabaseManager {
     schema_manager: SchemaManager,
     processed_file_store: ProcessedFileStore,
     content_store: ContentStore,
+    dispatch_site_store: crate::database::dispatch_sites::DispatchSiteStore,
     symbol_filename_store: SymbolFilenameStore,
     branch_store: IndexedBranchStore,
     workdir_index: std::sync::RwLock<Option<WorkdirIndex>>,
@@ -67,6 +68,9 @@ impl DatabaseManager {
             schema_manager: SchemaManager::new(connection.clone()),
             processed_file_store: ProcessedFileStore::new(connection.clone()),
             content_store: ContentStore::new(connection.clone()),
+            dispatch_site_store: crate::database::dispatch_sites::DispatchSiteStore::new(
+                connection.clone(),
+            ),
             symbol_filename_store: SymbolFilenameStore::new(connection.clone()),
             branch_store: IndexedBranchStore::new(connection.clone()),
             workdir_index: std::sync::RwLock::new(None),
@@ -670,6 +674,31 @@ impl DatabaseManager {
     }
 
     // Function operations
+    /// Record dispatch sites: calls that go through a value rather than
+    /// naming a function.
+    pub async fn insert_dispatch_sites(
+        &self,
+        sites: Vec<crate::types::DispatchSite>,
+    ) -> Result<()> {
+        self.dispatch_site_store.insert_batch(sites).await
+    }
+
+    /// Dispatch sites that go through the named member.
+    pub async fn find_dispatch_sites_by_member(
+        &self,
+        member: &str,
+    ) -> Result<Vec<crate::types::DispatchSite>> {
+        self.dispatch_site_store.find_by_member(member).await
+    }
+
+    /// Dispatch sites inside the named function.
+    pub async fn find_dispatch_sites_by_caller(
+        &self,
+        caller_name: &str,
+    ) -> Result<Vec<crate::types::DispatchSite>> {
+        self.dispatch_site_store.find_by_caller(caller_name).await
+    }
+
     pub async fn insert_functions(&self, functions: Vec<FunctionInfo>) -> Result<()> {
         // Extract (symbol_name, filename) pairs for symbol_filename table
         let symbol_filename_pairs: Vec<(String, String)> = functions
@@ -6220,6 +6249,43 @@ mod tests {
             calls: Some(vec!["target".to_string()]),
             types: None,
         }
+    }
+
+    #[tokio::test]
+    async fn reindexing_unchanged_content_keeps_one_row_per_dispatch_site() {
+        use crate::types::{DispatchKind, DispatchSite};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = DatabaseManager::new(
+            temp_dir.path().to_str().unwrap(),
+            temp_dir.path().to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        db.create_tables().await.unwrap();
+
+        let site = DispatchSite {
+            caller_name: "go".to_string(),
+            file_path: "a.c".to_string(),
+            git_file_hash: "hash-a".to_string(),
+            byte_start: 120,
+            line: 7,
+            member: "read".to_string(),
+            receiver_expr: Some("ops".to_string()),
+            receiver_type: None,
+            kind: DispatchKind::MemberArrow,
+            target: None,
+        };
+
+        db.insert_dispatch_sites(vec![site.clone()]).await.unwrap();
+        db.insert_dispatch_sites(vec![site.clone()]).await.unwrap();
+
+        let stored = db.find_dispatch_sites_by_member("read").await.unwrap();
+        assert_eq!(
+            stored,
+            vec![site],
+            "re-inserting the same site duplicated it"
+        );
     }
 
     #[tokio::test]

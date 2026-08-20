@@ -3,8 +3,8 @@
 use crate::git::walk_tree_at_commit_with_repo;
 use crate::indexer::{list_shas_in_range, process_commits_pipeline};
 use crate::{
-    DatabaseManager, FunctionInfo, GitFileEntry, GitFileManifestEntry, ProcessedFileRecord,
-    TreeSitterAnalyzer, TypeInfo,
+    DatabaseManager, DispatchSite, FunctionInfo, GitFileEntry, GitFileManifestEntry,
+    ProcessedFileRecord, TreeSitterAnalyzer, TypeInfo,
 };
 use anyhow::Result;
 use dashmap::DashSet;
@@ -29,6 +29,7 @@ struct GitFileTuple {
 struct GitTupleResults {
     functions: Vec<FunctionInfo>,
     types: Vec<TypeInfo>,
+    dispatch_sites: Vec<DispatchSite>,
     processed_files: Vec<ProcessedFileRecord>,
     files_processed: usize,
 }
@@ -37,6 +38,7 @@ impl GitTupleResults {
     fn merge(&mut self, other: GitTupleResults) {
         self.functions.extend(other.functions);
         self.types.extend(other.types);
+        self.dispatch_sites.extend(other.dispatch_sites);
         self.processed_files.extend(other.processed_files);
         self.files_processed += other.files_processed;
     }
@@ -245,7 +247,7 @@ fn process_git_file_tuple_with_repo(
     }
 
     // Check analysis results
-    let (mut functions, types, macros) = analysis_result?;
+    let (mut functions, types, macros, dispatch_sites) = analysis_result?;
 
     // Macros are now stored as functions - combine them
     if !no_macros {
@@ -265,6 +267,7 @@ fn process_git_file_tuple_with_repo(
     let results = GitTupleResults {
         functions,
         types,
+        dispatch_sites,
         processed_files: vec![processed_file_record],
         files_processed: 1,
     };
@@ -596,7 +599,7 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
                         let type_count = batch.types.len();
 
                         // Insert all three types in parallel
-                        let (func_result, type_result, processed_files_result) = tokio::join!(
+                        let (func_result, type_result, dispatch_result, processed_files_result) = tokio::join!(
                             async {
                                 if !batch.functions.is_empty() {
                                     db_manager_clone.insert_functions(batch.functions).await
@@ -607,6 +610,15 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
                             async {
                                 if !batch.types.is_empty() {
                                     db_manager_clone.insert_types(batch.types).await
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                            async {
+                                if !batch.dispatch_sites.is_empty() {
+                                    db_manager_clone
+                                        .insert_dispatch_sites(batch.dispatch_sites)
+                                        .await
                                 } else {
                                     Ok(())
                                 }
@@ -635,6 +647,13 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
                             insertion_successful = false;
                         } else {
                             types_counter.fetch_add(type_count, Ordering::Relaxed);
+                        }
+                        if let Err(e) = dispatch_result {
+                            error!(
+                                "Inserter {} failed to insert dispatch sites: {}",
+                                inserter_id, e
+                            );
+                            insertion_successful = false;
                         }
                         if let Err(e) = processed_files_result {
                             error!(
@@ -904,7 +923,7 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
                         let func_count = batch.functions.len();
                         let type_count = batch.types.len();
 
-                        let (func_result, type_result, processed_files_result) = tokio::join!(
+                        let (func_result, type_result, dispatch_result, processed_files_result) = tokio::join!(
                             async {
                                 if !batch.functions.is_empty() {
                                     db_manager_clone.insert_functions(batch.functions).await
@@ -915,6 +934,15 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
                             async {
                                 if !batch.types.is_empty() {
                                     db_manager_clone.insert_types(batch.types).await
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                            async {
+                                if !batch.dispatch_sites.is_empty() {
+                                    db_manager_clone
+                                        .insert_dispatch_sites(batch.dispatch_sites)
+                                        .await
                                 } else {
                                     Ok(())
                                 }
@@ -942,6 +970,13 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
                             insertion_successful = false;
                         } else {
                             types_counter.fetch_add(type_count, Ordering::Relaxed);
+                        }
+                        if let Err(e) = dispatch_result {
+                            error!(
+                                "Inserter {} failed to insert dispatch sites: {}",
+                                inserter_id, e
+                            );
+                            insertion_successful = false;
                         }
                         if let Err(e) = processed_files_result {
                             error!(

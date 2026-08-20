@@ -7,7 +7,8 @@ use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor, Tree};
 
 use crate::types::{
-    FieldInfo, FunctionInfo, GlobalTypeRegistry, MacroParams, ParameterInfo, TypeInfo,
+    DispatchKind, DispatchSite, FieldInfo, FunctionInfo, GlobalTypeRegistry, MacroParams,
+    ParameterInfo, TypeInfo,
 };
 // TemporaryCallRelationship import removed - call relationships are now embedded in function JSON columns
 use crate::hash::compute_file_hash;
@@ -52,6 +53,51 @@ struct LanguageQueries {
     typedef_query: Option<Query>, // Not needed for Rust
     macro_query: Query,
     call_query: Query,
+}
+
+/// What one file yields: functions, types, macros, and the dispatch sites
+/// whose targets are resolved later.
+pub type FileAnalysis = (
+    Vec<FunctionInfo>,
+    Vec<TypeInfo>,
+    Vec<FunctionInfo>,
+    Vec<DispatchSite>,
+);
+
+/// Calls found in one file: resolved edges, and dispatch sites whose targets
+/// are not known until query time.
+#[derive(Debug, Default)]
+struct CallExtraction {
+    calls: Vec<(String, usize, usize)>,
+    member_sites: Vec<RawDispatchSite>,
+}
+
+/// A dispatch site before it is attributed to the function containing it.
+#[derive(Debug, Clone)]
+struct RawDispatchSite {
+    member: String,
+    receiver_expr: Option<String>,
+    kind: DispatchKind,
+    byte_start: usize,
+    line: u32,
+}
+
+impl RawDispatchSite {
+    fn attribute(&self, caller_name: &str, file_path: &str, git_hash: &str) -> DispatchSite {
+        DispatchSite {
+            caller_name: caller_name.to_string(),
+            file_path: file_path.to_string(),
+            git_file_hash: git_hash.to_string(),
+            byte_start: self.byte_start as u64,
+            line: self.line,
+            member: self.member.clone(),
+            receiver_expr: self.receiver_expr.clone(),
+            // Typing the receiver needs the declaration; that is a later step.
+            receiver_type: None,
+            kind: self.kind,
+            target: None,
+        }
+    }
 }
 
 /// Collapse runs of whitespace (including newlines) into single spaces.
@@ -223,7 +269,8 @@ impl TreeSitterAnalyzer {
 
             (call_expression
                 function: (field_expression
-                    field: (field_identifier) @function_name
+                    argument: (_) @receiver
+                    field: (field_identifier) @member_name
                 )
             ) @method_call
         "#,
@@ -298,7 +345,8 @@ impl TreeSitterAnalyzer {
 
             (call_expression
                 function: (field_expression
-                    field: (field_identifier) @function_name
+                    value: (_) @receiver
+                    field: (field_identifier) @member_name
                 )
             ) @method_call
         "#,
@@ -367,7 +415,8 @@ impl TreeSitterAnalyzer {
 
             (call
                 function: (attribute
-                    attribute: (identifier) @function_name
+                    object: (_) @receiver
+                    attribute: (identifier) @member_name
                 )
             ) @method_call
         "#,
@@ -517,7 +566,7 @@ impl TreeSitterAnalyzer {
         file_path: &Path,
         git_hash: &str,
         source_root: Option<&Path>,
-    ) -> Result<(Vec<FunctionInfo>, Vec<TypeInfo>, Vec<FunctionInfo>)> {
+    ) -> Result<FileAnalysis> {
         // Detect language from file extension
         let language = Language::from_path(file_path)
             .ok_or_else(|| anyhow::anyhow!("Unsupported file type: {}", file_path.display()))?;
@@ -528,14 +577,15 @@ impl TreeSitterAnalyzer {
         })?;
 
         // Single-pass extraction with optimized call analysis
-        let (raw_functions, mut raw_types, raw_macros) = self.extract_all_with_embedded_data(
-            &tree,
-            source_code,
-            file_path,
-            git_hash,
-            source_root,
-            language,
-        )?;
+        let (raw_functions, mut raw_types, raw_macros, dispatch_sites) = self
+            .extract_all_with_embedded_data(
+                &tree,
+                source_code,
+                file_path,
+                git_hash,
+                source_root,
+                language,
+            )?;
 
         // Extract typedefs as TypeInfo with kind="typedef" and add to types (C only)
         if language == Language::C {
@@ -555,7 +605,7 @@ impl TreeSitterAnalyzer {
 
         // Call relationships are now embedded in function/macro JSON columns
 
-        Ok((functions, types, macros))
+        Ok((functions, types, macros, dispatch_sites))
     }
 
     /// Optimized single-pass extraction with embedded JSON data
@@ -568,9 +618,9 @@ impl TreeSitterAnalyzer {
         git_hash: &str,
         source_root: Option<&Path>,
         language: Language,
-    ) -> Result<(Vec<FunctionInfo>, Vec<TypeInfo>, Vec<FunctionInfo>)> {
+    ) -> Result<FileAnalysis> {
         // Single pass: extract all calls once and map them to functions by byte ranges
-        let all_calls = self.extract_all_calls_optimized(tree, source_code, language)?;
+        let extraction = self.extract_all_calls_optimized(tree, source_code, language)?;
 
         // Create extraction context
         let ctx = ExtractionContext {
@@ -583,7 +633,7 @@ impl TreeSitterAnalyzer {
         };
 
         // Extract functions with embedded call data
-        let functions = self.extract_functions_with_calls(&ctx, &all_calls)?;
+        let (functions, dispatch_sites) = self.extract_functions_with_calls(&ctx, &extraction)?;
 
         // Extract types (single traversal as before)
         let types = self.extract_types(
@@ -605,7 +655,7 @@ impl TreeSitterAnalyzer {
             language,
         )?;
 
-        Ok((functions, types, macros))
+        Ok((functions, types, macros, dispatch_sites))
     }
 
     /// Extract all calls in a single tree traversal and return with byte positions
@@ -614,29 +664,75 @@ impl TreeSitterAnalyzer {
         tree: &Tree,
         source_code: &str,
         language: Language,
-    ) -> Result<Vec<(String, usize, usize)>> {
+    ) -> Result<CallExtraction> {
         let queries = self.get_queries(language);
-        let mut calls = Vec::new();
+        let mut extraction = CallExtraction::default();
         let mut cursor = QueryCursor::new();
-        let mut captures = cursor.captures(
+        let mut matches = cursor.matches(
             &queries.call_query,
             tree.root_node(),
             source_code.as_bytes(),
         );
 
-        while let Some((call_match, _)) = captures.next() {
-            for capture in call_match.captures {
-                let capture_name = &queries.call_query.capture_names()[capture.index as usize];
+        while let Some(call_match) = matches.next() {
+            let mut member: Option<tree_sitter::Node> = None;
+            let mut receiver: Option<tree_sitter::Node> = None;
 
-                if *capture_name == "function_name" {
-                    if let Some(call) = Self::call_site_from_capture(capture.node, source_code) {
-                        calls.push(call);
+            for capture in call_match.captures {
+                match queries.call_query.capture_names()[capture.index as usize] {
+                    "function_name" => {
+                        if let Some(call) = Self::call_site_from_capture(capture.node, source_code)
+                        {
+                            extraction.calls.push(call);
+                        }
                     }
+                    "member_name" => member = Some(capture.node),
+                    "receiver" => receiver = Some(capture.node),
+                    _ => {}
                 }
+            }
+
+            // A member call names a member, not a function. Record where the
+            // dispatch happens; what it can reach is resolved by joining
+            // against the functions installed in that member.
+            if let Some(member) = member {
+                let name = &source_code[member.byte_range()];
+                if name.is_empty() {
+                    continue;
+                }
+
+                let (receiver_expr, kind) = match receiver {
+                    Some(receiver) => (
+                        Some(collapse_whitespace(&source_code[receiver.byte_range()])),
+                        Self::member_kind(member, source_code),
+                    ),
+                    None => (None, DispatchKind::MemberArrow),
+                };
+
+                extraction.member_sites.push(RawDispatchSite {
+                    member: name.to_string(),
+                    receiver_expr,
+                    kind,
+                    byte_start: member.start_byte(),
+                    line: member.start_position().row as u32 + 1,
+                });
             }
         }
 
-        Ok(calls)
+        Ok(extraction)
+    }
+
+    /// `a->m()` and `a.m()` differ only in the operator between receiver and
+    /// member, which the grammar leaves as an anonymous node.
+    fn member_kind(member: tree_sitter::Node, source_code: &str) -> DispatchKind {
+        let field = member
+            .parent()
+            .and_then(|field_expression| field_expression.child_by_field_name("operator"));
+
+        match field.map(|op| &source_code[op.byte_range()]) {
+            Some(".") => DispatchKind::MemberDot,
+            _ => DispatchKind::MemberArrow,
+        }
     }
 
     /// Turn one `function_name` capture into a call site: the called name and
@@ -659,8 +755,10 @@ impl TreeSitterAnalyzer {
     fn extract_functions_with_calls(
         &self,
         ctx: &ExtractionContext,
-        all_calls: &[(String, usize, usize)],
-    ) -> Result<Vec<FunctionInfo>> {
+        extraction: &CallExtraction,
+    ) -> Result<(Vec<FunctionInfo>, Vec<DispatchSite>)> {
+        let mut dispatch_sites: Vec<DispatchSite> = Vec::new();
+        let mut covered_sites: std::collections::HashSet<usize> = Default::default();
         let queries = self.get_queries(ctx.language);
         let mut cursor = QueryCursor::new();
         let mut captures = cursor.captures(
@@ -792,7 +890,8 @@ impl TreeSitterAnalyzer {
                 // Only extract calls and types for functions with bodies (not just declarations)
                 let (unique_calls, function_types) = if has_body {
                     // Extract calls within this function from pre-computed list (O(m) instead of O(n))
-                    let function_calls: Vec<String> = all_calls
+                    let function_calls: Vec<String> = extraction
+                        .calls
                         .iter()
                         .filter(|(_, call_start, call_end)| {
                             *call_start >= function_start_byte && *call_end <= function_end_byte
@@ -815,6 +914,22 @@ impl TreeSitterAnalyzer {
                     // For declarations only, don't extract calls or types from body
                     (Vec::new(), Vec::new())
                 };
+
+                for raw in extraction.member_sites.iter().filter(|site| {
+                    site.byte_start >= function_start_byte && site.byte_start < function_end_byte
+                }) {
+                    // The function query yields several captures per function,
+                    // so a site can be reached more than once; a site is one
+                    // row regardless.
+                    if !covered_sites.insert(raw.byte_start) {
+                        continue;
+                    }
+                    dispatch_sites.push(raw.attribute(
+                        &name,
+                        &self.make_relative_path(ctx.file_path, ctx.source_root),
+                        ctx.git_hash,
+                    ));
+                }
 
                 let func = FunctionInfo {
                     name: name.clone(),
@@ -849,7 +964,21 @@ impl TreeSitterAnalyzer {
             }
         }
 
-        Ok(functions)
+        // Python module level and class bodies, C++ and Rust static
+        // initializers: a dispatch that belongs to no function still happened.
+        for raw in extraction
+            .member_sites
+            .iter()
+            .filter(|site| !covered_sites.contains(&site.byte_start))
+        {
+            dispatch_sites.push(raw.attribute(
+                "",
+                &self.make_relative_path(ctx.file_path, ctx.source_root),
+                ctx.git_hash,
+            ));
+        }
+
+        Ok((functions, dispatch_sites))
     }
 
     /// Extract macros with embedded call/type data (optimized)
@@ -878,7 +1007,7 @@ impl TreeSitterAnalyzer {
         language: Language,
     ) -> Result<Vec<FunctionInfo>> {
         // Use the optimized approach but without pre-computed calls (for compatibility)
-        let all_calls = self.extract_all_calls_optimized(tree, source, language)?;
+        let extraction = self.extract_all_calls_optimized(tree, source, language)?;
         let ctx = ExtractionContext {
             tree,
             source,
@@ -887,7 +1016,9 @@ impl TreeSitterAnalyzer {
             source_root,
             language,
         };
-        self.extract_functions_with_calls(&ctx, &all_calls)
+        let (functions, _dispatch_sites) = self.extract_functions_with_calls(&ctx, &extraction)?;
+
+        Ok(functions)
     }
 
     fn extract_comments(
@@ -2382,7 +2513,7 @@ mod tests {
 
     fn fields_of(source: &str, type_name: &str) -> Vec<(String, String)> {
         let mut analyzer = TreeSitterAnalyzer::new().unwrap();
-        let (_functions, types, _macros) = analyzer
+        let (_functions, types, _macros, _sites) = analyzer
             .analyze_source_with_metadata(source, Path::new("test.c"), "testhash", None)
             .unwrap();
 
@@ -2395,6 +2526,85 @@ mod tests {
             .iter()
             .map(|m| (m.name.clone(), m.type_name.clone()))
             .collect()
+    }
+
+    fn analyze(source: &str, path: &str) -> (Vec<FunctionInfo>, Vec<DispatchSite>) {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let (functions, _types, _macros, sites) = analyzer
+            .analyze_source_with_metadata(source, Path::new(path), "testhash", None)
+            .unwrap();
+        (functions, sites)
+    }
+
+    #[test]
+    fn member_call_is_a_dispatch_site_not_a_call_to_the_member() {
+        let (functions, sites) = analyze(
+            "struct file;\n\
+             struct ops { int (*read)(struct file *); };\n\
+             int read(struct file *f) { return 0; }\n\
+             int go(struct ops *o, struct file *f) { return o->read(f); }\n",
+            "test.c",
+        );
+
+        let go = functions.iter().find(|f| f.name == "go").unwrap();
+        // A real function named `read` exists, which is exactly how a member
+        // name became a confident wrong answer before.
+        assert!(
+            !go.calls
+                .clone()
+                .unwrap_or_default()
+                .contains(&"read".to_string()),
+            "member name recorded as a called function: {:?}",
+            go.calls
+        );
+
+        assert_eq!(sites.len(), 1, "expected one dispatch site: {sites:?}");
+        let site = &sites[0];
+        assert_eq!(site.caller_name, "go");
+        assert_eq!(site.member, "read");
+        assert_eq!(site.receiver_expr.as_deref(), Some("o"));
+        assert_eq!(site.kind, DispatchKind::MemberArrow);
+        assert_eq!(site.line, 4);
+    }
+
+    #[test]
+    fn dot_and_arrow_are_distinguished() {
+        let (_functions, sites) = analyze(
+            "struct ops { int (*run)(void); };\n\
+             int go(struct ops *p, struct ops v) { return p->run() + v.run(); }\n",
+            "test.c",
+        );
+
+        let kinds: Vec<DispatchKind> = sites.iter().map(|s| s.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![DispatchKind::MemberArrow, DispatchKind::MemberDot]
+        );
+    }
+
+    #[test]
+    fn dispatch_outside_any_function_is_still_recorded() {
+        // Python module level and class bodies run code; a site there belongs
+        // to no function, and dropping it is how it stays invisible today.
+        let (_functions, sites) = analyze(
+            "class Handler:\n\
+             \tdef handle(self):\n\
+             \t\treturn 1\n\
+             \n\
+             h = Handler()\n\
+             h.handle()\n",
+            "test.py",
+        );
+
+        let module_level: Vec<&DispatchSite> =
+            sites.iter().filter(|s| s.caller_name.is_empty()).collect();
+        assert_eq!(
+            module_level.len(),
+            1,
+            "expected the module-level dispatch: {sites:?}"
+        );
+        assert_eq!(module_level[0].member, "handle");
+        assert_eq!(module_level[0].line, 6);
     }
 
     #[test]
@@ -2425,7 +2635,7 @@ mod tests {
 
     fn params_of(source: &str, func_name: &str) -> Vec<(String, String)> {
         let mut analyzer = TreeSitterAnalyzer::new().unwrap();
-        let (functions, _types, _macros) = analyzer
+        let (functions, _types, _macros, _sites) = analyzer
             .analyze_source_with_metadata(source, Path::new("test.c"), "testhash", None)
             .unwrap();
 

@@ -102,6 +102,64 @@ pub struct FieldInfo {
     pub offset: Option<u64>,
 }
 
+/// A call that dispatches through a value rather than naming a function:
+/// `ops->read(...)`, `(*fp)(...)`, a callback handed to another function.
+///
+/// The candidates are not known when the site is recorded. Resolution joins
+/// `(receiver_type, member)` against the functions installed in that slot, so
+/// what is stored here is only what the containing file itself proves.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DispatchSite {
+    /// Function containing the call site, empty when there is none: Python
+    /// module level and class bodies, C++ and Rust static initializers.
+    pub caller_name: String,
+    pub file_path: String,
+    pub git_file_hash: String,
+    /// Byte offset of the site within the file: unique per site, and stable
+    /// across a reindex of unchanged content.
+    pub byte_start: u64,
+    pub line: u32,
+    /// Member dispatched through, empty when the call goes through a plain
+    /// pointer value with no member involved.
+    pub member: String,
+    /// Receiver text as written, for display and for later type resolution.
+    pub receiver_expr: Option<String>,
+    /// Receiver type when the containing file proves it.
+    pub receiver_type: Option<String>,
+    pub kind: DispatchKind,
+    /// A target the site itself names, such as a local pointer's initializer.
+    pub target: Option<String>,
+}
+
+/// How a dispatch site was written. Stored, so values are append-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DispatchKind {
+    /// `receiver->member(...)`
+    MemberArrow,
+    /// `receiver.member(...)`
+    MemberDot,
+}
+
+impl DispatchKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DispatchKind::MemberArrow => "member_arrow",
+            DispatchKind::MemberDot => "member_dot",
+        }
+    }
+
+    /// Parse a stored `kind`. An unknown value is an error for the caller
+    /// rather than a silent default: a newer writer must not read as a
+    /// member call.
+    pub fn from_column_value(text: &str) -> Option<Self> {
+        match text {
+            "member_arrow" => Some(DispatchKind::MemberArrow),
+            "member_dot" => Some(DispatchKind::MemberDot),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TypedefInfo {
     pub name: String,
