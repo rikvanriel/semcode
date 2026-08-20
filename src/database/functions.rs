@@ -663,23 +663,43 @@ impl FunctionStore {
             return Ok(std::collections::HashMap::new());
         }
 
+        let (all_function_data, all_body_hashes) = self.fetch_metadata_by_names(names).await?;
+        let content_map = self.fetch_bodies_for_hashes(all_body_hashes).await?;
+
+        let mut result = std::collections::HashMap::new();
+        for func_data in all_function_data {
+            let name = func_data.name.clone();
+            result.insert(name, Self::metadata_into_function(func_data, &content_map));
+        }
+
+        Ok(result)
+    }
+
+    /// Build a `name IN (...)` filter for one chunk of names.
+    fn name_in_filter(names: &[String]) -> String {
+        let name_list = names
+            .iter()
+            .map(|name| format!("'{}'", name.replace("'", "''")))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        format!("name IN ({name_list})")
+    }
+
+    /// Fetch metadata for every row whose name is in `names`, along with the
+    /// set of body hashes those rows reference.
+    async fn fetch_metadata_by_names(
+        &self,
+        names: &[String],
+    ) -> Result<(Vec<FunctionMetadata>, std::collections::HashSet<String>)> {
         let table = self.connection.open_table("functions").execute().await?;
         let mut all_function_data = Vec::new();
         let mut all_body_hashes = std::collections::HashSet::new();
 
-        // Step 1: Fetch all function metadata and collect unique body hashes
         for chunk in names.chunks(100) {
-            let name_list = chunk
-                .iter()
-                .map(|name| format!("'{}'", name.replace("'", "''")))
-                .collect::<Vec<_>>()
-                .join(",");
-
-            let filter = format!("name IN ({name_list})");
-
             let results = table
                 .query()
-                .only_if(filter)
+                .only_if(Self::name_in_filter(chunk))
                 .execute()
                 .await?
                 .try_collect::<Vec<_>>()
@@ -689,7 +709,6 @@ impl FunctionStore {
                 for i in 0..batch.num_rows() {
                     if let Ok(Some(func_data)) = self.extract_function_metadata_from_batch(batch, i)
                     {
-                        // Collect body hash if not null
                         if let Some(ref body_hash) = func_data.body_hash {
                             all_body_hashes.insert(body_hash.clone());
                         }
@@ -699,38 +718,43 @@ impl FunctionStore {
             }
         }
 
-        // Step 2: Bulk fetch all content for the collected hashes
-        let content_map = if !all_body_hashes.is_empty() {
-            let hash_vec: Vec<String> = all_body_hashes.into_iter().collect();
-            self.bulk_get_content(&hash_vec).await?
-        } else {
-            std::collections::HashMap::new()
-        };
+        Ok((all_function_data, all_body_hashes))
+    }
 
-        // Step 3: Reconstruct FunctionInfo objects with content
-        let mut result = std::collections::HashMap::new();
-        for func_data in all_function_data {
-            let body = match func_data.body_hash {
-                Some(hash) => content_map.get(&hash).cloned().unwrap_or_default(),
-                None => String::new(),
-            };
-
-            let function_info = FunctionInfo {
-                name: func_data.name.clone(),
-                file_path: func_data.file_path,
-                git_file_hash: func_data.git_file_hash,
-                line_start: func_data.line_start,
-                line_end: func_data.line_end,
-                return_type: func_data.return_type,
-                parameters: func_data.parameters,
-                body,
-                calls: func_data.calls,
-                types: func_data.types,
-            };
-
-            result.insert(func_data.name, function_info);
+    /// Bulk fetch the bodies for a set of content hashes.
+    async fn fetch_bodies_for_hashes(
+        &self,
+        hashes: std::collections::HashSet<String>,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        if hashes.is_empty() {
+            return Ok(std::collections::HashMap::new());
         }
 
-        Ok(result)
+        let hash_vec: Vec<String> = hashes.into_iter().collect();
+        self.bulk_get_content(&hash_vec).await
+    }
+
+    /// Attach the body to one metadata row.
+    fn metadata_into_function(
+        func_data: FunctionMetadata,
+        content_map: &std::collections::HashMap<String, String>,
+    ) -> FunctionInfo {
+        let body = match func_data.body_hash {
+            Some(hash) => content_map.get(&hash).cloned().unwrap_or_default(),
+            None => String::new(),
+        };
+
+        FunctionInfo {
+            name: func_data.name,
+            file_path: func_data.file_path,
+            git_file_hash: func_data.git_file_hash,
+            line_start: func_data.line_start,
+            line_end: func_data.line_end,
+            return_type: func_data.return_type,
+            parameters: func_data.parameters,
+            body,
+            calls: func_data.calls,
+            types: func_data.types,
+        }
     }
 }
