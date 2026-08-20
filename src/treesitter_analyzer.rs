@@ -2554,23 +2554,57 @@ impl TreeSitterAnalyzer {
     }
 
     /// Extract calls and types from macro definition (simple text-based analysis)
+    /// The body of a `#define`, without the directive, the macro name or its
+    /// parameter list — none of which is a call, though `NAME(` looks like one.
+    fn macro_body(definition: &str) -> &str {
+        let Some(rest) = definition.strip_prefix("#define") else {
+            return definition;
+        };
+        let rest = rest.trim_start();
+
+        let name_end = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        let rest = &rest[name_end..];
+
+        // A function-like macro's parameter list follows the name directly.
+        match rest.strip_prefix('(') {
+            Some(params) => match params.find(')') {
+                Some(end) => params[end + 1..].trim_start(),
+                None => params,
+            },
+            None => rest.trim_start(),
+        }
+    }
+
     fn extract_macro_calls_and_types(&self, definition: &str) -> (Vec<String>, Vec<String>) {
         let mut calls = Vec::new();
         let mut types = Vec::new();
 
-        // Simple regex-like patterns for function calls: word followed by '('
-        let definition_text = definition.trim();
-        let words: Vec<&str> = definition_text.split_whitespace().collect();
+        let definition_text = Self::macro_body(definition.trim());
 
-        for (i, word) in words.iter().enumerate() {
-            // Look for function call pattern: identifier followed by (
-            if word.ends_with('(') || (i + 1 < words.len() && words[i + 1] == "(") {
-                let potential_call = word.trim_end_matches('(');
-                if self.is_valid_identifier(potential_call) {
-                    calls.push(potential_call.to_string());
-                }
+        // A call is an identifier immediately before a '(' — which is not a
+        // whitespace-separated token, since `helper(x)` is one word.
+        for (offset, _) in definition_text.match_indices('(') {
+            let before = definition_text[..offset].trim_end();
+            // Step over the delimiter by its own width: a macro body can hold
+            // any UTF-8, and slicing at delimiter + 1 splits a multi-byte
+            // character.
+            let start = before
+                .char_indices()
+                .rev()
+                .find(|(_, c)| !(c.is_alphanumeric() || *c == '_'))
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0);
+            let name = &before[start..];
+
+            if self.is_valid_identifier(name) {
+                calls.push(name.to_string());
             }
+        }
 
+        let words: Vec<&str> = definition_text.split_whitespace().collect();
+        for (i, word) in words.iter().enumerate() {
             // Look for type usage patterns (struct/union/enum keywords)
             if (*word == "struct" || *word == "union" || *word == "enum") && i + 1 < words.len() {
                 let type_name = words[i + 1].trim_end_matches(&['*', '&', ';', ',', ')', '}'][..]);
@@ -2882,6 +2916,72 @@ mod tests {
         assert_eq!(param[0].receiver_expr.as_deref(), Some("cb"));
         // Nothing in this function says what cb points at.
         assert_eq!(param[0].target, None);
+    }
+
+    fn macro_calls(source: &str, macro_name: &str) -> Vec<String> {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        // Macros come back separately; the indexer merges them into the
+        // functions table.
+        let (_functions, _types, macros, _sites) = analyzer
+            .analyze_source_with_metadata(source, Path::new("test.c"), "testhash", None)
+            .unwrap();
+
+        macros
+            .iter()
+            .find(|f| f.name == macro_name)
+            .unwrap_or_else(|| panic!("macro {macro_name} not extracted"))
+            .calls
+            .clone()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn macro_body_calls_are_found_without_a_space_before_the_paren() {
+        // The kernel spelling. Before, only `helper ( x )` was recognised, so
+        // a wrapper macro contributed no edges at all.
+        let source = "int helper(int x) { return x; }\n\
+                      void spin_lock_irq(int *lock) { }\n\
+                      #define TIGHT(x) helper(x)\n\
+                      #define SPACED(x) helper( x )\n\
+                      #define xa_lock_irq(xa) spin_lock_irq(&(xa)->xa_lock)\n";
+
+        assert_eq!(macro_calls(source, "TIGHT"), vec!["helper".to_string()]);
+        assert_eq!(macro_calls(source, "SPACED"), vec!["helper".to_string()]);
+        assert_eq!(
+            macro_calls(source, "xa_lock_irq"),
+            vec!["spin_lock_irq".to_string()]
+        );
+    }
+
+    #[test]
+    fn macro_body_with_multibyte_text_does_not_panic() {
+        // Kernel headers carry UTF-8 in comments and strings; slicing the
+        // body at a byte offset inside one of those characters panics, and a
+        // panicking worker takes every file it had left with it.
+        let source = "int helper(int x) { return x; }\n\
+                      #define DEGREES(x) /* 45° turn */ helper(x)\n\
+                      #define NAMED(x) \"café\" helper(x)\n";
+
+        assert_eq!(macro_calls(source, "DEGREES"), vec!["helper".to_string()]);
+        assert_eq!(macro_calls(source, "NAMED"), vec!["helper".to_string()]);
+    }
+
+    #[test]
+    fn macro_body_parentheses_that_are_not_calls_record_nothing() {
+        let source = "#define GROUPED(x) ((x) + 1)\n\
+                      #define CASTED(x) ((unsigned long)(x))\n";
+
+        assert!(
+            macro_calls(source, "GROUPED").is_empty(),
+            "grouping parens read as a call: {:?}",
+            macro_calls(source, "GROUPED")
+        );
+        // A cast names a type, not a function; `(x)` has no identifier before it.
+        assert!(
+            !macro_calls(source, "CASTED").contains(&"x".to_string()),
+            "cast operand read as a call: {:?}",
+            macro_calls(source, "CASTED")
+        );
     }
 
     #[test]
