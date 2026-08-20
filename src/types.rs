@@ -177,6 +177,52 @@ impl DispatchKind {
     }
 }
 
+/// A function installed in a struct member: the other half of a dispatch
+/// site. `.read = my_read` in a `struct file_operations` initializer says
+/// that a call through `file_operations::read` can reach `my_read`.
+///
+/// The target is recorded as written. Whether it names a function is not
+/// knowable while parsing one file, and does not need to be: resolution
+/// joins the target against the functions table, and an initializer holding
+/// a constant simply never joins.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Registration {
+    /// Struct or typedef whose member is being initialised.
+    pub container_type: String,
+    pub member: String,
+    /// Identifier the member is initialised with.
+    pub target: String,
+    pub file_path: String,
+    pub git_file_hash: String,
+    pub byte_start: u64,
+    pub line: u32,
+    /// Function containing the initializer, empty at file scope.
+    pub enclosing_function: String,
+    pub kind: RegistrationKind,
+}
+
+/// How a function came to be installed. Stored, so values are append-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RegistrationKind {
+    /// `.member = target` inside an initializer
+    DesignatedInit,
+}
+
+impl RegistrationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RegistrationKind::DesignatedInit => "designated_init",
+        }
+    }
+
+    pub fn from_column_value(text: &str) -> Option<Self> {
+        match text {
+            "designated_init" => Some(RegistrationKind::DesignatedInit),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TypedefInfo {
     pub name: String,

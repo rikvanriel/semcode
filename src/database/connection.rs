@@ -42,6 +42,7 @@ pub struct DatabaseManager {
     processed_file_store: ProcessedFileStore,
     content_store: ContentStore,
     dispatch_site_store: crate::database::dispatch_sites::DispatchSiteStore,
+    registration_store: crate::database::registrations::RegistrationStore,
     symbol_filename_store: SymbolFilenameStore,
     branch_store: IndexedBranchStore,
     workdir_index: std::sync::RwLock<Option<WorkdirIndex>>,
@@ -69,6 +70,9 @@ impl DatabaseManager {
             processed_file_store: ProcessedFileStore::new(connection.clone()),
             content_store: ContentStore::new(connection.clone()),
             dispatch_site_store: crate::database::dispatch_sites::DispatchSiteStore::new(
+                connection.clone(),
+            ),
+            registration_store: crate::database::registrations::RegistrationStore::new(
                 connection.clone(),
             ),
             symbol_filename_store: SymbolFilenameStore::new(connection.clone()),
@@ -681,6 +685,41 @@ impl DatabaseManager {
         sites: Vec<crate::types::DispatchSite>,
     ) -> Result<()> {
         self.dispatch_site_store.insert_batch(sites).await
+    }
+
+    /// Record functions installed in struct members.
+    pub async fn insert_registrations(
+        &self,
+        registrations: Vec<crate::types::Registration>,
+    ) -> Result<()> {
+        self.registration_store.insert_batch(registrations).await
+    }
+
+    /// Everything installed in one member of one type.
+    pub async fn find_registrations_for_slot(
+        &self,
+        container_type: &str,
+        member: &str,
+    ) -> Result<Vec<crate::types::Registration>> {
+        self.registration_store
+            .find_by_slot(container_type, member)
+            .await
+    }
+
+    /// Every place a function is installed.
+    pub async fn find_registrations_of(
+        &self,
+        target: &str,
+    ) -> Result<Vec<crate::types::Registration>> {
+        self.registration_store.find_by_target(target).await
+    }
+
+    /// Everything installed in a member of this name, whatever the type.
+    pub async fn find_registrations_by_member(
+        &self,
+        member: &str,
+    ) -> Result<Vec<crate::types::Registration>> {
+        self.registration_store.find_by_member(member).await
     }
 
     /// Dispatch sites that go through the named member.
@@ -6249,6 +6288,62 @@ mod tests {
             calls: Some(vec!["target".to_string()]),
             types: None,
         }
+    }
+
+    #[tokio::test]
+    async fn registrations_are_looked_up_by_slot_and_by_target() {
+        use crate::types::{Registration, RegistrationKind};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = DatabaseManager::new(
+            temp_dir.path().to_str().unwrap(),
+            temp_dir.path().to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        db.create_tables().await.unwrap();
+
+        let registration = |member: &str, target: &str, byte_start: u64| Registration {
+            container_type: "file_operations".to_string(),
+            member: member.to_string(),
+            target: target.to_string(),
+            file_path: "a.c".to_string(),
+            git_file_hash: "hash-a".to_string(),
+            byte_start,
+            line: 10,
+            enclosing_function: String::new(),
+            kind: RegistrationKind::DesignatedInit,
+        };
+
+        let rows = vec![
+            registration("read", "my_read", 100),
+            registration("write", "my_write", 140),
+        ];
+        db.insert_registrations(rows.clone()).await.unwrap();
+        // Reindexing the same file must not duplicate them.
+        db.insert_registrations(rows).await.unwrap();
+
+        let slot = db
+            .find_registrations_for_slot("file_operations", "read")
+            .await
+            .unwrap();
+        assert_eq!(
+            slot.len(),
+            1,
+            "duplicate rows for one initializer: {slot:?}"
+        );
+        assert_eq!(slot[0].target, "my_read");
+
+        let by_target = db.find_registrations_of("my_write").await.unwrap();
+        assert_eq!(by_target.len(), 1);
+        assert_eq!(by_target[0].member, "write");
+
+        // A member of a different type must not answer for this one.
+        let other = db
+            .find_registrations_for_slot("other_ops", "read")
+            .await
+            .unwrap();
+        assert!(other.is_empty(), "slot lookup ignored the type: {other:?}");
     }
 
     #[tokio::test]

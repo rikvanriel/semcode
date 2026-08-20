@@ -4,7 +4,7 @@ use crate::git::walk_tree_at_commit_with_repo;
 use crate::indexer::{list_shas_in_range, process_commits_pipeline};
 use crate::{
     DatabaseManager, DispatchSite, FunctionInfo, GitFileEntry, GitFileManifestEntry,
-    ProcessedFileRecord, TreeSitterAnalyzer, TypeInfo,
+    ProcessedFileRecord, Registration, TreeSitterAnalyzer, TypeInfo,
 };
 use anyhow::Result;
 use dashmap::DashSet;
@@ -30,6 +30,7 @@ struct GitTupleResults {
     functions: Vec<FunctionInfo>,
     types: Vec<TypeInfo>,
     dispatch_sites: Vec<DispatchSite>,
+    registrations: Vec<Registration>,
     processed_files: Vec<ProcessedFileRecord>,
     files_processed: usize,
 }
@@ -39,6 +40,7 @@ impl GitTupleResults {
         self.functions.extend(other.functions);
         self.types.extend(other.types);
         self.dispatch_sites.extend(other.dispatch_sites);
+        self.registrations.extend(other.registrations);
         self.processed_files.extend(other.processed_files);
         self.files_processed += other.files_processed;
     }
@@ -248,8 +250,12 @@ fn process_git_file_tuple_with_repo(
 
     // Check analysis results
     let analysis = analysis_result?;
-    let (mut functions, types, dispatch_sites) =
-        (analysis.functions, analysis.types, analysis.dispatch_sites);
+    let (mut functions, types, dispatch_sites, registrations) = (
+        analysis.functions,
+        analysis.types,
+        analysis.dispatch_sites,
+        analysis.registrations,
+    );
     let macros = analysis.macros;
 
     // Macros are now stored as functions - combine them
@@ -271,6 +277,7 @@ fn process_git_file_tuple_with_repo(
         functions,
         types,
         dispatch_sites,
+        registrations,
         processed_files: vec![processed_file_record],
         files_processed: 1,
     };
@@ -602,7 +609,13 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
                         let type_count = batch.types.len();
 
                         // Insert all three types in parallel
-                        let (func_result, type_result, dispatch_result, processed_files_result) = tokio::join!(
+                        let (
+                            func_result,
+                            type_result,
+                            dispatch_result,
+                            registration_result,
+                            processed_files_result,
+                        ) = tokio::join!(
                             async {
                                 if !batch.functions.is_empty() {
                                     db_manager_clone.insert_functions(batch.functions).await
@@ -621,6 +634,15 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
                                 if !batch.dispatch_sites.is_empty() {
                                     db_manager_clone
                                         .insert_dispatch_sites(batch.dispatch_sites)
+                                        .await
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                            async {
+                                if !batch.registrations.is_empty() {
+                                    db_manager_clone
+                                        .insert_registrations(batch.registrations)
                                         .await
                                 } else {
                                     Ok(())
@@ -654,6 +676,13 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
                         if let Err(e) = dispatch_result {
                             error!(
                                 "Inserter {} failed to insert dispatch sites: {}",
+                                inserter_id, e
+                            );
+                            insertion_successful = false;
+                        }
+                        if let Err(e) = registration_result {
+                            error!(
+                                "Inserter {} failed to insert registrations: {}",
                                 inserter_id, e
                             );
                             insertion_successful = false;
@@ -926,7 +955,13 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
                         let func_count = batch.functions.len();
                         let type_count = batch.types.len();
 
-                        let (func_result, type_result, dispatch_result, processed_files_result) = tokio::join!(
+                        let (
+                            func_result,
+                            type_result,
+                            dispatch_result,
+                            registration_result,
+                            processed_files_result,
+                        ) = tokio::join!(
                             async {
                                 if !batch.functions.is_empty() {
                                     db_manager_clone.insert_functions(batch.functions).await
@@ -945,6 +980,15 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
                                 if !batch.dispatch_sites.is_empty() {
                                     db_manager_clone
                                         .insert_dispatch_sites(batch.dispatch_sites)
+                                        .await
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                            async {
+                                if !batch.registrations.is_empty() {
+                                    db_manager_clone
+                                        .insert_registrations(batch.registrations)
                                         .await
                                 } else {
                                     Ok(())
@@ -977,6 +1021,13 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
                         if let Err(e) = dispatch_result {
                             error!(
                                 "Inserter {} failed to insert dispatch sites: {}",
+                                inserter_id, e
+                            );
+                            insertion_successful = false;
+                        }
+                        if let Err(e) = registration_result {
+                            error!(
+                                "Inserter {} failed to insert registrations: {}",
                                 inserter_id, e
                             );
                             insertion_successful = false;

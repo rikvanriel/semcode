@@ -8,7 +8,7 @@ use tree_sitter::{Parser, Query, QueryCursor, Tree};
 
 use crate::types::{
     DispatchKind, DispatchSite, FieldInfo, FunctionInfo, GlobalTypeRegistry, MacroParams,
-    ParameterInfo, TypeInfo,
+    ParameterInfo, Registration, RegistrationKind, TypeInfo,
 };
 // TemporaryCallRelationship import removed - call relationships are now embedded in function JSON columns
 use crate::hash::compute_file_hash;
@@ -63,6 +63,8 @@ pub struct FileAnalysis {
     pub macros: Vec<FunctionInfo>,
     /// Calls that dispatch through a value; their targets are resolved later.
     pub dispatch_sites: Vec<DispatchSite>,
+    /// Functions installed in struct members: what those sites can reach.
+    pub registrations: Vec<Registration>,
 }
 
 /// Calls found in one file: resolved edges, and dispatch sites whose targets
@@ -75,6 +77,33 @@ struct CallExtraction {
     /// naming one of them is recognised as dispatch rather than a call to a
     /// function of that name.
     pointer_vars: Vec<PointerVar>,
+    registrations: Vec<RawRegistration>,
+}
+
+/// A designated initializer before it is attributed to a function.
+#[derive(Debug, Clone)]
+struct RawRegistration {
+    container_type: String,
+    member: String,
+    target: String,
+    byte_start: usize,
+    line: u32,
+}
+
+impl RawRegistration {
+    fn attribute(&self, enclosing: &str, file_path: &str, git_hash: &str) -> Registration {
+        Registration {
+            container_type: self.container_type.clone(),
+            member: self.member.clone(),
+            target: self.target.clone(),
+            file_path: file_path.to_string(),
+            git_file_hash: git_hash.to_string(),
+            byte_start: self.byte_start as u64,
+            line: self.line,
+            enclosing_function: enclosing.to_string(),
+            kind: RegistrationKind::DesignatedInit,
+        }
+    }
 }
 
 /// A declared function-pointer variable or parameter.
@@ -611,6 +640,7 @@ impl TreeSitterAnalyzer {
             types: mut raw_types,
             macros: raw_macros,
             dispatch_sites,
+            registrations,
         } = self.extract_all_with_embedded_data(
             &tree,
             source_code,
@@ -643,6 +673,7 @@ impl TreeSitterAnalyzer {
             types,
             macros,
             dispatch_sites,
+            registrations,
         })
     }
 
@@ -671,7 +702,8 @@ impl TreeSitterAnalyzer {
         };
 
         // Extract functions with embedded call data
-        let (functions, dispatch_sites) = self.extract_functions_with_calls(&ctx, &extraction)?;
+        let (functions, dispatch_sites, registrations) =
+            self.extract_functions_with_calls(&ctx, &extraction)?;
 
         // Extract types (single traversal as before)
         let types = self.extract_types(
@@ -698,6 +730,7 @@ impl TreeSitterAnalyzer {
             types,
             macros,
             dispatch_sites,
+            registrations,
         })
     }
 
@@ -796,8 +829,131 @@ impl TreeSitterAnalyzer {
         }
 
         extraction.pointer_vars = Self::collect_pointer_vars(tree.root_node(), source_code);
+        extraction.registrations = Self::collect_registrations(tree.root_node(), source_code);
 
         Ok(extraction)
+    }
+
+    /// Every `.member = target` in the file whose container type the file
+    /// itself states. An initializer whose type is not stated is skipped: a
+    /// registration filed under the wrong type joins with the wrong dispatch
+    /// sites, which is worse than not having it.
+    fn collect_registrations(root: tree_sitter::Node, source: &str) -> Vec<RawRegistration> {
+        let mut found = Vec::new();
+        let mut stack = vec![root];
+
+        while let Some(node) = stack.pop() {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+
+            if node.kind() != "initializer_list" {
+                continue;
+            }
+
+            let Some(container_type) = Self::initializer_container_type(node, source) else {
+                continue;
+            };
+
+            let mut cursor = node.walk();
+            for pair in node.named_children(&mut cursor) {
+                if pair.kind() != "initializer_pair" {
+                    continue;
+                }
+
+                // `.member = ...`; an array designator is a slot, not a member.
+                let Some(designator) = pair.child_by_field_name("designator") else {
+                    continue;
+                };
+                if designator.kind() != "field_designator" {
+                    continue;
+                }
+                let member = designator
+                    .named_child(0)
+                    .map(|n| source[n.byte_range()].to_string())
+                    .unwrap_or_default();
+
+                let Some(value) = pair.child_by_field_name("value") else {
+                    continue;
+                };
+                // `.read = my_read` and `.read = &my_read` say the same thing.
+                let target_node = match value.kind() {
+                    "identifier" => Some(value),
+                    "pointer_expression" => value
+                        .child_by_field_name("argument")
+                        .filter(|a| a.kind() == "identifier"),
+                    _ => None,
+                };
+                let Some(target_node) = target_node else {
+                    continue;
+                };
+
+                let target = source[target_node.byte_range()].to_string();
+                if member.is_empty() || target.is_empty() {
+                    continue;
+                }
+
+                found.push(RawRegistration {
+                    container_type: container_type.clone(),
+                    member,
+                    target,
+                    byte_start: pair.start_byte(),
+                    line: pair.start_position().row as u32 + 1,
+                });
+            }
+        }
+
+        found
+    }
+
+    /// The type an initializer fills in, taken from the declaration or the
+    /// compound literal that holds it. A nested initializer states no type of
+    /// its own, and inferring one would need the member's declared type,
+    /// which usually lives in another file.
+    fn initializer_container_type(list: tree_sitter::Node, source: &str) -> Option<String> {
+        let mut node = list;
+
+        while let Some(parent) = node.parent() {
+            match parent.kind() {
+                // `(struct net_protocol) { .handler = tcp_v4_rcv }`
+                "compound_literal_expression" => {
+                    return parent
+                        .child_by_field_name("type")
+                        .and_then(|t| Self::aggregate_type_name(t, source));
+                }
+                // `static const struct file_operations fops = { ... };`
+                "init_declarator" | "declaration" => {
+                    let declaration = if parent.kind() == "declaration" {
+                        parent
+                    } else {
+                        parent.parent()?
+                    };
+                    return declaration
+                        .child_by_field_name("type")
+                        .and_then(|t| Self::aggregate_type_name(t, source));
+                }
+                // A nested initializer: the inner type is not stated here.
+                "initializer_pair" | "initializer_list" => return None,
+                _ => node = parent,
+            }
+        }
+
+        None
+    }
+
+    /// `struct file_operations` and a typedef name both identify a container.
+    fn aggregate_type_name(type_node: tree_sitter::Node, source: &str) -> Option<String> {
+        match type_node.kind() {
+            "struct_specifier" | "union_specifier" => type_node
+                .child_by_field_name("name")
+                .map(|n| source[n.byte_range()].to_string()),
+            "type_identifier" => Some(source[type_node.byte_range()].to_string()),
+            "type_descriptor" => type_node
+                .child_by_field_name("type")
+                .and_then(|t| Self::aggregate_type_name(t, source)),
+            _ => None,
+        }
     }
 
     /// Every function-pointer variable and parameter declared in the file.
@@ -971,9 +1127,11 @@ impl TreeSitterAnalyzer {
         &self,
         ctx: &ExtractionContext,
         extraction: &CallExtraction,
-    ) -> Result<(Vec<FunctionInfo>, Vec<DispatchSite>)> {
+    ) -> Result<(Vec<FunctionInfo>, Vec<DispatchSite>, Vec<Registration>)> {
         let mut dispatch_sites: Vec<DispatchSite> = Vec::new();
+        let mut registrations: Vec<Registration> = Vec::new();
         let mut covered_sites: std::collections::HashSet<usize> = Default::default();
+        let mut covered_registrations: std::collections::HashSet<usize> = Default::default();
         let mut pointer_call_sites: Vec<RawDispatchSite> = Vec::new();
         let queries = self.get_queries(ctx.language);
         let mut cursor = QueryCursor::new();
@@ -1179,6 +1337,19 @@ impl TreeSitterAnalyzer {
                     ));
                 }
 
+                for raw in extraction.registrations.iter().filter(|reg| {
+                    reg.byte_start >= function_start_byte && reg.byte_start < function_end_byte
+                }) {
+                    if !covered_registrations.insert(raw.byte_start) {
+                        continue;
+                    }
+                    registrations.push(raw.attribute(
+                        &name,
+                        &self.make_relative_path(ctx.file_path, ctx.source_root),
+                        ctx.git_hash,
+                    ));
+                }
+
                 let func = FunctionInfo {
                     name: name.clone(),
                     file_path: self.make_relative_path(ctx.file_path, ctx.source_root),
@@ -1212,6 +1383,19 @@ impl TreeSitterAnalyzer {
             }
         }
 
+        // Most ops tables sit at file scope and belong to no function.
+        for raw in extraction
+            .registrations
+            .iter()
+            .filter(|reg| !covered_registrations.contains(&reg.byte_start))
+        {
+            registrations.push(raw.attribute(
+                "",
+                &self.make_relative_path(ctx.file_path, ctx.source_root),
+                ctx.git_hash,
+            ));
+        }
+
         // Python module level and class bodies, C++ and Rust static
         // initializers: a dispatch that belongs to no function still happened.
         for raw in extraction
@@ -1226,7 +1410,7 @@ impl TreeSitterAnalyzer {
             ));
         }
 
-        Ok((functions, dispatch_sites))
+        Ok((functions, dispatch_sites, registrations))
     }
 
     /// Extract macros with embedded call/type data (optimized)
@@ -1264,7 +1448,8 @@ impl TreeSitterAnalyzer {
             source_root,
             language,
         };
-        let (functions, _dispatch_sites) = self.extract_functions_with_calls(&ctx, &extraction)?;
+        let (functions, _dispatch_sites, _registrations) =
+            self.extract_functions_with_calls(&ctx, &extraction)?;
 
         Ok(functions)
     }
@@ -2998,6 +3183,124 @@ mod tests {
             !macro_calls(source, "CASTED").contains(&"x".to_string()),
             "cast operand read as a call: {:?}",
             macro_calls(source, "CASTED")
+        );
+    }
+
+    fn registrations_of(source: &str, path: &str) -> Vec<(String, String, String, String)> {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        analyzer
+            .analyze_source_with_metadata(source, Path::new(path), "testhash", None)
+            .unwrap()
+            .registrations
+            .into_iter()
+            .map(|r| (r.container_type, r.member, r.target, r.enclosing_function))
+            .collect()
+    }
+
+    #[test]
+    fn file_scope_ops_table_registers_its_functions() {
+        let found = registrations_of(
+            "struct file;\n\
+             struct file_operations { int (*read)(struct file *); };\n\
+             static int my_read(struct file *f) { return 0; }\n\
+             static int my_write(struct file *f) { return 0; }\n\
+             static const struct file_operations fops = {\n\
+             \t.read = my_read,\n\
+             \t.write = &my_write,\n\
+             \t.owner = 0,\n\
+             };\n",
+            "test.c",
+        );
+
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "file_operations".to_string(),
+                    "read".to_string(),
+                    "my_read".to_string(),
+                    String::new()
+                ),
+                // `&f` and `f` install the same thing.
+                (
+                    "file_operations".to_string(),
+                    "write".to_string(),
+                    "my_write".to_string(),
+                    String::new()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn compound_literal_inside_a_function_registers_with_its_cast_type() {
+        // net/ipv4/af_inet.c: the registration issue #9 asks about is written
+        // inside inet_init, as a compound literal assigned to a member.
+        let found = registrations_of(
+            "struct sk_buff;\n\
+             struct net_protocol { int (*handler)(struct sk_buff *); int no_policy; };\n\
+             struct hotdata { struct net_protocol tcp_protocol; };\n\
+             static struct hotdata net_hotdata;\n\
+             int tcp_v4_rcv(struct sk_buff *skb);\n\
+             static int inet_init(void)\n\
+             {\n\
+             \tnet_hotdata.tcp_protocol = (struct net_protocol) {\n\
+             \t\t.handler = tcp_v4_rcv,\n\
+             \t\t.no_policy = 1,\n\
+             \t};\n\
+             \treturn 0;\n\
+             }\n",
+            "af_inet.c",
+        );
+
+        assert_eq!(
+            found,
+            vec![(
+                "net_protocol".to_string(),
+                "handler".to_string(),
+                "tcp_v4_rcv".to_string(),
+                "inet_init".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn an_initializer_whose_type_is_not_stated_registers_nothing() {
+        // A nested initializer names no type here: the member's type is
+        // declared with the struct, usually in another file. Filing the
+        // registration under a guessed type would join it to the wrong
+        // dispatch sites.
+        let found = registrations_of(
+            "struct outer { struct inner { int (*run)(void); } in; };\n\
+             int impl(void);\n\
+             static struct outer o = { .in = { .run = impl } };\n",
+            "test.c",
+        );
+
+        let members: Vec<&str> = found.iter().map(|(_, m, _, _)| m.as_str()).collect();
+        assert!(
+            !members.contains(&"run"),
+            "nested initializer registered under a guessed type: {found:?}"
+        );
+    }
+
+    #[test]
+    fn typedef_container_is_recorded_by_its_name() {
+        let found = registrations_of(
+            "typedef struct { int (*run)(void); } Ops;\n\
+             int impl(void);\n\
+             static Ops ops = { .run = impl };\n",
+            "test.c",
+        );
+
+        assert_eq!(
+            found,
+            vec![(
+                "Ops".to_string(),
+                "run".to_string(),
+                "impl".to_string(),
+                String::new()
+            )]
         );
     }
 

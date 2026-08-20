@@ -21,6 +21,10 @@ pub enum OptimizeOutcome {
     PartialFailure,
 }
 
+/// Bumped when the meaning of stored data changes, not merely its shape: a
+/// reader that does not understand a version must refuse rather than guess.
+pub const SCHEMA_VERSION: u32 = 1;
+
 pub struct SchemaManager {
     connection: Connection,
 }
@@ -55,6 +59,14 @@ impl SchemaManager {
 
         if !table_names.iter().any(|n| n == "dispatch_sites") {
             self.create_dispatch_sites_table().await?;
+        }
+
+        if !table_names.iter().any(|n| n == "registrations") {
+            self.create_registrations_table().await?;
+        }
+
+        if !table_names.iter().any(|n| n == "schema_meta") {
+            self.create_schema_meta_table().await?;
         }
 
         if !table_names.iter().any(|n| n == "git_commits") {
@@ -144,6 +156,73 @@ impl SchemaManager {
             .create_table("dispatch_sites", vec![empty_batch])
             .execute()
             .await?;
+
+        Ok(())
+    }
+
+    /// Functions installed in struct members: `.read = my_read`. Resolution
+    /// joins these against the members dispatch sites go through.
+    pub async fn create_registrations_table(&self) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("container_type", DataType::Utf8, false),
+            Field::new("member", DataType::Utf8, false),
+            Field::new("target", DataType::Utf8, false),
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("git_file_hash", DataType::Utf8, false),
+            Field::new("byte_start", DataType::Int64, false),
+            Field::new("line", DataType::Int64, false),
+            // Empty at file scope, which is where most ops tables live.
+            Field::new("enclosing_function", DataType::Utf8, false),
+            Field::new("kind", DataType::Utf8, false),
+        ]));
+
+        self.connection
+            .create_table("registrations", vec![RecordBatch::new_empty(schema)])
+            .execute()
+            .await?;
+
+        Ok(())
+    }
+
+    /// Schema version and per-feature population marks.
+    ///
+    /// A column being present says the schema was migrated; it does not say
+    /// which rows were indexed under which rules. Indexing is incremental per
+    /// file hash, so a database can hold a feature's column while most of its
+    /// rows predate the feature. The marks here record when a feature started
+    /// being populated, which is what makes a backfill decidable.
+    pub async fn create_schema_meta_table(&self) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+
+        let table = self
+            .connection
+            .create_table("schema_meta", vec![RecordBatch::new_empty(schema.clone())])
+            .execute()
+            .await?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            .to_string();
+        let keys = vec![
+            "schema_version",
+            "populated_since:dispatch_sites",
+            "populated_since:registrations",
+        ];
+        let values = vec![SCHEMA_VERSION.to_string(), now.clone(), now];
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(keys)) as arrow::array::ArrayRef,
+                Arc::new(arrow::array::StringArray::from(values)) as arrow::array::ArrayRef,
+            ],
+        )?;
+        table.add(vec![batch]).execute().await?;
 
         Ok(())
     }
