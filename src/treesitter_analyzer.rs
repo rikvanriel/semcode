@@ -629,21 +629,30 @@ impl TreeSitterAnalyzer {
                 let capture_name = &queries.call_query.capture_names()[capture.index as usize];
 
                 if *capture_name == "function_name" {
-                    let node = capture.node;
-                    let function_name = node
-                        .utf8_text(source_code.as_bytes())
-                        .unwrap_or("")
-                        .to_string();
-
-                    // Skip empty function names or obvious non-functions
-                    if !function_name.is_empty() && !function_name.chars().all(|c| c.is_numeric()) {
-                        calls.push((function_name, node.start_byte(), node.end_byte()));
+                    if let Some(call) = Self::call_site_from_capture(capture.node, source_code) {
+                        calls.push(call);
                     }
                 }
             }
         }
 
         Ok(calls)
+    }
+
+    /// Turn one `function_name` capture into a call site: the called name and
+    /// the byte range it occupies, which is what maps a call to its caller.
+    fn call_site_from_capture(
+        node: tree_sitter::Node,
+        source_code: &str,
+    ) -> Option<(String, usize, usize)> {
+        let name = node.utf8_text(source_code.as_bytes()).unwrap_or("");
+
+        // Skip empty names and obvious non-functions.
+        if name.is_empty() || name.chars().all(|c| c.is_numeric()) {
+            return None;
+        }
+
+        Some((name.to_string(), node.start_byte(), node.end_byte()))
     }
 
     /// Extract functions with pre-computed call data (avoids per-function tree traversals)
