@@ -70,6 +70,21 @@ pub type FileAnalysis = (
 struct CallExtraction {
     calls: Vec<(String, usize, usize)>,
     member_sites: Vec<RawDispatchSite>,
+    /// Function-pointer variables declared in this file, so that a call
+    /// naming one of them is recognised as dispatch rather than a call to a
+    /// function of that name.
+    pointer_vars: Vec<PointerVar>,
+}
+
+/// A declared function-pointer variable or parameter.
+#[derive(Debug, Clone)]
+struct PointerVar {
+    name: String,
+    /// Where the declaration sits, used to scope it to its function.
+    byte_start: usize,
+    /// The function it is initialised with, when the declaration says.
+    target: Option<String>,
+    is_parameter: bool,
 }
 
 /// A dispatch site before it is attributed to the function containing it.
@@ -80,6 +95,7 @@ struct RawDispatchSite {
     kind: DispatchKind,
     byte_start: usize,
     line: u32,
+    target: Option<String>,
 }
 
 impl RawDispatchSite {
@@ -95,7 +111,7 @@ impl RawDispatchSite {
             // Typing the receiver needs the declaration; that is a later step.
             receiver_type: None,
             kind: self.kind,
-            target: None,
+            target: self.target.clone(),
         }
     }
 }
@@ -273,6 +289,12 @@ impl TreeSitterAnalyzer {
                     field: (field_identifier) @member_name
                 )
             ) @method_call
+
+            (call_expression
+                function: (parenthesized_expression
+                    (pointer_expression argument: (_) @pointer_expr)
+                )
+            ) @deref_call
         "#,
         )?;
 
@@ -688,6 +710,21 @@ impl TreeSitterAnalyzer {
                     }
                     "member_name" => member = Some(capture.node),
                     "receiver" => receiver = Some(capture.node),
+                    "pointer_expr" => {
+                        // `(*fp)(...)`: a call through a pointer value, which
+                        // the plain call pattern does not match at all.
+                        let text = collapse_whitespace(&source_code[capture.node.byte_range()]);
+                        if !text.is_empty() {
+                            extraction.member_sites.push(RawDispatchSite {
+                                member: String::new(),
+                                receiver_expr: Some(text),
+                                kind: DispatchKind::PointerDeref,
+                                byte_start: capture.node.start_byte(),
+                                line: capture.node.start_position().row as u32 + 1,
+                                target: None,
+                            });
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -715,11 +752,89 @@ impl TreeSitterAnalyzer {
                     kind,
                     byte_start: member.start_byte(),
                     line: member.start_position().row as u32 + 1,
+                    target: None,
                 });
             }
         }
 
+        extraction.pointer_vars = Self::collect_pointer_vars(tree.root_node(), source_code);
+
         Ok(extraction)
+    }
+
+    /// Every function-pointer variable and parameter declared in the file.
+    /// A call naming one of these dispatches through a value; it is not a
+    /// call to a function of that name.
+    fn collect_pointer_vars(root: tree_sitter::Node, source: &str) -> Vec<PointerVar> {
+        let mut vars = Vec::new();
+        let mut stack = vec![root];
+
+        while let Some(node) = stack.pop() {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+
+            let is_parameter = match node.kind() {
+                "parameter_declaration" => true,
+                "declaration" => false,
+                _ => continue,
+            };
+
+            let mut cursor = node.walk();
+            for declarator in node.children_by_field_name("declarator", &mut cursor) {
+                // `int (*fp)(void) = handler;` wraps the declarator in an
+                // init_declarator that also carries the initial value.
+                let (declarator, target) = if declarator.kind() == "init_declarator" {
+                    let value = declarator.child_by_field_name("value").and_then(|value| {
+                        (value.kind() == "identifier")
+                            .then(|| source[value.byte_range()].to_string())
+                    });
+                    match declarator.child_by_field_name("declarator") {
+                        Some(inner) => (inner, value),
+                        None => continue,
+                    }
+                } else {
+                    (declarator, None)
+                };
+
+                if !Self::declares_function_pointer(declarator) {
+                    continue;
+                }
+
+                if let Some(name_node) = Self::innermost_declarator_name(declarator) {
+                    let name = source[name_node.byte_range()].to_string();
+                    if !name.is_empty() {
+                        vars.push(PointerVar {
+                            name,
+                            byte_start: node.start_byte(),
+                            target,
+                            is_parameter,
+                        });
+                    }
+                }
+            }
+        }
+
+        vars
+    }
+
+    /// True for `int (*fp)(void)`: a function declarator whose own declarator
+    /// is a parenthesised pointer, as opposed to a plain function declaration.
+    fn declares_function_pointer(declarator: tree_sitter::Node) -> bool {
+        let mut node = declarator;
+
+        loop {
+            if node.kind() == "function_declarator" {
+                let inner = node.child_by_field_name("declarator");
+                return matches!(inner.map(|i| i.kind()), Some("parenthesized_declarator"));
+            }
+
+            match node.child_by_field_name("declarator") {
+                Some(inner) => node = inner,
+                None => return false,
+            }
+        }
     }
 
     /// `a->m()` and `a.m()` differ only in the operator between receiver and
@@ -759,6 +874,7 @@ impl TreeSitterAnalyzer {
     ) -> Result<(Vec<FunctionInfo>, Vec<DispatchSite>)> {
         let mut dispatch_sites: Vec<DispatchSite> = Vec::new();
         let mut covered_sites: std::collections::HashSet<usize> = Default::default();
+        let mut pointer_call_sites: Vec<RawDispatchSite> = Vec::new();
         let queries = self.get_queries(ctx.language);
         let mut cursor = QueryCursor::new();
         let mut captures = cursor.captures(
@@ -890,14 +1006,40 @@ impl TreeSitterAnalyzer {
                 // Only extract calls and types for functions with bodies (not just declarations)
                 let (unique_calls, function_types) = if has_body {
                     // Extract calls within this function from pre-computed list (O(m) instead of O(n))
-                    let function_calls: Vec<String> = extraction
-                        .calls
+                    // Function pointers declared by this function: a call
+                    // naming one of them dispatches through a value.
+                    let pointers: std::collections::HashMap<&str, &PointerVar> = extraction
+                        .pointer_vars
                         .iter()
-                        .filter(|(_, call_start, call_end)| {
-                            *call_start >= function_start_byte && *call_end <= function_end_byte
+                        .filter(|var| {
+                            var.byte_start >= function_start_byte
+                                && var.byte_start < function_end_byte
                         })
-                        .map(|(call_name, _, _)| call_name.clone())
+                        .map(|var| (var.name.as_str(), var))
                         .collect();
+
+                    let mut function_calls: Vec<String> = Vec::new();
+                    for (call_name, call_start, call_end) in &extraction.calls {
+                        if *call_start < function_start_byte || *call_end > function_end_byte {
+                            continue;
+                        }
+
+                        match pointers.get(call_name.as_str()) {
+                            Some(var) => pointer_call_sites.push(RawDispatchSite {
+                                member: String::new(),
+                                receiver_expr: Some(var.name.clone()),
+                                kind: if var.is_parameter {
+                                    DispatchKind::PointerParam
+                                } else {
+                                    DispatchKind::PointerLocal
+                                },
+                                byte_start: *call_start,
+                                line: ctx.source[..*call_start].lines().count() as u32,
+                                target: var.target.clone(),
+                            }),
+                            None => function_calls.push(call_name.clone()),
+                        }
+                    }
 
                     // Remove duplicates and sort
                     let mut unique_calls = function_calls;
@@ -915,9 +1057,15 @@ impl TreeSitterAnalyzer {
                     (Vec::new(), Vec::new())
                 };
 
-                for raw in extraction.member_sites.iter().filter(|site| {
-                    site.byte_start >= function_start_byte && site.byte_start < function_end_byte
-                }) {
+                for raw in extraction
+                    .member_sites
+                    .iter()
+                    .chain(pointer_call_sites.iter())
+                    .filter(|site| {
+                        site.byte_start >= function_start_byte
+                            && site.byte_start < function_end_byte
+                    })
+                {
                     // The function query yields several captures per function,
                     // so a site can be reached more than once; a site is one
                     // row regardless.
@@ -2534,6 +2682,76 @@ mod tests {
             .analyze_source_with_metadata(source, Path::new(path), "testhash", None)
             .unwrap();
         (functions, sites)
+    }
+
+    #[test]
+    fn call_through_a_dereferenced_pointer_is_recorded() {
+        // `(*fp)(...)` matched no call pattern at all, so the call site was
+        // simply absent from the index.
+        let (_functions, sites) = analyze(
+            "struct file;\n\
+             int deref(int (*fp)(struct file *), struct file *f) { return (*fp)(f); }\n",
+            "test.c",
+        );
+
+        let deref: Vec<&DispatchSite> = sites
+            .iter()
+            .filter(|s| s.kind == DispatchKind::PointerDeref)
+            .collect();
+        assert_eq!(deref.len(), 1, "expected the deref call: {sites:?}");
+        assert_eq!(deref[0].receiver_expr.as_deref(), Some("fp"));
+        assert_eq!(deref[0].caller_name, "deref");
+    }
+
+    #[test]
+    fn call_through_a_pointer_variable_is_not_a_call_to_that_name() {
+        let (functions, sites) = analyze(
+            "struct file;\n\
+             int my_read(struct file *f) { return 1; }\n\
+             int fp(struct file *f) { return 2; }\n\
+             int go(struct file *f) {\n\
+             \tint (*fp)(struct file *) = my_read;\n\
+             \treturn fp(f);\n\
+             }\n",
+            "test.c",
+        );
+
+        let go = functions.iter().find(|f| f.name == "go").unwrap();
+        // A function named `fp` exists here, which is what made the variable
+        // name resolve to a real, unrelated function.
+        assert!(
+            !go.calls
+                .clone()
+                .unwrap_or_default()
+                .contains(&"fp".to_string()),
+            "pointer variable recorded as a called function: {:?}",
+            go.calls
+        );
+
+        let local: Vec<&DispatchSite> = sites
+            .iter()
+            .filter(|s| s.kind == DispatchKind::PointerLocal)
+            .collect();
+        assert_eq!(local.len(), 1, "expected the pointer call: {sites:?}");
+        // The declaration says what it was initialised with.
+        assert_eq!(local[0].target.as_deref(), Some("my_read"));
+    }
+
+    #[test]
+    fn call_through_a_pointer_parameter_is_marked_as_one() {
+        let (_functions, sites) = analyze(
+            "int go(int (*cb)(int), int x) { return cb(x); }\n",
+            "test.c",
+        );
+
+        let param: Vec<&DispatchSite> = sites
+            .iter()
+            .filter(|s| s.kind == DispatchKind::PointerParam)
+            .collect();
+        assert_eq!(param.len(), 1, "expected the parameter call: {sites:?}");
+        assert_eq!(param[0].receiver_expr.as_deref(), Some("cb"));
+        // Nothing in this function says what cb points at.
+        assert_eq!(param[0].target, None);
     }
 
     #[test]

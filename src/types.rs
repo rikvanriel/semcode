@@ -138,6 +138,12 @@ pub enum DispatchKind {
     MemberArrow,
     /// `receiver.member(...)`
     MemberDot,
+    /// `(*fp)(...)`
+    PointerDeref,
+    /// `fp(...)` where `fp` is a function pointer declared in this function
+    PointerLocal,
+    /// `fp(...)` where `fp` is a function-pointer parameter
+    PointerParam,
 }
 
 impl DispatchKind {
@@ -145,6 +151,9 @@ impl DispatchKind {
         match self {
             DispatchKind::MemberArrow => "member_arrow",
             DispatchKind::MemberDot => "member_dot",
+            DispatchKind::PointerDeref => "pointer_deref",
+            DispatchKind::PointerLocal => "pointer_local",
+            DispatchKind::PointerParam => "pointer_param",
         }
     }
 
@@ -155,6 +164,9 @@ impl DispatchKind {
         match text {
             "member_arrow" => Some(DispatchKind::MemberArrow),
             "member_dot" => Some(DispatchKind::MemberDot),
+            "pointer_deref" => Some(DispatchKind::PointerDeref),
+            "pointer_local" => Some(DispatchKind::PointerLocal),
+            "pointer_param" => Some(DispatchKind::PointerParam),
             _ => None,
         }
     }
