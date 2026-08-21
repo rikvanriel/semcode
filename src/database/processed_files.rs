@@ -11,6 +11,8 @@ pub struct ProcessedFileRecord {
     pub file: String,
     pub git_sha: Option<String>, // Store as hex string
     pub git_file_sha: String,
+    /// The extractor that read it, absent when the row predates the column.
+    pub extractor_version: Option<u32>,
 }
 
 // Separate struct for JSON serialization with hex strings
@@ -69,6 +71,12 @@ impl ProcessedFileStore {
         }
         let git_sha_array = git_sha_builder.finish();
 
+        let mut extractor_version_builder = arrow::array::Int64Builder::new();
+        for record in &records {
+            extractor_version_builder.append_option(record.extractor_version.map(|v| v as i64));
+        }
+        let extractor_version_array = extractor_version_builder.finish();
+
         // Create git_file_sha StringArray (non-nullable)
         let mut git_file_sha_builder = StringBuilder::new();
         for record in &records {
@@ -80,6 +88,10 @@ impl ProcessedFileStore {
             ("file", Arc::new(file_builder.finish()) as ArrayRef),
             ("git_sha", Arc::new(git_sha_array) as ArrayRef),
             ("git_file_sha", Arc::new(git_file_sha_array) as ArrayRef),
+            (
+                "extractor_version",
+                Arc::new(extractor_version_array) as ArrayRef,
+            ),
         ])?;
 
         // Replace any earlier row for the same file content rather than
@@ -454,10 +466,19 @@ impl ProcessedFileStore {
 
         let git_file_sha = git_file_sha_array.value(row).to_string();
 
+        // Absent in rows written before the column existed, which is exactly
+        // the population that has to be read again.
+        let extractor_version = batch
+            .column_by_name("extractor_version")
+            .and_then(|column| column.as_any().downcast_ref::<arrow::array::Int64Array>())
+            .filter(|versions| versions.is_valid(row))
+            .map(|versions| versions.value(row) as u32);
+
         Ok(Some(ProcessedFileRecord {
             file,
             git_sha,
             git_file_sha,
+            extractor_version,
         }))
     }
 }

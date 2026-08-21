@@ -271,6 +271,7 @@ fn process_git_file_tuple_with_repo(
         file: tuple.file_path.to_string_lossy().to_string(),
         git_sha: None, // Will be set by caller if available
         git_file_sha: tuple.file_sha.clone(),
+        extractor_version: Some(crate::SCHEMA_VERSION),
     };
 
     let results = GitTupleResults {

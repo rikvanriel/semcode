@@ -3124,6 +3124,7 @@ impl DatabaseManager {
             file,
             git_sha,
             git_file_sha,
+            extractor_version: Some(crate::SCHEMA_VERSION),
         };
         self.processed_file_store.insert(record).await
     }

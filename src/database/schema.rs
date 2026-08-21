@@ -55,6 +55,8 @@ impl SchemaManager {
 
         if !table_names.iter().any(|n| n == "processed_files") {
             self.create_processed_files_table().await?;
+        } else {
+            self.migrate_processed_files_table().await?;
         }
 
         if !table_names.iter().any(|n| n == "symbol_filename") {
@@ -447,6 +449,11 @@ impl SchemaManager {
             Field::new("file", DataType::Utf8, false),   // File path
             Field::new("git_sha", DataType::Utf8, true), // Current git head SHA as hex string (nullable)
             Field::new("git_file_sha", DataType::Utf8, false), // SHA of specific file content as hex string
+            // Which extractor read this file. Unchanged content is skipped on
+            // a later run, which is right only when the reading would produce
+            // what it produced before; after the extractor learns something,
+            // the row is stale even though the file is not.
+            Field::new("extractor_version", DataType::Int64, true),
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());
@@ -457,6 +464,40 @@ impl SchemaManager {
             .await?;
 
         Ok(())
+    }
+
+    /// Give an older `processed_files` table the column that says which
+    /// extractor read each file, by starting it again.
+    ///
+    /// The rows cannot be carried over because there is nothing to carry them
+    /// to: a row written before the column existed was written by an unknown
+    /// older extractor, which is exactly the state that must not be trusted
+    /// to skip a file. Dropping them costs one re-read of a tree that was
+    /// going to be re-read anyway.
+    ///
+    /// Without this the column is missing on every database that predates it,
+    /// so nothing can record a version and nothing can read one back: the
+    /// index would report itself stale forever, and re-indexing would never
+    /// settle it.
+    async fn migrate_processed_files_table(&self) -> Result<()> {
+        let table = self
+            .connection
+            .open_table("processed_files")
+            .execute()
+            .await?;
+        let has_column = table
+            .schema()
+            .await?
+            .fields()
+            .iter()
+            .any(|field| field.name() == "extractor_version");
+        if has_column {
+            return Ok(());
+        }
+
+        tracing::info!("processed_files predates the extractor version column: starting it again");
+        self.connection.drop_table("processed_files", &[]).await?;
+        self.create_processed_files_table().await
     }
 
     async fn create_symbol_filename_table(&self) -> Result<()> {
