@@ -847,7 +847,40 @@ impl TreeSitterAnalyzer {
             .registrations
             .extend(Self::collect_assignments(tree.root_node(), source_code));
 
+        // A keyword is not a member, so anything named after one came from a
+        // misread, not from the code.
+        extraction
+            .member_sites
+            .retain(|site| !Self::is_c_keyword(&site.member));
+        extraction
+            .registrations
+            .retain(|registration| !Self::is_c_keyword(&registration.member));
+
         Ok(extraction)
+    }
+
+    /// A struct has no member named `long`, because C will not allow one.
+    /// Assembly written in a macro body reads as C that says otherwise:
+    ///
+    /// ```text
+    /// #define __ASM_EXTABLE_RAW(insn, fixup, type, data)  \
+    ///         .pushsection __ex_table, "a";               \
+    ///         .long ((insn) - .);
+    /// ```
+    ///
+    /// `.long ((insn) - .)` parses as a call through a member named `long`,
+    /// and `.short (type)` as one named `short`. Rejecting a member that is a
+    /// keyword drops those without needing to know which bodies are assembly
+    /// — the same reading is wrong wherever it happens.
+    fn is_c_keyword(name: &str) -> bool {
+        const KEYWORDS: [&str; 34] = [
+            "auto", "break", "case", "char", "const", "continue", "default", "do", "double",
+            "else", "enum", "extern", "float", "for", "goto", "if", "inline", "int", "long",
+            "register", "restrict", "return", "short", "signed", "sizeof", "static", "struct",
+            "switch", "typedef", "union", "unsigned", "void", "volatile", "while",
+        ];
+
+        KEYWORDS.contains(&name)
     }
 
     /// Every `.member = target` in the file whose container type the file
@@ -2956,7 +2989,7 @@ impl TreeSitterAnalyzer {
             return MacroBodyFacts::default();
         }
 
-        let Some((tree, wrapped, prefix_len)) = Self::parse_macro_body(parser, body) else {
+        let Some((tree, wrapped, prefix_len, _clean)) = Self::parse_macro_body(parser, body) else {
             return MacroBodyFacts {
                 calls: Self::scan_macro_body_calls(body),
                 ..Default::default()
@@ -3055,10 +3088,14 @@ impl TreeSitterAnalyzer {
 
     /// Parse a macro body in whichever context it fits, returning the tree and
     /// the text that was parsed, so node ranges can be read back.
+    /// The parse of a macro body: the tree, the text it was parsed in, how
+    /// far the wrapper pushed the body along, and whether the parse is clean.
+    /// A body that parses with errors still yields usable call names, but its
+    /// structure is whatever error recovery invented.
     fn parse_macro_body(
         parser: &mut tree_sitter::Parser,
         body: &str,
-    ) -> Option<(Tree, String, usize)> {
+    ) -> Option<(Tree, String, usize, bool)> {
         const CONTEXTS: [(&str, &str); 3] = [
             ("void __semcode_body(void) { ", "; }"),
             ("", ""),
@@ -3075,7 +3112,7 @@ impl TreeSitterAnalyzer {
 
             let errors = Self::count_parse_errors(tree.root_node());
             if errors == 0 {
-                return Some((tree, wrapped, prefix.len()));
+                return Some((tree, wrapped, prefix.len(), true));
             }
 
             match &best {
@@ -3084,7 +3121,7 @@ impl TreeSitterAnalyzer {
             }
         }
 
-        best.map(|(tree, wrapped, prefix_len, _)| (tree, wrapped, prefix_len))
+        best.map(|(tree, wrapped, prefix_len, _)| (tree, wrapped, prefix_len, false))
     }
 
     fn count_parse_errors(node: tree_sitter::Node) -> usize {
@@ -3452,6 +3489,23 @@ mod tests {
             .calls
             .clone()
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn assembly_in_a_macro_body_is_not_a_dispatch() {
+        // arch/arm64/include/asm/asm-extable.h, under __ASSEMBLER__.
+        let (_functions, sites) = analyze(
+            "#define __ASM_EXTABLE_RAW(insn, fixup) \\\n\
+             \t.pushsection __ex_table, \"a\";\\\n\
+             \t.long ((insn) - .);\\\n\
+             \t.short (fixup);\n",
+            "test.c",
+        );
+
+        assert!(
+            sites.is_empty(),
+            "read assembler directives as members: {sites:?}"
+        );
     }
 
     #[test]
