@@ -30,6 +30,10 @@ use std::collections::HashSet;
 // Optimal batch size for LanceDB operations
 pub const OPTIMAL_BATCH_SIZE: usize = 65536;
 
+/// A revision's file manifest: path to blob id, shared because building one
+/// walks the whole tree.
+type GitManifest = std::sync::Arc<std::collections::HashMap<String, String>>;
+
 pub struct DatabaseManager {
     connection: Connection,
     git_repo_path: String,
@@ -46,6 +50,9 @@ pub struct DatabaseManager {
     symbol_filename_store: SymbolFilenameStore,
     branch_store: IndexedBranchStore,
     workdir_index: std::sync::RwLock<Option<WorkdirIndex>>,
+    /// The last manifest generated, kept because a single query asks for the
+    /// same revision several times. Building one walks the whole tree.
+    manifest_cache: std::sync::RwLock<Option<(String, GitManifest)>>,
 }
 
 impl DatabaseManager {
@@ -78,6 +85,7 @@ impl DatabaseManager {
             symbol_filename_store: SymbolFilenameStore::new(connection.clone()),
             branch_store: IndexedBranchStore::new(connection.clone()),
             workdir_index: std::sync::RwLock::new(None),
+            manifest_cache: std::sync::RwLock::new(None),
         })
     }
 
@@ -814,7 +822,7 @@ impl DatabaseManager {
     ) -> Result<Vec<crate::database::resolution::IndirectCaller>> {
         use crate::database::resolution::{at_revision, group_by_member, indirect_callers};
 
-        let manifest = self.generate_git_manifest(git_sha).await?;
+        let manifest = self.git_manifest_cached(git_sha).await?;
 
         let registrations = at_revision(
             self.registration_store.find_by_target(target).await?,
@@ -1089,7 +1097,7 @@ impl DatabaseManager {
         if let Some(func) = self.workdir_find_function(name) {
             return Ok(Some(func));
         }
-        let git_manifest = self.generate_git_manifest(git_sha).await?;
+        let git_manifest = self.git_manifest_cached(git_sha).await?;
         if git_manifest.is_empty() {
             tracing::info!(
                 "No files resolved for '{}' at commit '{}' - falling back to non-git lookup",
@@ -2304,7 +2312,7 @@ impl DatabaseManager {
         let mut caller_names: Vec<String> =
             workdir_callers.iter().map(|f| f.name.clone()).collect();
 
-        let git_manifest = self.generate_git_manifest(git_sha).await?;
+        let git_manifest = self.git_manifest_cached(git_sha).await?;
         if !git_manifest.is_empty() {
             let db_callers = self
                 .get_function_callers_with_manifest(function_name, &git_manifest)
@@ -2580,7 +2588,7 @@ impl DatabaseManager {
         if let Some(callees) = self.workdir_find_callees(function_name) {
             return Ok(callees);
         }
-        let git_manifest = self.generate_git_manifest(git_sha).await?;
+        let git_manifest = self.git_manifest_cached(git_sha).await?;
         if git_manifest.is_empty() {
             return Ok(Vec::new());
         }
@@ -3806,7 +3814,7 @@ impl DatabaseManager {
             "Generating complete git file manifest for commit: {}",
             effective_git_sha
         );
-        let git_manifest = self.generate_git_manifest(&effective_git_sha).await?;
+        let git_manifest = self.git_manifest_cached(&effective_git_sha).await?;
         tracing::info!(
             "Generated manifest with {} files at commit {}",
             git_manifest.len(),
@@ -3905,6 +3913,30 @@ impl DatabaseManager {
     /// Get callers using pre-loaded git manifest for filtering
     /// Generate a complete manifest of all file paths and their SHAs at a specific git commit
     /// Uses the shared git tree traversal utility for consistency
+    /// The manifest for a revision, walking the tree only when it is not the
+    /// one already in hand.
+    ///
+    /// `callers` asks twice — once for direct callers, once for indirect —
+    /// and each walk reads about 90,000 entries on a Linux tree. The cache
+    /// holds one revision: a query asks about one, and the second ask is
+    /// where the saving is.
+    pub async fn git_manifest_cached(&self, git_sha: &str) -> Result<GitManifest> {
+        if let Ok(cache) = self.manifest_cache.read() {
+            if let Some((sha, manifest)) = cache.as_ref() {
+                if sha == git_sha {
+                    return Ok(manifest.clone());
+                }
+            }
+        }
+
+        let manifest = std::sync::Arc::new(self.generate_git_manifest(git_sha).await?);
+        if let Ok(mut cache) = self.manifest_cache.write() {
+            *cache = Some((git_sha.to_string(), manifest.clone()));
+        }
+
+        Ok(manifest)
+    }
+
     pub async fn generate_git_manifest(
         &self,
         git_sha: &str,
