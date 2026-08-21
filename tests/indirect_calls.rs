@@ -79,6 +79,10 @@ fn write_fixture(repo: &Path) {
          int deliver_plain(const struct net_protocol *ipprot, struct sk_buff *skb)\n\
          {\n\
          \treturn ipprot->handler(skb);\n\
+         }\n\
+         int deliver_untyped(struct sk_buff *skb)\n\
+         {\n\
+         \treturn proto_table->handler(skb);\n\
          }\n",
     )
     .unwrap();
@@ -140,23 +144,30 @@ async fn a_handler_reached_only_through_a_pointer_has_callers() {
         .filter(|c| c.evidence.is_type_matched())
         .collect();
 
+    // Two sites reach it on the evidence of a type: the macro names it, and
+    // the plain member call is on a receiver this file declares as the
+    // struct the function is installed in.
+    let named: Vec<&str> = named_at_site
+        .iter()
+        .map(|caller| caller.caller_name.as_str())
+        .collect();
     assert_eq!(
-        named_at_site.len(),
-        1,
-        "expected the macro's declared candidate, got {indirect:?}"
+        named,
+        vec!["deliver_plain", "ip_protocol_deliver_rcu"],
+        "expected both typed candidates, got {indirect:?}"
     );
-    assert_eq!(named_at_site[0].caller_name, "ip_protocol_deliver_rcu");
-    assert_eq!(named_at_site[0].site_file, "ip_input.c");
-    assert_eq!(named_at_site[0].member, "handler");
+    assert!(named_at_site
+        .iter()
+        .all(|caller| caller.site_file == "ip_input.c" && caller.member == "handler"));
 
-    // The plain member call matches by member name; without a receiver type
-    // it stays weaker evidence, and says so rather than being dropped.
+    // The call on a receiver the file never declares matches by member name
+    // alone; it stays weaker evidence, and says so rather than being dropped.
     let by_member: Vec<_> = indirect
         .iter()
         .filter(|c| !c.evidence.is_type_matched())
         .collect();
     assert!(
-        by_member.iter().any(|c| c.caller_name == "deliver_plain"),
+        by_member.iter().any(|c| c.caller_name == "deliver_untyped"),
         "member call missing from the weaker matches: {indirect:?}"
     );
 }

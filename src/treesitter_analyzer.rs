@@ -132,6 +132,9 @@ struct PointerVar {
 struct RawDispatchSite {
     member: String,
     receiver_expr: Option<String>,
+    /// The struct or union the receiver was declared as, when the file says
+    /// so. Filled in after extraction, once the declarations are in scope.
+    receiver_type: Option<String>,
     kind: DispatchKind,
     byte_start: usize,
     line: u32,
@@ -148,8 +151,7 @@ impl RawDispatchSite {
             line: self.line,
             member: self.member.clone(),
             receiver_expr: self.receiver_expr.clone(),
-            // Typing the receiver needs the declaration; that is a later step.
-            receiver_type: None,
+            receiver_type: self.receiver_type.clone(),
             kind: self.kind,
             target: self.target.clone(),
         }
@@ -789,6 +791,7 @@ impl TreeSitterAnalyzer {
                             extraction.member_sites.push(RawDispatchSite {
                                 member: String::new(),
                                 receiver_expr: Some(text),
+                                receiver_type: None,
                                 kind: DispatchKind::PointerDeref,
                                 byte_start: capture.node.start_byte(),
                                 line: capture.node.start_position().row as u32 + 1,
@@ -833,6 +836,7 @@ impl TreeSitterAnalyzer {
                 extraction.member_sites.push(RawDispatchSite {
                     member: name.to_string(),
                     receiver_expr,
+                    receiver_type: None,
                     kind,
                     byte_start: member.start_byte(),
                     line: member.start_position().row as u32 + 1,
@@ -847,6 +851,8 @@ impl TreeSitterAnalyzer {
             .registrations
             .extend(Self::collect_assignments(tree.root_node(), source_code));
 
+        Self::type_receivers(tree.root_node(), source_code, &mut extraction.member_sites);
+
         // A keyword is not a member, so anything named after one came from a
         // misread, not from the code.
         extraction
@@ -857,6 +863,146 @@ impl TreeSitterAnalyzer {
             .retain(|registration| !Self::is_c_keyword(&registration.member));
 
         Ok(extraction)
+    }
+
+    /// Give each member dispatch the type of its receiver, where the file
+    /// declares it.
+    ///
+    /// ```text
+    /// static int probe(struct file_operations *ops) { ops->read(...); }
+    /// ```
+    ///
+    /// `ops` is declared here, so the site can say it dispatches through
+    /// `file_operations::read` rather than through some member named `read`.
+    /// Only names a scope declares are used: a receiver whose type comes from
+    /// a header this file does not contain stays untyped, and a receiver that
+    /// is itself a member access (`inode->i_fop->read()`) needs the field's
+    /// type, which is a query-time lookup in the types table.
+    ///
+    /// A name declared twice with different types in one function is left
+    /// untyped as well. Shadowing is rare, and a site filed under the wrong
+    /// type joins with the wrong registrations, which is worse than a site
+    /// that admits it does not know.
+    fn type_receivers(root: tree_sitter::Node, source: &str, sites: &mut [RawDispatchSite]) {
+        if sites.is_empty() {
+            return;
+        }
+
+        // Declarations outside every function, which any function can see.
+        let file_scope = Self::declared_types_in(root, source, true);
+
+        let mut scopes: Vec<(usize, usize, HashMap<String, Option<String>>)> = Vec::new();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+
+            if node.kind() != "function_definition" {
+                continue;
+            }
+            scopes.push((
+                node.start_byte(),
+                node.end_byte(),
+                Self::declared_types_in(node, source, false),
+            ));
+        }
+
+        for site in sites.iter_mut() {
+            let Some(receiver) = site.receiver_expr.as_deref() else {
+                continue;
+            };
+            // Anything but a plain name needs more than a declaration.
+            if receiver.is_empty()
+                || receiver.starts_with(|c: char| c.is_numeric())
+                || !receiver.chars().all(|c| c.is_alphanumeric() || c == '_')
+            {
+                continue;
+            }
+
+            let scope = scopes
+                .iter()
+                .find(|(start, end, _)| site.byte_start >= *start && site.byte_start < *end)
+                .map(|(_, _, declared)| declared);
+
+            let declared = scope
+                .and_then(|declared| declared.get(receiver))
+                .or_else(|| file_scope.get(receiver));
+
+            if let Some(Some(type_name)) = declared {
+                site.receiver_type = Some(type_name.clone());
+            }
+        }
+    }
+
+    /// Names declared in this subtree with the aggregate type each was
+    /// declared as. A name declared twice with conflicting types maps to
+    /// `None`: the scope does not say which one a use refers to.
+    ///
+    /// `outer_only` keeps the walk out of functions entirely, which is how
+    /// file scope is collected without picking up another function's
+    /// parameters and locals.
+    fn declared_types_in(
+        node: tree_sitter::Node,
+        source: &str,
+        outer_only: bool,
+    ) -> HashMap<String, Option<String>> {
+        let mut declared: HashMap<String, Option<String>> = HashMap::new();
+        let mut stack = vec![node];
+
+        while let Some(node) = stack.pop() {
+            // File scope is what a function did not declare: parameters and
+            // locals belong to one function, and reading them as file scope
+            // types a receiver in a function that never declared it.
+            if outer_only && node.kind() == "function_definition" {
+                continue;
+            }
+
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+
+            if !matches!(node.kind(), "declaration" | "parameter_declaration") {
+                continue;
+            }
+
+            let type_name = node
+                .child_by_field_name("type")
+                .and_then(|type_node| Self::aggregate_type_name(type_node, source));
+
+            let mut cursor = node.walk();
+            for declarator in node.children_by_field_name("declarator", &mut cursor) {
+                let declarator = if declarator.kind() == "init_declarator" {
+                    match declarator.child_by_field_name("declarator") {
+                        Some(inner) => inner,
+                        None => continue,
+                    }
+                } else {
+                    declarator
+                };
+
+                let Some(name) = Self::innermost_declarator_name(declarator) else {
+                    continue;
+                };
+                let name = source[name.byte_range()].to_string();
+                if name.is_empty() {
+                    continue;
+                }
+
+                declared
+                    .entry(name)
+                    .and_modify(|known| {
+                        if *known != type_name {
+                            *known = None;
+                        }
+                    })
+                    .or_insert_with(|| type_name.clone());
+            }
+        }
+
+        declared
     }
 
     /// A struct has no member named `long`, because C will not allow one.
@@ -1257,6 +1403,7 @@ impl TreeSitterAnalyzer {
             sites.push(RawDispatchSite {
                 member: member.clone(),
                 receiver_expr: Some(collapse_whitespace(&source[dispatch.byte_range()])),
+                receiver_type: None,
                 kind: DispatchKind::MacroDeclared,
                 byte_start: candidate.start_byte(),
                 line: candidate.start_position().row as u32 + 1,
@@ -1460,6 +1607,7 @@ impl TreeSitterAnalyzer {
                             Some(var) => pointer_call_sites.push(RawDispatchSite {
                                 member: String::new(),
                                 receiver_expr: Some(var.name.clone()),
+                                receiver_type: None,
                                 kind: if var.is_parameter {
                                     DispatchKind::PointerParam
                                 } else {
@@ -3500,6 +3648,89 @@ mod tests {
             .calls
             .clone()
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_receiver_declared_here_carries_its_type() {
+        let (_functions, sites) = analyze(
+            "struct file_operations { int (*read)(void); };\n\
+             int probe(struct file_operations *ops) { return ops->read(); }\n",
+            "test.c",
+        );
+
+        assert_eq!(sites.len(), 1, "{sites:?}");
+        assert_eq!(sites[0].member, "read");
+        assert_eq!(sites[0].receiver_type.as_deref(), Some("file_operations"));
+    }
+
+    #[test]
+    fn a_local_declaration_types_the_receiver_too() {
+        let (_functions, sites) = analyze(
+            "struct ops { int (*run)(void); };\n\
+             int probe(void) { struct ops *o = get(); return o->run(); }\n",
+            "test.c",
+        );
+
+        assert_eq!(sites[0].receiver_type.as_deref(), Some("ops"));
+    }
+
+    #[test]
+    fn an_undeclared_receiver_stays_untyped() {
+        // `ops` comes from somewhere this file does not show. Guessing a type
+        // here files the site against registrations it has nothing to do with.
+        let (_functions, sites) = analyze("int probe(void) { return ops->read(); }\n", "test.c");
+
+        assert_eq!(sites.len(), 1, "{sites:?}");
+        assert_eq!(sites[0].receiver_type, None);
+    }
+
+    #[test]
+    fn a_name_declared_as_two_types_in_one_function_stays_untyped() {
+        let (_functions, sites) = analyze(
+            "struct a { int (*run)(void); };\n\
+             struct b { int (*run)(void); };\n\
+             int probe(void) {\n\
+                 { struct a *o = first(); o->run(); }\n\
+                 { struct b *o = second(); return o->run(); }\n\
+             }\n",
+            "test.c",
+        );
+
+        assert_eq!(sites.len(), 2, "{sites:?}");
+        assert!(
+            sites.iter().all(|site| site.receiver_type.is_none()),
+            "picked a type for a shadowed name: {sites:?}"
+        );
+    }
+
+    #[test]
+    fn a_receiver_declared_in_another_function_does_not_leak() {
+        let (_functions, sites) = analyze(
+            "struct ops { int (*run)(void); };\n\
+             int typed(struct ops *o) { return o->run(); }\n\
+             int untyped(void) { return o->run(); }\n",
+            "test.c",
+        );
+
+        let typed = sites.iter().find(|s| s.caller_name == "typed").unwrap();
+        let untyped = sites.iter().find(|s| s.caller_name == "untyped").unwrap();
+        assert_eq!(typed.receiver_type.as_deref(), Some("ops"));
+        assert_eq!(untyped.receiver_type, None);
+    }
+
+    #[test]
+    fn a_field_chain_receiver_is_left_for_query_time() {
+        // `inode->i_fop` needs the type of the field, which lives in the
+        // types table, not in this declaration.
+        let (_functions, sites) = analyze(
+            "struct inode { struct file_operations *i_fop; };\n\
+             int probe(struct inode *inode) { return inode->i_fop->read(); }\n",
+            "test.c",
+        );
+
+        let read = sites.iter().find(|s| s.member == "read").unwrap();
+        assert_eq!(read.receiver_expr.as_deref(), Some("inode->i_fop"));
+        assert_eq!(read.receiver_type, None);
     }
 
     #[test]
