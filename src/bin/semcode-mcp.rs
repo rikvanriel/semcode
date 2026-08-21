@@ -403,12 +403,18 @@ async fn write_indirect_callers(
                     container_type,
                     registration_file,
                     registration_line,
+                    registration_count,
                     ..
                 } => {
                     writeln!(
                         buffer,
-                        "     installed in {}::{} at {}:{}",
-                        container_type, caller.member, registration_file, registration_line
+                        "     installed in {}::{} at {}:{} ({} place{})",
+                        container_type,
+                        caller.member,
+                        registration_file,
+                        registration_line,
+                        registration_count,
+                        if *registration_count == 1 { "" } else { "s" }
                     )?;
                 }
             }

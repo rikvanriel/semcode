@@ -33,8 +33,13 @@ pub enum Evidence {
     /// not state — see `type_matched`.
     Registered {
         container_type: String,
+        /// One of the places it is installed, and how many there are. A
+        /// function in a widely used slot is installed hundreds of times,
+        /// and the site is the same site whichever of them the reader looks
+        /// at.
         registration_file: String,
         registration_line: u32,
+        registration_count: usize,
         /// True when the site's receiver type is known and matches the type
         /// the function was installed in. False means the member names match
         /// and nothing contradicts it, which is weaker.
@@ -73,6 +78,13 @@ pub fn indirect_callers(
         });
     }
 
+    // A site reached through a registration is one answer, however many
+    // places install the function there: seq_read sits in file_operations
+    // ::read in 430 of them, and listing fs/read_write.c once per
+    // registration buries the three call sites that matter.
+    type SiteKey = (String, String, u32, String, String, String, bool);
+    let mut by_site: HashMap<SiteKey, (&Registration, usize)> = HashMap::new();
+
     for registration in registrations {
         let Some(sites) = sites_by_member.get(&registration.member) else {
             continue;
@@ -92,20 +104,51 @@ pub fn indirect_callers(
                 None => false,
             };
 
-            found.push(IndirectCaller {
-                caller_name: site.caller_name.clone(),
-                site_file: site.file_path.clone(),
-                site_line: site.line,
-                member: site.member.clone(),
-                site_kind: site.kind.as_str().to_string(),
-                evidence: Evidence::Registered {
-                    container_type: registration.container_type.clone(),
-                    registration_file: registration.file_path.clone(),
-                    registration_line: registration.line,
-                    type_matched,
-                },
-            });
+            let key = (
+                site.caller_name.clone(),
+                site.file_path.clone(),
+                site.line,
+                site.member.clone(),
+                site.kind.as_str().to_string(),
+                registration.container_type.clone(),
+                type_matched,
+            );
+
+            by_site
+                .entry(key)
+                .and_modify(|(exemplar, count)| {
+                    *count += 1;
+                    // Whichever comes first in the tree, so the answer does
+                    // not change with the order rows come back in.
+                    if (&registration.file_path, registration.line)
+                        < (&exemplar.file_path, exemplar.line)
+                    {
+                        *exemplar = registration;
+                    }
+                })
+                .or_insert((registration, 1));
         }
+    }
+
+    for (
+        (caller_name, site_file, site_line, member, site_kind, container_type, type_matched),
+        (exemplar, count),
+    ) in by_site
+    {
+        found.push(IndirectCaller {
+            caller_name,
+            site_file,
+            site_line,
+            member,
+            site_kind,
+            evidence: Evidence::Registered {
+                container_type,
+                registration_file: exemplar.file_path.clone(),
+                registration_line: exemplar.line,
+                registration_count: count,
+                type_matched,
+            },
+        });
     }
 
     found.sort_by(|a, b| {
@@ -232,5 +275,52 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].evidence, Evidence::StatedAtSite);
         assert!(found[0].evidence.is_type_matched());
+    }
+
+    #[test]
+    fn a_site_is_one_answer_however_many_places_install_the_target() {
+        // seq_read sits in file_operations::read hundreds of times. The call
+        // in vfs_read is still one call.
+        let sites = group_by_member(vec![site("read", "vfs_read", Some("file_operations"))]);
+        let installs: Vec<Registration> = (0..3)
+            .map(|i| {
+                let mut registration = registration("file_operations", "read", "seq_read");
+                registration.file_path = format!("fs/{i}.c");
+                registration.line = 10 + i;
+                registration
+            })
+            .collect();
+
+        let found = indirect_callers(&installs, &sites, &[]);
+
+        assert_eq!(found.len(), 1, "one site, one answer: {found:?}");
+        match &found[0].evidence {
+            Evidence::Registered {
+                registration_count,
+                registration_file,
+                ..
+            } => {
+                assert_eq!(*registration_count, 3);
+                // The exemplar is the same one whichever order they arrive in.
+                assert_eq!(registration_file, "fs/0.c");
+            }
+            other => panic!("unexpected evidence: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_sites_stay_two_answers() {
+        let sites = group_by_member(vec![
+            site("read", "vfs_read", Some("file_operations")),
+            site("read", "loop_rw_iter", Some("file_operations")),
+        ]);
+
+        let found = indirect_callers(
+            &[registration("file_operations", "read", "seq_read")],
+            &sites,
+            &[],
+        );
+
+        assert_eq!(found.len(), 2, "{found:?}");
     }
 }

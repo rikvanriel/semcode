@@ -398,6 +398,7 @@ fn show_indirect_callers(
                 container_type,
                 registration_file,
                 registration_line,
+                registration_count,
                 type_matched,
             } => {
                 let confidence = if *type_matched {
@@ -405,13 +406,18 @@ fn show_indirect_callers(
                 } else {
                     "member name matches, receiver type unknown"
                 };
+                let elsewhere = match registration_count {
+                    1 => String::new(),
+                    n => format!(" and {} other places", n - 1),
+                };
                 writeln!(
                     writer,
-                    "     installed in {}::{} at {}:{} ({})",
+                    "     installed in {}::{} at {}:{}{} ({})",
                     container_type.cyan(),
                     caller.member.cyan(),
                     registration_file.bright_black(),
                     registration_line,
+                    elsewhere.bright_black(),
                     confidence.bright_black()
                 )?;
             }
