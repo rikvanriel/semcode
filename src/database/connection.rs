@@ -99,11 +99,38 @@ impl DatabaseManager {
         self.schema_manager.stored_schema_version().await
     }
 
-    /// True when the index was written before the extractor learned what it
-    /// knows now, so what is stored is not what a fresh index would hold.
+    /// Content hashes this build's extractor has read, which is the set a
+    /// later run may skip. A file read by an older extractor is missing from
+    /// it even though the file itself has not changed.
+    pub async fn processed_by_this_extractor(&self) -> Result<std::collections::HashSet<String>> {
+        Ok(self
+            .get_all_processed_files()
+            .await?
+            .into_iter()
+            .filter(|record| record.extractor_version == Some(crate::SCHEMA_VERSION))
+            .map(|record| record.git_file_sha)
+            .collect())
+    }
+
+    /// True when any file in the index was read by an older extractor, so
+    /// what is stored for it is not what a fresh index would hold.
+    ///
+    /// Asked of the files rather than of a mark on the database as a whole: a
+    /// run over a commit range reads the files that commit touched and no
+    /// others, and a database-wide mark would call the whole index current on
+    /// the strength of those few.
     pub async fn index_predates_reader(&self) -> Result<bool> {
-        Ok(self.stored_schema_version().await?.unwrap_or(0)
-            < crate::database::schema::SCHEMA_VERSION)
+        let files = self.get_all_processed_files().await?;
+        if !files.is_empty() {
+            return Ok(files
+                .iter()
+                .any(|record| record.extractor_version != Some(crate::SCHEMA_VERSION)));
+        }
+
+        // No files to ask, so fall back to the mark on the database: an index
+        // holding rows from before that mark existed still predates this
+        // build, and a fresh one does not.
+        Ok(self.stored_schema_version().await?.unwrap_or(0) < crate::SCHEMA_VERSION)
     }
 
     /// Mark the index as holding what this build writes, with the options it

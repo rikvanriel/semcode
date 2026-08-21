@@ -1115,27 +1115,12 @@ pub async fn process_git_tree(
 
     let start_time = std::time::Instant::now();
 
-    // Get already processed files from database for deduplication.
-    //
-    // A file is skipped when its content was seen before, which is right as
-    // long as seeing it produced what it would produce now. After the
-    // extractor learns something new — a table, a column, a kind of fact —
-    // the rows for an unchanged file are the old rows, and skipping it keeps
-    // them. Re-read everything in that case; the version is recorded again
-    // once the tree has been indexed.
-    let stale = db_manager.index_predates_reader().await?;
-    let processed_files: HashSet<String> = if stale {
-        info!("Index predates this build of semcode: re-reading every file");
-        HashSet::new()
-    } else {
-        info!("Loading processed files from database for deduplication");
-        db_manager
-            .get_all_processed_files()
-            .await?
-            .into_iter()
-            .map(|record| record.git_file_sha)
-            .collect()
-    };
+    // Get already processed files from database for deduplication. A row
+    // written by an older extractor does not qualify: the file has not
+    // changed, the reading of it has, so it is absent from this set and gets
+    // read again on its own account.
+    info!("Loading processed files from database for deduplication");
+    let processed_files: HashSet<String> = db_manager.processed_by_this_extractor().await?;
 
     info!(
         "Found {} already processed files in database",

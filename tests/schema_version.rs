@@ -82,3 +82,27 @@ async fn an_index_records_how_it_was_built() {
         Some((vec!["rs".to_string()], false))
     );
 }
+
+#[tokio::test]
+async fn a_file_read_by_this_extractor_may_be_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = manager(dir.path()).await;
+
+    db.mark_file_processed(
+        "fs/read_write.c".to_string(),
+        Some("deadbeef".to_string()),
+        "cafe1234".to_string(),
+    )
+    .await
+    .unwrap();
+
+    let skippable = db.processed_by_this_extractor().await.unwrap();
+    assert!(
+        skippable.contains("cafe1234"),
+        "a file this build read is not in the skip set: {skippable:?}"
+    );
+    assert!(
+        !db.index_predates_reader().await.unwrap(),
+        "a file this build read makes the index look stale"
+    );
+}
