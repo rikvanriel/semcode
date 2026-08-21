@@ -271,10 +271,11 @@ pub async fn show_callers_to_writer(
         Some(func) => {
             // Always use git-aware callers query
             let callers = db.get_function_callers_git_aware(name, git_sha).await?;
-            if callers.is_empty() {
+            let indirect = db.find_indirect_callers(name, git_sha).await?;
+            if callers.is_empty() && indirect.is_empty() {
                 let info_msg = format!("{} No functions call '{}'", "Info:".yellow(), name);
                 writeln!(writer, "{info_msg}")?;
-            } else {
+            } else if !callers.is_empty() {
                 let header = format!("\n{}", "=== Direct Callers ===".bold().green());
                 writeln!(writer, "{header}")?;
 
@@ -321,6 +322,8 @@ pub async fn show_callers_to_writer(
                     }
                 }
             }
+
+            show_indirect_callers(&indirect, writer)?;
         }
         None => {
             let error_msg = format!(
@@ -330,6 +333,100 @@ pub async fn show_callers_to_writer(
             );
             writeln!(writer, "{error_msg}")?;
         }
+    }
+
+    Ok(())
+}
+
+/// Callers that reach the function without naming it, with the evidence for
+/// each: a reader has to be able to check the claim, since a member call can
+/// reach anything installed in that member.
+fn show_indirect_callers(
+    indirect: &[crate::database::resolution::IndirectCaller],
+    writer: &mut dyn Write,
+) -> Result<()> {
+    use crate::database::resolution::Evidence;
+
+    if indirect.is_empty() {
+        return Ok(());
+    }
+
+    // A member-name match with no receiver type reaches every call through a
+    // member of that name anywhere in the tree, which for a name like
+    // `handler` is most of the kernel. Those are reported as a count, not as
+    // an answer.
+    let (confident, by_name_only): (Vec<_>, Vec<_>) = indirect
+        .iter()
+        .partition(|caller| caller.evidence.is_type_matched());
+
+    if confident.is_empty() && by_name_only.is_empty() {
+        return Ok(());
+    }
+
+    if !confident.is_empty() {
+        let header = format!("\n{}", "=== Indirect Callers ===".bold().green());
+        writeln!(writer, "{header}")?;
+        writeln!(
+            writer,
+            "{} call sites can reach it through a function pointer:",
+            confident.len()
+        )?;
+    }
+
+    for (i, caller) in confident.iter().enumerate() {
+        let where_from = if caller.caller_name.is_empty() {
+            "(file scope)".to_string()
+        } else {
+            caller.caller_name.clone()
+        };
+
+        writeln!(
+            writer,
+            "  {}. {} at {}:{} [{}]",
+            (i + 1).to_string().yellow(),
+            where_from.cyan(),
+            caller.site_file.bright_black(),
+            caller.site_line,
+            caller.site_kind.bright_black()
+        )?;
+
+        match &caller.evidence {
+            Evidence::StatedAtSite => {
+                writeln!(writer, "     names it at the call site")?;
+            }
+            Evidence::Registered {
+                container_type,
+                registration_file,
+                registration_line,
+                type_matched,
+            } => {
+                let confidence = if *type_matched {
+                    "receiver type matches"
+                } else {
+                    "member name matches, receiver type unknown"
+                };
+                writeln!(
+                    writer,
+                    "     installed in {}::{} at {}:{} ({})",
+                    container_type.cyan(),
+                    caller.member.cyan(),
+                    registration_file.bright_black(),
+                    registration_line,
+                    confidence.bright_black()
+                )?;
+            }
+        }
+    }
+
+    if !by_name_only.is_empty() {
+        let note = format!(
+            "\n{} {} further call sites go through a member of the same name, \
+             but nothing says their receiver has the type the function was \
+             installed in.",
+            "Note:".yellow(),
+            by_name_only.len()
+        );
+        writeln!(writer, "{note}")?;
     }
 
     Ok(())

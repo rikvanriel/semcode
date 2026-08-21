@@ -722,6 +722,56 @@ impl DatabaseManager {
         self.registration_store.find_by_member(member).await
     }
 
+    /// Call sites that can reach this function without naming it: a member
+    /// call where the function is installed in that member, or a site that
+    /// names it outright.
+    ///
+    /// Rows are filtered to the revision being queried, the same way function
+    /// lookups are, so a registration removed in a later commit stops
+    /// answering.
+    pub async fn find_indirect_callers(
+        &self,
+        target: &str,
+        git_sha: &str,
+    ) -> Result<Vec<crate::database::resolution::IndirectCaller>> {
+        use crate::database::resolution::{at_revision, group_by_member, indirect_callers};
+
+        let manifest = self.generate_git_manifest(git_sha).await?;
+
+        let registrations = at_revision(
+            self.registration_store.find_by_target(target).await?,
+            &manifest,
+            |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
+        );
+        let stated = at_revision(
+            self.dispatch_site_store.find_by_target(target).await?,
+            &manifest,
+            |s| (s.file_path.as_str(), s.git_file_hash.as_str()),
+        );
+
+        // Only the members the function is actually installed in matter.
+        let mut sites = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for registration in &registrations {
+            if !seen.insert(registration.member.clone()) {
+                continue;
+            }
+            sites.extend(at_revision(
+                self.dispatch_site_store
+                    .find_by_member(&registration.member)
+                    .await?,
+                &manifest,
+                |s| (s.file_path.as_str(), s.git_file_hash.as_str()),
+            ));
+        }
+
+        Ok(indirect_callers(
+            &registrations,
+            &group_by_member(sites),
+            &stated,
+        ))
+    }
+
     /// Dispatch sites that go through the named member.
     pub async fn find_dispatch_sites_by_member(
         &self,
@@ -6288,6 +6338,86 @@ mod tests {
             calls: Some(vec!["target".to_string()]),
             types: None,
         }
+    }
+
+    #[tokio::test]
+    async fn indirect_callers_come_from_the_revision_being_queried() {
+        use crate::types::{DispatchKind, DispatchSite, Registration, RegistrationKind};
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo_path = repo_dir.path();
+        git(repo_path, &["init", "-q"]);
+        std::fs::write(repo_path.join("driver.c"), "/* ops table */\n").unwrap();
+        std::fs::write(repo_path.join("vfs.c"), "/* caller */\n").unwrap();
+        git(repo_path, &["add", "driver.c", "vfs.c"]);
+        git(repo_path, &["commit", "-q", "-m", "initial"]);
+
+        let git_sha = crate::git::get_git_sha(repo_path).unwrap().unwrap();
+        let driver_hash = crate::git::get_git_file_hash_at_commit(repo_path, &git_sha, "driver.c")
+            .unwrap()
+            .unwrap();
+        let vfs_hash = crate::git::get_git_file_hash_at_commit(repo_path, &git_sha, "vfs.c")
+            .unwrap()
+            .unwrap();
+
+        let db_path = repo_path.join(".semcode.db");
+        let db = DatabaseManager::new(
+            db_path.to_str().unwrap(),
+            repo_path.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        db.create_tables().await.unwrap();
+
+        db.insert_functions(vec![test_function("my_read", "driver.c", &driver_hash)])
+            .await
+            .unwrap();
+
+        db.insert_registrations(vec![Registration {
+            container_type: "file_operations".to_string(),
+            member: "read".to_string(),
+            target: "my_read".to_string(),
+            file_path: "driver.c".to_string(),
+            git_file_hash: driver_hash.clone(),
+            byte_start: 0,
+            line: 1,
+            enclosing_function: String::new(),
+            kind: RegistrationKind::DesignatedInit,
+        }])
+        .await
+        .unwrap();
+
+        let site = |file: &str, hash: &str, receiver_type: Option<&str>| DispatchSite {
+            caller_name: "vfs_read".to_string(),
+            file_path: file.to_string(),
+            git_file_hash: hash.to_string(),
+            byte_start: 0,
+            line: 1,
+            member: "read".to_string(),
+            receiver_expr: Some("f->f_op".to_string()),
+            receiver_type: receiver_type.map(|t| t.to_string()),
+            kind: DispatchKind::MemberArrow,
+            target: None,
+        };
+
+        db.insert_dispatch_sites(vec![
+            site("vfs.c", &vfs_hash, Some("file_operations")),
+            // Same site recorded when vfs.c had different content: it is not
+            // part of this revision and must not answer.
+            site("vfs.c", "stale-hash", Some("file_operations")),
+        ])
+        .await
+        .unwrap();
+
+        let found = db.find_indirect_callers("my_read", &git_sha).await.unwrap();
+
+        assert_eq!(found.len(), 1, "stale rows answered too: {found:?}");
+        assert_eq!(found[0].caller_name, "vfs_read");
+        assert!(
+            found[0].evidence.is_type_matched(),
+            "receiver type matched the registration but was not reported as such: {:?}",
+            found[0].evidence
+        );
     }
 
     #[tokio::test]

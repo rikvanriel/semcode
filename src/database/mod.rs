@@ -7,6 +7,7 @@ pub mod dispatch_sites;
 mod functions;
 pub mod processed_files;
 pub mod registrations;
+pub mod resolution;
 mod schema;
 pub mod search;
 mod symbol_filename;

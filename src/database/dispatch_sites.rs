@@ -123,6 +123,34 @@ impl DispatchSiteStore {
         Ok(sites)
     }
 
+    /// Every site that names this function as a candidate outright: an
+    /// indirect-call macro's declared target, or a local pointer's
+    /// initializer.
+    pub async fn find_by_target(&self, target: &str) -> Result<Vec<DispatchSite>> {
+        let table = self
+            .connection
+            .open_table("dispatch_sites")
+            .execute()
+            .await?;
+        let escaped = target.replace('\'', "''");
+        let batches: Vec<RecordBatch> = table
+            .query()
+            .only_if(format!("target = '{escaped}'"))
+            .execute()
+            .await?
+            .try_collect()
+            .await?;
+
+        let mut sites = Vec::new();
+        for batch in &batches {
+            for row in 0..batch.num_rows() {
+                sites.push(Self::site_from_batch(batch, row)?);
+            }
+        }
+
+        Ok(sites)
+    }
+
     /// Every site inside the named function.
     pub async fn find_by_caller(&self, caller_name: &str) -> Result<Vec<DispatchSite>> {
         let table = self
