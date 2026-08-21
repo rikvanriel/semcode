@@ -135,6 +135,10 @@ struct RawDispatchSite {
     /// The struct or union the receiver was declared as, when the file says
     /// so. Filled in after extraction, once the declarations are in scope.
     receiver_type: Option<String>,
+    /// For `base->field->member()`, what the file proves about `base` and
+    /// which field the receiver reads from it.
+    receiver_base_type: Option<String>,
+    receiver_field: Option<String>,
     kind: DispatchKind,
     byte_start: usize,
     line: u32,
@@ -152,10 +156,34 @@ impl RawDispatchSite {
             member: self.member.clone(),
             receiver_expr: self.receiver_expr.clone(),
             receiver_type: self.receiver_type.clone(),
+            receiver_base_type: self.receiver_base_type.clone(),
+            receiver_field: self.receiver_field.clone(),
             kind: self.kind,
             target: self.target.clone(),
         }
     }
+}
+
+/// An identifier and nothing else: `ops`, but not `ops->fn` or `get()`.
+fn is_plain_name(text: &str) -> bool {
+    !text.is_empty()
+        && !text.starts_with(|c: char| c.is_numeric())
+        && text.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// `base->field` or `base.field`, where both sides are plain names. A longer
+/// chain needs the type of an intermediate field, which needs the same
+/// lookup again; one step is what the types table answers in one hop.
+fn field_step(text: &str) -> Option<(&str, &str)> {
+    for separator in ["->", "."] {
+        if let Some((base, field)) = text.split_once(separator) {
+            if is_plain_name(base) && is_plain_name(field) {
+                return Some((base, field));
+            }
+        }
+    }
+
+    None
 }
 
 /// Collapse runs of whitespace (including newlines) into single spaces.
@@ -792,6 +820,8 @@ impl TreeSitterAnalyzer {
                                 member: String::new(),
                                 receiver_expr: Some(text),
                                 receiver_type: None,
+                                receiver_base_type: None,
+                                receiver_field: None,
                                 kind: DispatchKind::PointerDeref,
                                 byte_start: capture.node.start_byte(),
                                 line: capture.node.start_position().row as u32 + 1,
@@ -837,6 +867,8 @@ impl TreeSitterAnalyzer {
                     member: name.to_string(),
                     receiver_expr,
                     receiver_type: None,
+                    receiver_base_type: None,
+                    receiver_field: None,
                     kind,
                     byte_start: member.start_byte(),
                     line: member.start_position().row as u32 + 1,
@@ -913,25 +945,35 @@ impl TreeSitterAnalyzer {
             let Some(receiver) = site.receiver_expr.as_deref() else {
                 continue;
             };
-            // Anything but a plain name needs more than a declaration.
-            if receiver.is_empty()
-                || receiver.starts_with(|c: char| c.is_numeric())
-                || !receiver.chars().all(|c| c.is_alphanumeric() || c == '_')
-            {
-                continue;
-            }
 
             let scope = scopes
                 .iter()
                 .find(|(start, end, _)| site.byte_start >= *start && site.byte_start < *end)
                 .map(|(_, _, declared)| declared);
+            let declared_type = |name: &str| -> Option<String> {
+                match scope
+                    .and_then(|declared| declared.get(name))
+                    .or_else(|| file_scope.get(name))
+                {
+                    Some(Some(type_name)) => Some(type_name.clone()),
+                    _ => None,
+                }
+            };
 
-            let declared = scope
-                .and_then(|declared| declared.get(receiver))
-                .or_else(|| file_scope.get(receiver));
+            if is_plain_name(receiver) {
+                site.receiver_type = declared_type(receiver);
+                continue;
+            }
 
-            if let Some(Some(type_name)) = declared {
-                site.receiver_type = Some(type_name.clone());
+            // `inode->i_fop->read()`: the file proves what `inode` is, and
+            // the field says which member of it the receiver reads. What
+            // `i_fop` is declared as belongs to whichever file declares
+            // struct inode, so the pair is stored and resolution finishes it.
+            if let Some((base, field)) = field_step(receiver) {
+                if let Some(base_type) = declared_type(base) {
+                    site.receiver_base_type = Some(base_type);
+                    site.receiver_field = Some(field.to_string());
+                }
             }
         }
     }
@@ -1404,6 +1446,8 @@ impl TreeSitterAnalyzer {
                 member: member.clone(),
                 receiver_expr: Some(collapse_whitespace(&source[dispatch.byte_range()])),
                 receiver_type: None,
+                receiver_base_type: None,
+                receiver_field: None,
                 kind: DispatchKind::MacroDeclared,
                 byte_start: candidate.start_byte(),
                 line: candidate.start_position().row as u32 + 1,
@@ -1608,6 +1652,8 @@ impl TreeSitterAnalyzer {
                                 member: String::new(),
                                 receiver_expr: Some(var.name.clone()),
                                 receiver_type: None,
+                                receiver_base_type: None,
+                                receiver_field: None,
                                 kind: if var.is_parameter {
                                     DispatchKind::PointerParam
                                 } else {
@@ -3719,9 +3765,10 @@ mod tests {
     }
 
     #[test]
-    fn a_field_chain_receiver_is_left_for_query_time() {
-        // `inode->i_fop` needs the type of the field, which lives in the
-        // types table, not in this declaration.
+    fn a_field_chain_receiver_records_the_base_and_the_field() {
+        // `inode->i_fop` is typed by what `i_fop` is declared as, which is in
+        // whichever file declares struct inode. What this file proves is the
+        // type of `inode` and the name of the field.
         let (_functions, sites) = analyze(
             "struct inode { struct file_operations *i_fop; };\n\
              int probe(struct inode *inode) { return inode->i_fop->read(); }\n",
@@ -3731,6 +3778,35 @@ mod tests {
         let read = sites.iter().find(|s| s.member == "read").unwrap();
         assert_eq!(read.receiver_expr.as_deref(), Some("inode->i_fop"));
         assert_eq!(read.receiver_type, None);
+        assert_eq!(read.receiver_base_type.as_deref(), Some("inode"));
+        assert_eq!(read.receiver_field.as_deref(), Some("i_fop"));
+    }
+
+    #[test]
+    fn a_field_chain_on_an_undeclared_base_records_nothing() {
+        let (_functions, sites) = analyze(
+            "int probe(void) { return global->ops->read(); }\n",
+            "test.c",
+        );
+
+        let read = sites.iter().find(|s| s.member == "read").unwrap();
+        assert_eq!(read.receiver_base_type, None);
+        assert_eq!(read.receiver_field, None);
+    }
+
+    #[test]
+    fn a_longer_chain_records_nothing() {
+        // `a->b->c` needs the type of `b` before the type of `c`: the same
+        // lookup twice, which is not what one stored pair answers.
+        let (_functions, sites) = analyze(
+            "struct outer { struct middle *b; };\n\
+             int probe(struct outer *a) { return a->b->c->run(); }\n",
+            "test.c",
+        );
+
+        let run = sites.iter().find(|s| s.member == "run").unwrap();
+        assert_eq!(run.receiver_expr.as_deref(), Some("a->b->c"));
+        assert_eq!(run.receiver_base_type, None);
     }
 
     #[test]

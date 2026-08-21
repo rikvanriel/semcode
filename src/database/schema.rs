@@ -144,6 +144,8 @@ impl SchemaManager {
             Field::new("member", DataType::Utf8, false),
             Field::new("receiver_expr", DataType::Utf8, true),
             Field::new("receiver_type", DataType::Utf8, true),
+            Field::new("receiver_base_type", DataType::Utf8, true),
+            Field::new("receiver_field", DataType::Utf8, true),
             Field::new("kind", DataType::Utf8, false),
             // Part of the merge key, so it carries "" rather than null: a
             // null key column matches nothing and the row is dropped.

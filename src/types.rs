@@ -126,6 +126,13 @@ pub struct DispatchSite {
     pub receiver_expr: Option<String>,
     /// Receiver type when the containing file proves it.
     pub receiver_type: Option<String>,
+    /// For a receiver that is itself a field access, `inode->i_fop->read()`,
+    /// the type of the base and the field read from it: `inode` and `i_fop`.
+    /// The receiver's own type is the type of that field, which lives in
+    /// whichever file declares the struct, so resolution finishes the job
+    /// against the types table. Both are set together or not at all.
+    pub receiver_base_type: Option<String>,
+    pub receiver_field: Option<String>,
     pub kind: DispatchKind,
     /// A target the site itself names, such as a local pointer's initializer.
     pub target: Option<String>,

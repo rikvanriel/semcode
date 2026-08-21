@@ -6429,6 +6429,8 @@ mod tests {
             member: "read".to_string(),
             receiver_expr: Some("f->f_op".to_string()),
             receiver_type: receiver_type.map(|t| t.to_string()),
+            receiver_base_type: None,
+            receiver_field: None,
             kind: DispatchKind::MemberArrow,
             target: None,
         };
@@ -6531,6 +6533,8 @@ mod tests {
             member: "read".to_string(),
             receiver_expr: Some("ops".to_string()),
             receiver_type: None,
+            receiver_base_type: None,
+            receiver_field: None,
             kind: DispatchKind::MemberArrow,
             target: None,
         };
