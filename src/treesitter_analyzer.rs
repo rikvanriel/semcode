@@ -88,6 +88,7 @@ struct RawRegistration {
     target: String,
     byte_start: usize,
     line: u32,
+    kind: RegistrationKind,
 }
 
 impl RawRegistration {
@@ -101,7 +102,7 @@ impl RawRegistration {
             byte_start: self.byte_start as u64,
             line: self.line,
             enclosing_function: enclosing.to_string(),
-            kind: RegistrationKind::DesignatedInit,
+            kind: self.kind,
         }
     }
 }
@@ -830,6 +831,9 @@ impl TreeSitterAnalyzer {
 
         extraction.pointer_vars = Self::collect_pointer_vars(tree.root_node(), source_code);
         extraction.registrations = Self::collect_registrations(tree.root_node(), source_code);
+        extraction
+            .registrations
+            .extend(Self::collect_assignments(tree.root_node(), source_code));
 
         Ok(extraction)
     }
@@ -900,11 +904,136 @@ impl TreeSitterAnalyzer {
                     target,
                     byte_start: pair.start_byte(),
                     line: pair.start_position().row as u32 + 1,
+                    kind: RegistrationKind::DesignatedInit,
                 });
             }
         }
 
         found
+    }
+
+    /// `x->handler = my_handler;` installs a function just as an initializer
+    /// does. The type of `x` has to come from a declaration in this file:
+    /// the struct is usually declared in a header the file does not contain,
+    /// and a registration filed under a guessed type is worse than none.
+    fn collect_assignments(root: tree_sitter::Node, source: &str) -> Vec<RawRegistration> {
+        let locals = Self::collect_local_struct_types(root, source);
+        let mut found = Vec::new();
+        let mut stack = vec![root];
+
+        while let Some(node) = stack.pop() {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+
+            if node.kind() != "assignment_expression" {
+                continue;
+            }
+
+            let (Some(left), Some(right)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+            ) else {
+                continue;
+            };
+            if left.kind() != "field_expression" {
+                continue;
+            }
+
+            let target = match right.kind() {
+                "identifier" => source[right.byte_range()].to_string(),
+                "pointer_expression" => match right
+                    .child_by_field_name("argument")
+                    .filter(|a| a.kind() == "identifier")
+                {
+                    Some(a) => source[a.byte_range()].to_string(),
+                    None => continue,
+                },
+                _ => continue,
+            };
+
+            let Some(member) = left
+                .child_by_field_name("field")
+                .map(|f| source[f.byte_range()].to_string())
+            else {
+                continue;
+            };
+
+            // Only a receiver that is a plain variable declared here can be
+            // typed without leaving the file.
+            let Some(receiver) = left.child_by_field_name("argument") else {
+                continue;
+            };
+            if receiver.kind() != "identifier" {
+                continue;
+            }
+            let Some(container_type) = locals.get(&source[receiver.byte_range()]).cloned() else {
+                continue;
+            };
+
+            found.push(RawRegistration {
+                container_type,
+                member,
+                target,
+                byte_start: node.start_byte(),
+                line: node.start_position().row as u32 + 1,
+                kind: RegistrationKind::Assignment,
+            });
+        }
+
+        found
+    }
+
+    /// Variables in this file declared as a struct, union or typedef, by name.
+    /// Shadowing is ignored: two locals of the same name in one file with
+    /// different types are rare, and the cost is a registration filed under
+    /// the wrong one of the two.
+    fn collect_local_struct_types(
+        root: tree_sitter::Node,
+        source: &str,
+    ) -> std::collections::HashMap<String, String> {
+        let mut types = std::collections::HashMap::new();
+        let mut stack = vec![root];
+
+        while let Some(node) = stack.pop() {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+
+            if !matches!(node.kind(), "declaration" | "parameter_declaration") {
+                continue;
+            }
+
+            let Some(type_node) = node.child_by_field_name("type") else {
+                continue;
+            };
+            let Some(type_name) = Self::aggregate_type_name(type_node, source) else {
+                continue;
+            };
+
+            let mut cursor = node.walk();
+            for declarator in node.children_by_field_name("declarator", &mut cursor) {
+                let declarator = if declarator.kind() == "init_declarator" {
+                    match declarator.child_by_field_name("declarator") {
+                        Some(inner) => inner,
+                        None => continue,
+                    }
+                } else {
+                    declarator
+                };
+
+                if let Some(name) = Self::innermost_declarator_name(declarator) {
+                    let name = source[name.byte_range()].to_string();
+                    if !name.is_empty() {
+                        types.insert(name, type_name.clone());
+                    }
+                }
+            }
+        }
+
+        types
     }
 
     /// The type an initializer fills in, taken from the declaration or the
@@ -3261,6 +3390,43 @@ mod tests {
                 "tcp_v4_rcv".to_string(),
                 "inet_init".to_string()
             )]
+        );
+    }
+
+    #[test]
+    fn assignment_to_a_member_registers_when_the_receiver_is_typed_here() {
+        let found = registrations_of(
+            "struct ops { int (*run)(void); };\n\
+             int impl(void);\n\
+             void setup(struct ops *o) { o->run = impl; }\n",
+            "test.c",
+        );
+
+        assert_eq!(
+            found,
+            vec![(
+                "ops".to_string(),
+                "run".to_string(),
+                "impl".to_string(),
+                "setup".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn assignment_through_an_untyped_receiver_registers_nothing() {
+        // `container_of(...)` returns something this file cannot type, and
+        // guessing the type would file the registration against the wrong
+        // dispatch sites.
+        let found = registrations_of(
+            "int impl(void);\n\
+             void setup(void *p) { GET_OPS(p)->run = impl; }\n",
+            "test.c",
+        );
+
+        assert!(
+            found.is_empty(),
+            "registered under a guessed type: {found:?}"
         );
     }
 

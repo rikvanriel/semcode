@@ -206,18 +206,22 @@ pub struct Registration {
 pub enum RegistrationKind {
     /// `.member = target` inside an initializer
     DesignatedInit,
+    /// `x->member = target;` or `x.member = target;`
+    Assignment,
 }
 
 impl RegistrationKind {
     pub fn as_str(self) -> &'static str {
         match self {
             RegistrationKind::DesignatedInit => "designated_init",
+            RegistrationKind::Assignment => "assignment",
         }
     }
 
     pub fn from_column_value(text: &str) -> Option<Self> {
         match text {
             "designated_init" => Some(RegistrationKind::DesignatedInit),
+            "assignment" => Some(RegistrationKind::Assignment),
             _ => None,
         }
     }
