@@ -1556,13 +1556,13 @@ async fn run_pipeline(args: Args) -> Result<()> {
             }
         };
 
-        // An index written by an older semcode does not hold what this one
-        // extracts, and the files it was built from have not changed, so
-        // indexing a commit range adds nothing: every file is skipped as
-        // already seen, and the answers stay quietly incomplete. Read the
-        // whole tree instead, which is what the user asked for by running the
-        // indexer again.
-        if db_manager.index_predates_reader().await? {
+        // An index written by an older semcode holds rows that no commit
+        // range will refresh: the files have not changed, so a range covers
+        // none of them. Read the whole tree instead — but only when the
+        // caller did not name a range. `--git A..B` asks a question, and
+        // answering a different one without saying so is the behaviour this
+        // series exists to remove.
+        if args.git.is_none() && db_manager.index_predates_reader().await? {
             let repo = gix::discover(&args.source)
                 .map_err(|e| anyhow::anyhow!("Not in a git repository: {}", e))?;
             let head = repo.head_commit()?.id().to_string();
