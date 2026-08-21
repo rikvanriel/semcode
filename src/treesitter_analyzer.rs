@@ -1957,13 +1957,19 @@ impl TreeSitterAnalyzer {
         source_root: Option<&Path>,
         language: Language,
     ) -> Result<Vec<FunctionInfo>> {
+        // Macro bodies are re-parsed as C; one parser serves the whole file.
+        let mut body_parser = tree_sitter::Parser::new();
+        body_parser.set_language(&tree_sitter_c::LANGUAGE.into())?;
         let queries = self.get_queries(language);
         let mut cursor = QueryCursor::new();
-        let mut captures =
-            cursor.captures(&queries.macro_query, tree.root_node(), source.as_bytes());
+        // matches(), not captures(): a match arrives once with every capture
+        // present. captures() yields the same match repeatedly as each
+        // capture is found, and the early yields have no body yet.
+        let mut matches = cursor.matches(&queries.macro_query, tree.root_node(), source.as_bytes());
         let mut macros = Vec::new();
 
-        while let Some((m, _)) = captures.next() {
+        while let Some(m) = matches.next() {
+            let mut body: Option<tree_sitter::Node> = None;
             let mut macro_name = None;
             let mut parameters = None;
             let mut definition = String::new();
@@ -1984,9 +1990,7 @@ impl TreeSitterAnalyzer {
                         parameters = Some(self.parse_macro_parameters(text));
                         is_function_like = true;
                     }
-                    "value" => {
-                        // Skip the value capture since we don't use expansion anymore
-                    }
+                    "value" => body = Some(node),
                     "macro" | "function_macro" => {
                         definition = text.to_string();
                         if capture_name == "function_macro" {
@@ -1999,7 +2003,14 @@ impl TreeSitterAnalyzer {
 
             if let Some(name) = macro_name {
                 // Extract calls and types from macro definition
-                let (macro_calls, macro_types) = self.extract_macro_calls_and_types(&definition);
+                let (macro_calls, macro_types) = match body {
+                    Some(body) => Self::macro_body_calls_and_types(
+                        &mut body_parser,
+                        queries,
+                        &source[body.byte_range()],
+                    ),
+                    None => (Vec::new(), Vec::new()),
+                };
 
                 let macro_info = FunctionInfo::from_macro(MacroParams {
                     name,
@@ -2882,68 +2893,72 @@ impl TreeSitterAnalyzer {
         )
     }
 
-    /// Extract calls and types from macro definition (simple text-based analysis)
-    /// The body of a `#define`, without the directive, the macro name or its
-    /// parameter list — none of which is a call, though `NAME(` looks like one.
-    fn macro_body(definition: &str) -> &str {
-        let Some(rest) = definition.strip_prefix("#define") else {
-            return definition;
+    /// Parse a macro body as C and report what it calls and which types it
+    /// names.
+    ///
+    /// A `#define` body is not a translation unit — it can be an expression,
+    /// a statement, a declaration or an initializer — so it is tried in each
+    /// of those contexts and the cleanest parse wins.
+    fn macro_body_calls_and_types(
+        parser: &mut tree_sitter::Parser,
+        queries: &LanguageQueries,
+        body: &str,
+    ) -> (Vec<String>, Vec<String>) {
+        let body = body.trim();
+        if body.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
+        let Some((tree, wrapped)) = Self::parse_macro_body(parser, body) else {
+            return (Self::scan_macro_body_calls(body), Vec::new());
         };
-        let rest = rest.trim_start();
 
-        let name_end = rest
-            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .unwrap_or(rest.len());
-        let rest = &rest[name_end..];
-
-        // A function-like macro's parameter list follows the name directly.
-        match rest.strip_prefix('(') {
-            Some(params) => match params.find(')') {
-                Some(end) => params[end + 1..].trim_start(),
-                None => params,
-            },
-            None => rest.trim_start(),
-        }
-    }
-
-    fn extract_macro_calls_and_types(&self, definition: &str) -> (Vec<String>, Vec<String>) {
         let mut calls = Vec::new();
-        let mut types = Vec::new();
-
-        let definition_text = Self::macro_body(definition.trim());
-
-        // A call is an identifier immediately before a '(' — which is not a
-        // whitespace-separated token, since `helper(x)` is one word.
-        for (offset, _) in definition_text.match_indices('(') {
-            let before = definition_text[..offset].trim_end();
-            // Step over the delimiter by its own width: a macro body can hold
-            // any UTF-8, and slicing at delimiter + 1 splits a multi-byte
-            // character.
-            let start = before
-                .char_indices()
-                .rev()
-                .find(|(_, c)| !(c.is_alphanumeric() || *c == '_'))
-                .map(|(i, c)| i + c.len_utf8())
-                .unwrap_or(0);
-            let name = &before[start..];
-
-            if self.is_valid_identifier(name) {
-                calls.push(name.to_string());
-            }
-        }
-
-        let words: Vec<&str> = definition_text.split_whitespace().collect();
-        for (i, word) in words.iter().enumerate() {
-            // Look for type usage patterns (struct/union/enum keywords)
-            if (*word == "struct" || *word == "union" || *word == "enum") && i + 1 < words.len() {
-                let type_name = words[i + 1].trim_end_matches(&['*', '&', ';', ',', ')', '}'][..]);
-                if self.is_valid_identifier(type_name) {
-                    types.push(type_name.to_string());
+        let mut cursor = QueryCursor::new();
+        let mut captures =
+            cursor.captures(&queries.call_query, tree.root_node(), wrapped.as_bytes());
+        while let Some((call_match, _)) = captures.next() {
+            for capture in call_match.captures {
+                if queries.call_query.capture_names()[capture.index as usize] == "function_name" {
+                    let name = &wrapped[capture.node.byte_range()];
+                    if !name.is_empty() {
+                        calls.push(name.to_string());
+                    }
                 }
             }
         }
 
-        // Remove duplicates and sort
+        let mut types = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            let mut walker = node.walk();
+            for child in node.children(&mut walker) {
+                stack.push(child);
+            }
+
+            match node.kind() {
+                "struct_specifier" | "union_specifier" | "enum_specifier" => {
+                    if let Some(name) = node.child_by_field_name("name") {
+                        types.push(wrapped[name.byte_range()].to_string());
+                    }
+                }
+                "type_identifier" => types.push(wrapped[node.byte_range()].to_string()),
+                _ => {}
+            }
+        }
+
+        // Plenty of bodies are fragments that are not valid C on their own —
+        // `"prefix: " fmt` and friends — and parse into something with no call
+        // in it. Scanning finds the call there; the parse is what keeps the
+        // scan from reading grouping parens as calls in the ordinary case.
+        if calls.is_empty() {
+            calls = Self::scan_macro_body_calls(body);
+        }
+
+        // The wrapper introduces names of its own; they are not the macro's.
+        calls.retain(|name| !name.starts_with("__semcode_"));
+        types.retain(|name| !name.starts_with("__semcode_"));
+
         calls.sort();
         calls.dedup();
         types.sort();
@@ -2952,13 +2967,97 @@ impl TreeSitterAnalyzer {
         (calls, types)
     }
 
-    /// Check if a string is a valid C identifier
-    fn is_valid_identifier(&self, s: &str) -> bool {
-        !s.is_empty()
-            && s.chars().all(|c| c.is_alphanumeric() || c == '_')
-            && s.chars()
-                .next()
-                .is_some_and(|c| c.is_alphabetic() || c == '_')
+    /// Parse a macro body in whichever context it fits, returning the tree and
+    /// the text that was parsed, so node ranges can be read back.
+    fn parse_macro_body(parser: &mut tree_sitter::Parser, body: &str) -> Option<(Tree, String)> {
+        const CONTEXTS: [(&str, &str); 3] = [
+            ("void __semcode_body(void) { ", "; }"),
+            ("", ""),
+            ("struct __semcode_s __semcode_v = ", ";"),
+        ];
+
+        let mut best: Option<(Tree, String, usize)> = None;
+
+        for (prefix, suffix) in CONTEXTS {
+            let wrapped = format!("{prefix}{body}{suffix}");
+            let Some(tree) = parser.parse(&wrapped, None) else {
+                continue;
+            };
+
+            let errors = Self::count_parse_errors(tree.root_node());
+            if errors == 0 {
+                return Some((tree, wrapped));
+            }
+
+            match &best {
+                Some((_, _, fewest)) if *fewest <= errors => {}
+                _ => best = Some((tree, wrapped, errors)),
+            }
+        }
+
+        best.map(|(tree, wrapped, _)| (tree, wrapped))
+    }
+
+    fn count_parse_errors(node: tree_sitter::Node) -> usize {
+        if !node.has_error() {
+            return 0;
+        }
+
+        let mut errors = 0;
+        let mut stack = vec![node];
+        while let Some(node) = stack.pop() {
+            if node.is_error() || node.is_missing() {
+                errors += 1;
+            }
+            let mut walker = node.walk();
+            for child in node.children(&mut walker) {
+                stack.push(child);
+            }
+        }
+
+        errors
+    }
+
+    /// Identifiers immediately before a '(' in a macro body, less the
+    /// keywords that take a parenthesised operand without being a call.
+    fn scan_macro_body_calls(body: &str) -> Vec<String> {
+        const NOT_CALLS: [&str; 12] = [
+            "if",
+            "for",
+            "while",
+            "switch",
+            "return",
+            "sizeof",
+            "typeof",
+            "__typeof__",
+            "defined",
+            "case",
+            "do",
+            "else",
+        ];
+
+        let mut calls = Vec::new();
+        for (offset, _) in body.match_indices('(') {
+            let before = body[..offset].trim_end();
+            // Step back over the delimiter by its own width: a body can hold
+            // any UTF-8, and slicing at delimiter + 1 splits a character.
+            let start = before
+                .char_indices()
+                .rev()
+                .find(|(_, c)| !(c.is_alphanumeric() || *c == '_'))
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0);
+            let name = &before[start..];
+
+            let is_identifier = !name.is_empty()
+                && !name.starts_with(|c: char| c.is_numeric())
+                && name.chars().all(|c| c.is_alphanumeric() || c == '_');
+            if is_identifier && !NOT_CALLS.contains(&name) {
+                calls.push(name.to_string());
+            }
+        }
+
+        calls
     }
 
     /// Deduplicate functions within a single file (no threading issues)
@@ -3264,6 +3363,48 @@ mod tests {
             .calls
             .clone()
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn macro_body_calls_come_from_a_real_parse() {
+        // A scan can only match an identifier before a paren. A parse sees
+        // the structure, so a call nested in an expression, a cast or a
+        // statement expression is found, and a keyword taking a parenthesised
+        // operand is not read as a call.
+        let source = "int helper(int x) { return x; }\n\
+                      int other(int x) { return x; }\n\
+                      #define NESTED(x) helper(other(x) + 1)\n\
+                      #define CAST(x) ((unsigned long)helper(x))\n\
+                      #define STMT(x) ({ int __v = helper(x); __v; })\n\
+                      #define GUARD(x) if (x) helper(x)\n";
+
+        assert_eq!(
+            macro_calls(source, "NESTED"),
+            vec!["helper".to_string(), "other".to_string()]
+        );
+        assert_eq!(macro_calls(source, "CAST"), vec!["helper".to_string()]);
+        assert_eq!(macro_calls(source, "STMT"), vec!["helper".to_string()]);
+        assert_eq!(macro_calls(source, "GUARD"), vec!["helper".to_string()]);
+    }
+
+    #[test]
+    fn an_initializer_macro_body_parses_as_one() {
+        // `{ .read = wrap(f) }` is neither a statement nor an expression; it
+        // parses only as an initializer, which is one of the contexts tried.
+        let source = "int wrap(int (*f)(void));\n\
+                      #define OPS_INIT(f) { .read = wrap(f), .write = 0 }\n";
+
+        assert_eq!(macro_calls(source, "OPS_INIT"), vec!["wrap".to_string()]);
+    }
+
+    #[test]
+    fn a_fragment_body_still_reports_its_call() {
+        // `"prefix: " fmt` is not valid C alone, and the kernel is full of
+        // it. The parse finds nothing, so the scan answers instead.
+        let source = "int printk(const char *fmt, int x);\n\
+                      #define pr_thing(x) printk(\"thing: \" \"%d\", x)\n";
+
+        assert_eq!(macro_calls(source, "pr_thing"), vec!["printk".to_string()]);
     }
 
     #[test]
