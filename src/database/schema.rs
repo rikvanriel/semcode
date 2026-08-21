@@ -163,10 +163,23 @@ impl SchemaManager {
 
         let empty_batch = RecordBatch::new_empty(schema.clone());
 
-        self.connection
+        let table = self
+            .connection
             .create_table("dispatch_sites", vec![empty_batch])
             .execute()
             .await?;
+
+        // Indices belong with the table, not in create_scalar_indices(): that
+        // one returns as soon as the database holds rows, so anything added
+        // there reaches neither an existing index nor a fresh one, which
+        // fills before it runs.
+        for (columns, what) in [
+            (["member"], "BTree index on dispatch_sites.member"),
+            (["target"], "BTree index on dispatch_sites.target"),
+            (["caller_name"], "BTree index on dispatch_sites.caller_name"),
+        ] {
+            self.try_create_index(&table, &columns, what).await;
+        }
 
         Ok(())
     }
@@ -187,10 +200,26 @@ impl SchemaManager {
             Field::new("kind", DataType::Utf8, false),
         ]));
 
-        self.connection
+        let table = self
+            .connection
             .create_table("registrations", vec![RecordBatch::new_empty(schema)])
             .execute()
             .await?;
+
+        // Every resolution query filters on one of these three: the target
+        // when asking where a function is installed, the member when joining
+        // dispatch sites, the container type when asking what implements a
+        // slot.
+        for (columns, what) in [
+            (["target"], "BTree index on registrations.target"),
+            (["member"], "BTree index on registrations.member"),
+            (
+                ["container_type"],
+                "BTree index on registrations.container_type",
+            ),
+        ] {
+            self.try_create_index(&table, &columns, what).await;
+        }
 
         Ok(())
     }
