@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-use anyhow::Result;
+use anyhow::{Context, Result};
 use arrow::array::Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -23,7 +23,11 @@ pub enum OptimizeOutcome {
 
 /// Bumped when the meaning of stored data changes, not merely its shape: a
 /// reader that does not understand a version must refuse rather than guess.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// 2: dispatch sites and registrations, receiver types, calls and facts from
+///    macro bodies. An index written by version 1 holds none of them for a
+///    file it has already seen.
+pub const SCHEMA_VERSION: u32 = 2;
 
 pub struct SchemaManager {
     connection: Connection,
@@ -66,7 +70,12 @@ impl SchemaManager {
         }
 
         if !table_names.iter().any(|n| n == "schema_meta") {
-            self.create_schema_meta_table().await?;
+            // An index that already holds functions was written before this
+            // table existed, so it was written by something older. Stamping
+            // it with the current version here would claim it holds what this
+            // build writes, and nothing would ever re-read it.
+            let preexisting = table_names.iter().any(|n| n == "functions");
+            self.create_schema_meta_table_for(preexisting).await?;
         }
 
         if !table_names.iter().any(|n| n == "git_commits") {
@@ -193,7 +202,77 @@ impl SchemaManager {
     /// file hash, so a database can hold a feature's column while most of its
     /// rows predate the feature. The marks here record when a feature started
     /// being populated, which is what makes a backfill decidable.
+    /// The version the index was written by, or `None` when the table
+    /// predates versioning entirely.
+    pub async fn stored_schema_version(&self) -> Result<Option<u32>> {
+        let names = self.connection.table_names().execute().await?;
+        if !names.iter().any(|name| name == "schema_meta") {
+            return Ok(None);
+        }
+
+        let batches: Vec<arrow::record_batch::RecordBatch> = self
+            .connection
+            .open_table("schema_meta")
+            .execute()
+            .await?
+            .query()
+            .only_if("key = 'schema_version'")
+            .execute()
+            .await?
+            .try_collect()
+            .await?;
+
+        for batch in &batches {
+            let Some(values) = batch
+                .column_by_name("value")
+                .and_then(|c| c.as_any().downcast_ref::<arrow::array::StringArray>())
+            else {
+                continue;
+            };
+            for row in 0..values.len() {
+                if values.is_valid(row) {
+                    return Ok(values.value(row).parse().ok());
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Record that the index now holds what this version writes.
+    pub async fn set_schema_version(&self) -> Result<()> {
+        let table = self.connection.open_table("schema_meta").execute().await?;
+        table
+            .delete("key = 'schema_version'")
+            .await
+            .context("clearing the recorded schema version")?;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["schema_version"]))
+                    as arrow::array::ArrayRef,
+                Arc::new(arrow::array::StringArray::from(vec![
+                    SCHEMA_VERSION.to_string()
+                ])) as arrow::array::ArrayRef,
+            ],
+        )?;
+        table.add(vec![batch]).execute().await?;
+
+        Ok(())
+    }
+
     pub async fn create_schema_meta_table(&self) -> Result<()> {
+        self.create_schema_meta_table_for(false).await
+    }
+
+    /// `preexisting` marks an index that held data before this table did: its
+    /// rows come from an unknown older version, which is version 0 here.
+    pub async fn create_schema_meta_table_for(&self, preexisting: bool) -> Result<()> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("key", DataType::Utf8, false),
             Field::new("value", DataType::Utf8, false),
@@ -215,7 +294,8 @@ impl SchemaManager {
             "populated_since:dispatch_sites",
             "populated_since:registrations",
         ];
-        let values = vec![SCHEMA_VERSION.to_string(), now.clone(), now];
+        let written_by = if preexisting { 0 } else { SCHEMA_VERSION };
+        let values = vec![written_by.to_string(), now.clone(), now];
 
         let batch = RecordBatch::try_new(
             schema,

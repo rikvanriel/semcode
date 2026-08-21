@@ -85,6 +85,23 @@ impl DatabaseManager {
         Ok(self.connection.table_names().execute().await?)
     }
 
+    /// The schema version the index was written by. `None` means it predates
+    /// versioning, which for these purposes is older than anything.
+    pub async fn stored_schema_version(&self) -> Result<Option<u32>> {
+        self.schema_manager.stored_schema_version().await
+    }
+
+    /// True when the index was written before the extractor learned what it
+    /// knows now, so what is stored is not what a fresh index would hold.
+    pub async fn index_predates_reader(&self) -> Result<bool> {
+        Ok(self.stored_schema_version().await?.unwrap_or(0)
+            < crate::database::schema::SCHEMA_VERSION)
+    }
+
+    pub async fn record_schema_version(&self) -> Result<()> {
+        self.schema_manager.set_schema_version().await
+    }
+
     pub async fn create_tables(&self) -> Result<()> {
         self.schema_manager.create_all_tables().await?;
         self.schema_manager.create_scalar_indices().await?;
