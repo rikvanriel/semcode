@@ -266,10 +266,6 @@ impl SchemaManager {
         Ok(())
     }
 
-    pub async fn create_schema_meta_table(&self) -> Result<()> {
-        self.create_schema_meta_table_for(false).await
-    }
-
     /// `preexisting` marks an index that held data before this table did: its
     /// rows come from an unknown older version, which is version 0 here.
     pub async fn create_schema_meta_table_for(&self, preexisting: bool) -> Result<()> {
