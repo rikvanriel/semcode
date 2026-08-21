@@ -2720,6 +2720,7 @@ struct McpServer {
     default_git_sha: Option<String>,
     model_path: Option<String>,
     git_repo_path: String,
+    database_path: String,
     page_cache: PageCache,
     indexing_state: Arc<tokio::sync::Mutex<IndexingState>>,
     notification_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
@@ -2758,6 +2759,7 @@ impl McpServer {
             default_git_sha,
             model_path,
             git_repo_path: git_repo_path.to_string(),
+            database_path: database_path.to_string(),
             page_cache: PageCache::new(),
             indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
@@ -2826,6 +2828,52 @@ impl McpServer {
     }
 
     /// Check if the database appears to be empty and return a helpful message if so
+    /// A refusal to answer, when answering would mislead.
+    ///
+    /// An index written by an older semcode holds what that version
+    /// extracted, so a query against it returns fewer callers and no
+    /// registrations while looking exactly like a complete answer. A caller
+    /// that is a language model cannot tell, and will act on it, so the
+    /// refusal carries the facts as fields rather than only as prose: what
+    /// wrote the index, what this build expects, and the command that fixes
+    /// it.
+    async fn refuse_stale_index(&self) -> Option<Value> {
+        if !self.db.index_predates_reader().await.ok()? {
+            return None;
+        }
+
+        let written_by = self.db.stored_schema_version().await.ok()?.unwrap_or(0);
+        let tree = std::fs::canonicalize(&self.git_repo_path)
+            .unwrap_or_else(|_| std::path::PathBuf::from(&self.git_repo_path))
+            .display()
+            .to_string();
+        let database = std::path::Path::new(&self.database_path)
+            .parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok())
+            .map(|parent| parent.display().to_string())
+            .unwrap_or_else(|| tree.clone());
+        let command = format!("semcode-index -s {tree} -d {database}");
+
+        Some(json!({
+            "content": [{
+                "type": "text",
+                "text": format!(
+                    "This index was written by an older semcode (version {written_by}; this \
+                     build writes {expected}), so it does not hold everything this build \
+                     extracts: dispatch sites, registrations and receiver types are missing \
+                     or incomplete. Answers would look complete and be wrong. Rebuild the \
+                     index by running: {command}",
+                    expected = semcode::SCHEMA_VERSION,
+                )
+            }],
+            "isError": true,
+            "index_stale": true,
+            "written_by": written_by,
+            "expected": semcode::SCHEMA_VERSION,
+            "command": command,
+        }))
+    }
+
     async fn check_database_status(&self) -> Option<String> {
         let state = self.indexing_state.lock().await;
 
@@ -3153,6 +3201,9 @@ impl McpServer {
 
     async fn handle_find_function(&self, args: &Value) -> Value {
         // Check if database is empty and return helpful message
+        if let Some(refusal) = self.refuse_stale_index().await {
+            return refusal;
+        }
         if let Some(status_msg) = self.check_database_status().await {
             return json!({
                 "content": [{"type": "text", "text": status_msg}]
@@ -3177,6 +3228,9 @@ impl McpServer {
 
     async fn handle_find_type(&self, args: &Value) -> Value {
         // Check if database is empty and return helpful message
+        if let Some(refusal) = self.refuse_stale_index().await {
+            return refusal;
+        }
         if let Some(status_msg) = self.check_database_status().await {
             return json!({
                 "content": [{"type": "text", "text": status_msg}]
@@ -3201,6 +3255,9 @@ impl McpServer {
 
     async fn handle_find_callers(&self, args: &Value) -> Value {
         // Check if database is empty and return helpful message
+        if let Some(refusal) = self.refuse_stale_index().await {
+            return refusal;
+        }
         if let Some(status_msg) = self.check_database_status().await {
             return json!({
                 "content": [{"type": "text", "text": status_msg}]
@@ -3224,6 +3281,9 @@ impl McpServer {
     }
 
     async fn handle_find_implementors(&self, args: &Value) -> Value {
+        if let Some(refusal) = self.refuse_stale_index().await {
+            return refusal;
+        }
         if let Some(status_msg) = self.check_database_status().await {
             return json!({
                 "content": [{"type": "text", "text": status_msg}]
@@ -3268,6 +3328,9 @@ impl McpServer {
     }
 
     async fn handle_find_registrations(&self, args: &Value) -> Value {
+        if let Some(refusal) = self.refuse_stale_index().await {
+            return refusal;
+        }
         if let Some(status_msg) = self.check_database_status().await {
             return json!({
                 "content": [{"type": "text", "text": status_msg}]
@@ -3310,6 +3373,9 @@ impl McpServer {
 
     async fn handle_find_calls(&self, args: &Value) -> Value {
         // Check if database is empty and return helpful message
+        if let Some(refusal) = self.refuse_stale_index().await {
+            return refusal;
+        }
         if let Some(status_msg) = self.check_database_status().await {
             return json!({
                 "content": [{"type": "text", "text": status_msg}]
@@ -3334,6 +3400,9 @@ impl McpServer {
 
     async fn handle_find_callchain(&self, args: &Value) -> Value {
         // Check if database is empty and return helpful message
+        if let Some(refusal) = self.refuse_stale_index().await {
+            return refusal;
+        }
         if let Some(status_msg) = self.check_database_status().await {
             return json!({
                 "content": [{"type": "text", "text": status_msg}]
@@ -3390,6 +3459,9 @@ impl McpServer {
 
     async fn handle_grep_functions(&self, args: &Value) -> Value {
         // Check if database is empty and return helpful message
+        if let Some(refusal) = self.refuse_stale_index().await {
+            return refusal;
+        }
         if let Some(status_msg) = self.check_database_status().await {
             return json!({
                 "content": [{"type": "text", "text": status_msg}]
@@ -3420,6 +3492,9 @@ impl McpServer {
 
     async fn handle_vgrep_functions(&self, args: &Value) -> Value {
         // Check if database is empty and return helpful message
+        if let Some(refusal) = self.refuse_stale_index().await {
+            return refusal;
+        }
         if let Some(status_msg) = self.check_database_status().await {
             return json!({
                 "content": [{"type": "text", "text": status_msg}]
@@ -6071,6 +6146,7 @@ mod tests {
         );
         let server = McpServer {
             db,
+            database_path: String::new(),
             default_git_sha: None,
             model_path: None,
             git_repo_path: ".".to_string(),
@@ -6106,6 +6182,7 @@ mod tests {
 
         let server = McpServer {
             db,
+            database_path: String::new(),
             default_git_sha: None,
             model_path: None,
             git_repo_path: ".".to_string(),
@@ -6143,6 +6220,7 @@ mod tests {
 
         let server = McpServer {
             db,
+            database_path: String::new(),
             default_git_sha: None,
             model_path: None,
             git_repo_path: ".".to_string(),
@@ -6156,6 +6234,54 @@ mod tests {
         let content = result["content"][0]["text"].as_str().unwrap();
         assert!(content.contains("Completed (100 files processed)"));
         assert!(content.contains("5.00s"));
+    }
+
+    #[tokio::test]
+    async fn a_stale_index_is_refused_with_the_command_that_fixes_it() {
+        // A model cannot see that an answer is short. Hand it the facts as
+        // fields, not as a sentence to interpret.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DatabaseManager::new(
+                temp_dir.path().join("db").to_str().unwrap(),
+                ".".to_string(),
+            )
+            .await
+            .unwrap(),
+        );
+        db.create_tables().await.unwrap();
+
+        let server = McpServer {
+            db: db.clone(),
+            database_path: temp_dir.path().join("db").to_string_lossy().into_owned(),
+            default_git_sha: None,
+            model_path: None,
+            git_repo_path: ".".to_string(),
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            lazy_mode: false,
+        };
+
+        // A fresh index is current, so nothing is refused.
+        assert!(server.refuse_stale_index().await.is_none());
+
+        // What an older semcode leaves: rows, and no idea what wrote them.
+        std::fs::remove_dir_all(temp_dir.path().join("db").join("schema_meta.lance")).unwrap();
+        db.create_tables().await.unwrap();
+
+        let refusal = server
+            .refuse_stale_index()
+            .await
+            .expect("a stale index must be refused");
+        assert_eq!(refusal["index_stale"], json!(true));
+        assert_eq!(refusal["isError"], json!(true));
+        assert_eq!(refusal["written_by"], json!(0));
+        assert_eq!(refusal["expected"], json!(semcode::SCHEMA_VERSION));
+        assert!(refusal["command"]
+            .as_str()
+            .unwrap()
+            .starts_with("semcode-index -s "));
     }
 
     #[tokio::test]
@@ -6177,6 +6303,7 @@ mod tests {
 
         let server = McpServer {
             db,
+            database_path: String::new(),
             default_git_sha: None,
             model_path: None,
             git_repo_path: ".".to_string(),
@@ -6288,6 +6415,7 @@ mod tests {
         );
         let server = McpServer {
             db,
+            database_path: String::new(),
             default_git_sha: None,
             model_path: None,
             git_repo_path: ".".to_string(),
@@ -6318,6 +6446,7 @@ mod tests {
         );
         let server = McpServer {
             db,
+            database_path: String::new(),
             default_git_sha: None,
             model_path: None,
             git_repo_path: ".".to_string(),
@@ -6350,6 +6479,7 @@ mod tests {
         );
         let server = McpServer {
             db,
+            database_path: String::new(),
             default_git_sha: None,
             model_path: None,
             git_repo_path: ".".to_string(),
@@ -6378,6 +6508,7 @@ mod tests {
         );
         let server = McpServer {
             db,
+            database_path: String::new(),
             default_git_sha: None,
             model_path: None,
             git_repo_path: ".".to_string(),
@@ -6406,6 +6537,7 @@ mod tests {
         );
         let server = McpServer {
             db,
+            database_path: String::new(),
             default_git_sha: None,
             model_path: None,
             git_repo_path: ".".to_string(),
@@ -6448,6 +6580,7 @@ mod tests {
         );
         let server = McpServer {
             db,
+            database_path: String::new(),
             default_git_sha: None,
             model_path: None,
             git_repo_path: temp_dir.path().to_string_lossy().into_owned(),
@@ -6477,6 +6610,7 @@ mod tests {
         );
         let server = McpServer {
             db,
+            database_path: String::new(),
             default_git_sha: None,
             model_path: None,
             git_repo_path: ".".to_string(),
@@ -6508,6 +6642,7 @@ mod tests {
         );
         let server = McpServer {
             db,
+            database_path: String::new(),
             default_git_sha: None,
             model_path: None,
             git_repo_path: ".".to_string(),
