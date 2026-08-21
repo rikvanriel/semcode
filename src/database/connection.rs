@@ -695,6 +695,39 @@ impl DatabaseManager {
         self.registration_store.insert_batch(registrations).await
     }
 
+    /// Everything installed in one member of one type, at a revision.
+    pub async fn find_registrations_for_slot_git_aware(
+        &self,
+        container_type: &str,
+        member: &str,
+        git_sha: &str,
+    ) -> Result<Vec<crate::types::Registration>> {
+        let manifest = self.generate_git_manifest(git_sha).await?;
+
+        Ok(crate::database::resolution::at_revision(
+            self.registration_store
+                .find_by_slot(container_type, member)
+                .await?,
+            &manifest,
+            |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
+        ))
+    }
+
+    /// Every place a function is installed, at a revision.
+    pub async fn find_registrations_of_git_aware(
+        &self,
+        target: &str,
+        git_sha: &str,
+    ) -> Result<Vec<crate::types::Registration>> {
+        let manifest = self.generate_git_manifest(git_sha).await?;
+
+        Ok(crate::database::resolution::at_revision(
+            self.registration_store.find_by_target(target).await?,
+            &manifest,
+            |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
+        ))
+    }
+
     /// Everything installed in one member of one type.
     pub async fn find_registrations_for_slot(
         &self,

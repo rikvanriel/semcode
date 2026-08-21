@@ -7,7 +7,9 @@ use regex;
 use semcode::{git, DatabaseManager, LoreEmailFilters};
 
 use owo_colors::OwoColorize as _;
-use semcode::callchain::{find_all_paths, show_callees, show_callers};
+use semcode::callchain::{
+    find_all_paths, show_callees, show_callers, show_implementors, show_registrations,
+};
 use semcode::display::print_help;
 use semcode::file_survey::survey_file_json_with_references;
 use semcode::lore_writers::{
@@ -1078,6 +1080,54 @@ pub async fn handle_command(
             } else {
                 let name = parsed_parts[1..].join(" ");
                 show_callers(db, &name, verbose, &git_sha).await?;
+            }
+        }
+        "implementors" => {
+            let (parsed_parts, _verbose) = parse_verbose_flag(&parts);
+
+            // `type.member`, or the two written separately.
+            let slot: Option<(String, String)> = match parsed_parts.len() {
+                2 => parsed_parts[1]
+                    .split_once('.')
+                    .map(|(t, m)| (t.to_string(), m.to_string())),
+                3 => Some((parsed_parts[1].to_string(), parsed_parts[2].to_string())),
+                _ => None,
+            };
+
+            match slot {
+                Some((container_type, member))
+                    if !container_type.is_empty() && !member.is_empty() =>
+                {
+                    // `struct file_operations` and `file_operations` name the
+                    // same type; registrations are keyed by the bare name.
+                    let container_type = container_type
+                        .strip_prefix("struct ")
+                        .unwrap_or(&container_type)
+                        .to_string();
+                    show_implementors(db, &container_type, &member, &git_sha).await?;
+                }
+                _ => {
+                    println!(
+                        "{}",
+                        "Usage: implementors [--git <sha>] <type>.<member>".red()
+                    );
+                    println!("  Show the functions installed in a struct member");
+                    println!("  Example: implementors file_operations.read");
+                }
+            }
+        }
+        "registrations" => {
+            let (parsed_parts, _verbose) = parse_verbose_flag(&parts);
+
+            if parsed_parts.len() < 2 {
+                println!(
+                    "{}",
+                    "Usage: registrations [--git <sha>] <function_name>".red()
+                );
+                println!("  Show the struct members a function is installed in");
+            } else {
+                let name = parsed_parts[1..].join(" ");
+                show_registrations(db, &name, &git_sha).await?;
             }
         }
         "calls" => {

@@ -432,6 +432,123 @@ fn show_indirect_callers(
     Ok(())
 }
 
+/// Functions installed in one member of one type: the other side of the
+/// question `callers` answers.
+pub async fn show_implementors_to_writer(
+    db: &DatabaseManager,
+    container_type: &str,
+    member: &str,
+    writer: &mut dyn Write,
+    git_sha: &str,
+) -> Result<()> {
+    writeln!(
+        writer,
+        "Finding functions installed in {}::{}",
+        container_type.cyan(),
+        member.cyan()
+    )?;
+
+    let found = db
+        .find_registrations_for_slot_git_aware(container_type, member, git_sha)
+        .await?;
+
+    if found.is_empty() {
+        writeln!(
+            writer,
+            "{} Nothing is installed in {}::{}",
+            "Info:".yellow(),
+            container_type,
+            member
+        )?;
+        return Ok(());
+    }
+
+    let header = format!("\n{}", "=== Implementors ===".bold().green());
+    writeln!(writer, "{header}")?;
+    writeln!(writer, "{} installed:", found.len())?;
+
+    for (i, registration) in found.iter().enumerate() {
+        let where_from = if registration.enclosing_function.is_empty() {
+            String::new()
+        } else {
+            format!(" in {}", registration.enclosing_function)
+        };
+        writeln!(
+            writer,
+            "  {}. {} at {}:{}{} [{}]",
+            (i + 1).to_string().yellow(),
+            registration.target.cyan(),
+            registration.file_path.bright_black(),
+            registration.line,
+            where_from.bright_black(),
+            registration.kind.as_str().bright_black()
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Where a function is installed, which is how it can be reached without
+/// being named.
+pub async fn show_registrations_to_writer(
+    db: &DatabaseManager,
+    name: &str,
+    writer: &mut dyn Write,
+    git_sha: &str,
+) -> Result<()> {
+    writeln!(writer, "Finding where {} is installed", name.cyan())?;
+
+    let found = db.find_registrations_of_git_aware(name, git_sha).await?;
+
+    if found.is_empty() {
+        writeln!(
+            writer,
+            "{} {} is not installed in any struct member",
+            "Info:".yellow(),
+            name
+        )?;
+        return Ok(());
+    }
+
+    let header = format!("\n{}", "=== Registrations ===".bold().green());
+    writeln!(writer, "{header}")?;
+    writeln!(writer, "{} places install it:", found.len())?;
+
+    for (i, registration) in found.iter().enumerate() {
+        let where_from = if registration.enclosing_function.is_empty() {
+            String::new()
+        } else {
+            format!(" in {}", registration.enclosing_function)
+        };
+        writeln!(
+            writer,
+            "  {}. {}::{} at {}:{}{} [{}]",
+            (i + 1).to_string().yellow(),
+            registration.container_type.cyan(),
+            registration.member.cyan(),
+            registration.file_path.bright_black(),
+            registration.line,
+            where_from.bright_black(),
+            registration.kind.as_str().bright_black()
+        )?;
+    }
+
+    Ok(())
+}
+
+pub async fn show_implementors(
+    db: &DatabaseManager,
+    container_type: &str,
+    member: &str,
+    git_sha: &str,
+) -> Result<()> {
+    show_implementors_to_writer(db, container_type, member, &mut stdout(), git_sha).await
+}
+
+pub async fn show_registrations(db: &DatabaseManager, name: &str, git_sha: &str) -> Result<()> {
+    show_registrations_to_writer(db, name, &mut stdout(), git_sha).await
+}
+
 pub async fn show_callees_to_writer(
     db: &DatabaseManager,
     name: &str,
