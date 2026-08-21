@@ -205,18 +205,66 @@ impl SchemaManager {
     /// The version the index was written by, or `None` when the table
     /// predates versioning entirely.
     pub async fn stored_schema_version(&self) -> Result<Option<u32>> {
+        Ok(self
+            .meta_value("schema_version")
+            .await?
+            .and_then(|value| value.parse().ok()))
+    }
+
+    /// Record that the index now holds what this version writes, and how it
+    /// was built.
+    ///
+    /// The options matter as much as the version: an index built for `c,h`
+    /// does not hold what one built for `c,h,rs` holds, and rebuilding it
+    /// with different options silently changes what a query can find.
+    pub async fn set_index_build(&self, extensions: &[String], no_macros: bool) -> Result<()> {
+        let table = self.connection.open_table("schema_meta").execute().await?;
+        let keys = ["schema_version", "index:extensions", "index:macros"];
+        for key in keys {
+            table
+                .delete(&format!("key = '{key}'"))
+                .await
+                .with_context(|| format!("clearing {key}"))?;
+        }
+
+        let values = [
+            SCHEMA_VERSION.to_string(),
+            extensions.join(","),
+            if no_macros { "skipped" } else { "indexed" }.to_string(),
+        ];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(keys.to_vec())) as arrow::array::ArrayRef,
+                Arc::new(arrow::array::StringArray::from(values.to_vec()))
+                    as arrow::array::ArrayRef,
+            ],
+        )?;
+        table.add(vec![batch]).execute().await?;
+
+        Ok(())
+    }
+
+    /// The value recorded under a key, absent when the index does not say.
+    pub async fn meta_value(&self, key: &str) -> Result<Option<String>> {
         let names = self.connection.table_names().execute().await?;
         if !names.iter().any(|name| name == "schema_meta") {
             return Ok(None);
         }
 
+        let escaped = key.replace('\'', "''");
         let batches: Vec<arrow::record_batch::RecordBatch> = self
             .connection
             .open_table("schema_meta")
             .execute()
             .await?
             .query()
-            .only_if("key = 'schema_version'")
+            .only_if(format!("key = '{escaped}'"))
             .execute()
             .await?
             .try_collect()
@@ -231,7 +279,7 @@ impl SchemaManager {
             };
             for row in 0..values.len() {
                 if values.is_valid(row) {
-                    return Ok(values.value(row).parse().ok());
+                    return Ok(Some(values.value(row).to_string()));
                 }
             }
         }
@@ -239,35 +287,6 @@ impl SchemaManager {
         Ok(None)
     }
 
-    /// Record that the index now holds what this version writes.
-    pub async fn set_schema_version(&self) -> Result<()> {
-        let table = self.connection.open_table("schema_meta").execute().await?;
-        table
-            .delete("key = 'schema_version'")
-            .await
-            .context("clearing the recorded schema version")?;
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("value", DataType::Utf8, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(arrow::array::StringArray::from(vec!["schema_version"]))
-                    as arrow::array::ArrayRef,
-                Arc::new(arrow::array::StringArray::from(vec![
-                    SCHEMA_VERSION.to_string()
-                ])) as arrow::array::ArrayRef,
-            ],
-        )?;
-        table.add(vec![batch]).execute().await?;
-
-        Ok(())
-    }
-
-    /// `preexisting` marks an index that held data before this table did: its
-    /// rows come from an unknown older version, which is version 0 here.
     pub async fn create_schema_meta_table_for(&self, preexisting: bool) -> Result<()> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("key", DataType::Utf8, false),

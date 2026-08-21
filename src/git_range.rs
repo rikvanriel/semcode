@@ -1201,9 +1201,10 @@ pub async fn process_git_tree(
     }
 
     // The tree has been read with this build, so the index now holds what
-    // this version writes. Recorded last: an interrupted run leaves the older
-    // version in place and is re-read next time.
-    db_manager.record_schema_version().await?;
+    // this version writes, for the extensions it was told to read. Recorded
+    // last: an interrupted run leaves the older version in place and is
+    // re-read next time.
+    db_manager.record_index_build(extensions, no_macros).await?;
 
     Ok(())
 }
@@ -1369,6 +1370,8 @@ pub async fn process_git_range(
             error!("Failed to check database health: {}", e);
         }
     }
+
+    db_manager.record_index_build(extensions, no_macros).await?;
 
     Ok(())
 }

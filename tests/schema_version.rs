@@ -48,6 +48,37 @@ async fn an_index_that_predates_versioning_is_not_current() {
     );
 
     // Once the tree has been read again, it holds what this build writes.
-    db.record_schema_version().await.unwrap();
+    db.record_index_build(&["c".to_string(), "h".to_string()], false)
+        .await
+        .unwrap();
     assert!(!db.index_predates_reader().await.unwrap());
+}
+
+#[tokio::test]
+async fn an_index_records_how_it_was_built() {
+    // Rebuilding an index for different extensions changes what a query can
+    // find, so what it was built for has to be written down rather than
+    // assumed.
+    let dir = tempfile::tempdir().unwrap();
+    let db = manager(dir.path()).await;
+
+    assert_eq!(db.recorded_index_options().await.unwrap(), None);
+
+    db.record_index_build(&["c".to_string(), "h".to_string()], true)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.recorded_index_options().await.unwrap(),
+        Some((vec!["c".to_string(), "h".to_string()], true))
+    );
+
+    // Indexing again with other options replaces them rather than adding a
+    // second answer.
+    db.record_index_build(&["rs".to_string()], false)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.recorded_index_options().await.unwrap(),
+        Some((vec!["rs".to_string()], false))
+    );
 }

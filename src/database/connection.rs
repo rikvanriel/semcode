@@ -98,8 +98,36 @@ impl DatabaseManager {
             < crate::database::schema::SCHEMA_VERSION)
     }
 
-    pub async fn record_schema_version(&self) -> Result<()> {
-        self.schema_manager.set_schema_version().await
+    /// Mark the index as holding what this build writes, with the options it
+    /// was built with.
+    pub async fn record_index_build(&self, extensions: &[String], no_macros: bool) -> Result<()> {
+        self.schema_manager
+            .set_index_build(extensions, no_macros)
+            .await
+    }
+
+    /// How the index was built: the extensions indexed, and whether macros
+    /// were skipped. `None` when the index does not say, which is every index
+    /// written before this was recorded.
+    pub async fn recorded_index_options(&self) -> Result<Option<(Vec<String>, bool)>> {
+        let Some(extensions) = self.schema_manager.meta_value("index:extensions").await? else {
+            return Ok(None);
+        };
+        if extensions.is_empty() {
+            return Ok(None);
+        }
+
+        let no_macros = self
+            .schema_manager
+            .meta_value("index:macros")
+            .await?
+            .map(|value| value == "skipped")
+            .unwrap_or(false);
+
+        Ok(Some((
+            extensions.split(',').map(|e| e.to_string()).collect(),
+            no_macros,
+        )))
     }
 
     pub async fn create_tables(&self) -> Result<()> {
