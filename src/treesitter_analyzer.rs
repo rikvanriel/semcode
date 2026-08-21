@@ -581,15 +581,17 @@ impl TreeSitterAnalyzer {
             )?);
         }
 
-        // Extract macros
-        raw_macros.extend(self.extract_macros(
+        // Extract macros; the sites in their bodies are dropped on this
+        // path, which serves callers that want definitions only.
+        let (extracted_macros, _macro_sites) = self.extract_macros(
             &tree,
             &source_code,
             file_path,
             &git_hash,
             source_root,
             language,
-        )?);
+        )?;
+        raw_macros.extend(extracted_macros);
 
         // Call relationships are now embedded in function/macro JSON columns during parsing
 
@@ -690,7 +692,8 @@ impl TreeSitterAnalyzer {
         language: Language,
     ) -> Result<FileAnalysis> {
         // Single pass: extract all calls once and map them to functions by byte ranges
-        let extraction = self.extract_all_calls_optimized(tree, source_code, language)?;
+        let extraction =
+            Self::extract_all_calls_optimized(self.get_queries(language), tree, source_code)?;
 
         // Create extraction context
         let ctx = ExtractionContext {
@@ -703,7 +706,7 @@ impl TreeSitterAnalyzer {
         };
 
         // Extract functions with embedded call data
-        let (functions, dispatch_sites, registrations) =
+        let (functions, mut dispatch_sites, registrations) =
             self.extract_functions_with_calls(&ctx, &extraction)?;
 
         // Extract types (single traversal as before)
@@ -717,7 +720,7 @@ impl TreeSitterAnalyzer {
         )?;
 
         // Extract macros with embedded data (single traversal)
-        let macros = self.extract_macros_with_embedded_data(
+        let (macros, macro_sites) = self.extract_macros_with_embedded_data(
             tree,
             source_code,
             file_path,
@@ -725,6 +728,7 @@ impl TreeSitterAnalyzer {
             source_root,
             language,
         )?;
+        dispatch_sites.extend(macro_sites);
 
         Ok(FileAnalysis {
             functions,
@@ -737,12 +741,10 @@ impl TreeSitterAnalyzer {
 
     /// Extract all calls in a single tree traversal and return with byte positions
     fn extract_all_calls_optimized(
-        &self,
+        queries: &LanguageQueries,
         tree: &Tree,
         source_code: &str,
-        language: Language,
     ) -> Result<CallExtraction> {
-        let queries = self.get_queries(language);
         let mut extraction = CallExtraction::default();
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(
@@ -1551,7 +1553,7 @@ impl TreeSitterAnalyzer {
         git_hash: &str,
         source_root: Option<&Path>,
         language: Language,
-    ) -> Result<Vec<FunctionInfo>> {
+    ) -> Result<(Vec<FunctionInfo>, Vec<DispatchSite>)> {
         // This is the same as extract_macros but named differently for clarity
         // Macros are not as performance-critical as functions since they're fewer in number
         self.extract_macros(tree, source, file_path, git_hash, source_root, language)
@@ -1568,7 +1570,8 @@ impl TreeSitterAnalyzer {
         language: Language,
     ) -> Result<Vec<FunctionInfo>> {
         // Use the optimized approach but without pre-computed calls (for compatibility)
-        let extraction = self.extract_all_calls_optimized(tree, source, language)?;
+        let extraction =
+            Self::extract_all_calls_optimized(self.get_queries(language), tree, source)?;
         let ctx = ExtractionContext {
             tree,
             source,
@@ -1956,10 +1959,11 @@ impl TreeSitterAnalyzer {
         git_hash: &str,
         source_root: Option<&Path>,
         language: Language,
-    ) -> Result<Vec<FunctionInfo>> {
+    ) -> Result<(Vec<FunctionInfo>, Vec<DispatchSite>)> {
         // Macro bodies are re-parsed as C; one parser serves the whole file.
         let mut body_parser = tree_sitter::Parser::new();
         body_parser.set_language(&tree_sitter_c::LANGUAGE.into())?;
+        let mut dispatch_sites: Vec<DispatchSite> = Vec::new();
         let queries = self.get_queries(language);
         let mut cursor = QueryCursor::new();
         // matches(), not captures(): a match arrives once with every capture
@@ -2003,14 +2007,35 @@ impl TreeSitterAnalyzer {
 
             if let Some(name) = macro_name {
                 // Extract calls and types from macro definition
-                let (macro_calls, macro_types) = match body {
-                    Some(body) => Self::macro_body_calls_and_types(
-                        &mut body_parser,
-                        queries,
-                        &source[body.byte_range()],
-                    ),
-                    None => (Vec::new(), Vec::new()),
+                let (macro_calls, macro_types, body_sites) = match body {
+                    Some(body) => {
+                        let (calls, types, mut sites) = Self::macro_body_calls_and_types(
+                            &mut body_parser,
+                            queries,
+                            &source[body.byte_range()],
+                        );
+
+                        // Positions come back relative to the body; place them
+                        // in the file so the site is where the macro is.
+                        let body_start = body.start_byte();
+                        let body_line = body.start_position().row as u32 + 1;
+                        for site in &mut sites {
+                            site.byte_start += body_start;
+                            site.line = body_line + site.line.saturating_sub(1);
+                        }
+
+                        (calls, types, sites)
+                    }
+                    None => (Vec::new(), Vec::new(), Vec::new()),
                 };
+
+                dispatch_sites.extend(body_sites.iter().map(|raw| {
+                    raw.attribute(
+                        &name,
+                        &self.make_relative_path(file_path, source_root),
+                        git_hash,
+                    )
+                }));
 
                 let macro_info = FunctionInfo::from_macro(MacroParams {
                     name,
@@ -2040,7 +2065,7 @@ impl TreeSitterAnalyzer {
             }
         }
 
-        Ok(macros)
+        Ok((macros, dispatch_sites))
     }
 
     fn parse_parameters_from_node(
@@ -2903,14 +2928,14 @@ impl TreeSitterAnalyzer {
         parser: &mut tree_sitter::Parser,
         queries: &LanguageQueries,
         body: &str,
-    ) -> (Vec<String>, Vec<String>) {
+    ) -> (Vec<String>, Vec<String>, Vec<RawDispatchSite>) {
         let body = body.trim();
         if body.is_empty() {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new());
         }
 
-        let Some((tree, wrapped)) = Self::parse_macro_body(parser, body) else {
-            return (Self::scan_macro_body_calls(body), Vec::new());
+        let Some((tree, wrapped, prefix_len)) = Self::parse_macro_body(parser, body) else {
+            return (Self::scan_macro_body_calls(body), Vec::new(), Vec::new());
         };
 
         let mut calls = Vec::new();
@@ -2964,19 +2989,37 @@ impl TreeSitterAnalyzer {
         types.sort();
         types.dedup();
 
-        (calls, types)
+        // A macro body dispatches like any other code: `((o)->run())` is a
+        // call through a member wherever it is written. Positions are in the
+        // wrapped text, and the caller maps them back to the file.
+        let mut sites = match Self::extract_all_calls_optimized(queries, &tree, &wrapped) {
+            Ok(extraction) => extraction.member_sites,
+            Err(_) => Vec::new(),
+        };
+        // The wrapper sits on one line before the body, so a position maps
+        // back by subtracting its length; a body spanning several lines keeps
+        // its own line offsets.
+        sites.retain(|site| site.byte_start >= prefix_len);
+        for site in &mut sites {
+            site.byte_start -= prefix_len;
+        }
+
+        (calls, types, sites)
     }
 
     /// Parse a macro body in whichever context it fits, returning the tree and
     /// the text that was parsed, so node ranges can be read back.
-    fn parse_macro_body(parser: &mut tree_sitter::Parser, body: &str) -> Option<(Tree, String)> {
+    fn parse_macro_body(
+        parser: &mut tree_sitter::Parser,
+        body: &str,
+    ) -> Option<(Tree, String, usize)> {
         const CONTEXTS: [(&str, &str); 3] = [
             ("void __semcode_body(void) { ", "; }"),
             ("", ""),
             ("struct __semcode_s __semcode_v = ", ";"),
         ];
 
-        let mut best: Option<(Tree, String, usize)> = None;
+        let mut best: Option<(Tree, String, usize, usize)> = None;
 
         for (prefix, suffix) in CONTEXTS {
             let wrapped = format!("{prefix}{body}{suffix}");
@@ -2986,16 +3029,16 @@ impl TreeSitterAnalyzer {
 
             let errors = Self::count_parse_errors(tree.root_node());
             if errors == 0 {
-                return Some((tree, wrapped));
+                return Some((tree, wrapped, prefix.len()));
             }
 
             match &best {
-                Some((_, _, fewest)) if *fewest <= errors => {}
-                _ => best = Some((tree, wrapped, errors)),
+                Some((_, _, _, fewest)) if *fewest <= errors => {}
+                _ => best = Some((tree, wrapped, prefix.len(), errors)),
             }
         }
 
-        best.map(|(tree, wrapped, _)| (tree, wrapped))
+        best.map(|(tree, wrapped, prefix_len, _)| (tree, wrapped, prefix_len))
     }
 
     fn count_parse_errors(node: tree_sitter::Node) -> usize {
@@ -3363,6 +3406,45 @@ mod tests {
             .calls
             .clone()
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_macro_body_that_dispatches_records_a_site() {
+        // Whole subsystems put their indirection in a macro:
+        // include/linux/efi.h writes `((p)->f(args))`.
+        let (_functions, sites) = analyze(
+            "struct ops { int (*run)(void); };\n\
+             #define CALL_RUN(o) ((o)->run())\n",
+            "test.c",
+        );
+
+        assert_eq!(sites.len(), 1, "expected the site in the body: {sites:?}");
+        assert_eq!(sites[0].member, "run");
+        assert_eq!(sites[0].kind, DispatchKind::MemberArrow);
+        // The site belongs to the macro, since that is where it is written.
+        assert_eq!(sites[0].caller_name, "CALL_RUN");
+        assert_eq!(sites[0].line, 2);
+    }
+
+    #[test]
+    fn a_dispatching_macro_and_its_user_are_separate_sites() {
+        let (_functions, sites) = analyze(
+            "struct ops { int (*run)(void); };\n\
+             #define CALL_RUN(o) ((o)->run())\n\
+             int user(struct ops *o) { return CALL_RUN(o); }\n\
+             int direct(struct ops *o) { return o->run(); }\n",
+            "test.c",
+        );
+
+        let callers: Vec<&str> = sites.iter().map(|s| s.caller_name.as_str()).collect();
+        assert!(
+            callers.contains(&"CALL_RUN"),
+            "macro site missing: {sites:?}"
+        );
+        assert!(callers.contains(&"direct"), "plain site missing: {sites:?}");
+        // The expansion is not visible here, so the user of the macro has no
+        // site of its own; it reaches the dispatch through the macro.
+        assert!(!callers.contains(&"user"), "invented a site: {sites:?}");
     }
 
     #[test]
