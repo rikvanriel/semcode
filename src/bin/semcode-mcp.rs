@@ -346,7 +346,84 @@ async fn mcp_show_callers(
         }
     }
 
+    write_indirect_callers(db, function_name, git_sha, &mut buffer).await?;
+
     Ok(String::from_utf8_lossy(&buffer).to_string())
+}
+
+/// Callers that reach the function through a function pointer, with the
+/// evidence for each. A consumer that only reads the text still sees them;
+/// one that parses it can tell them from direct callers by the section.
+async fn write_indirect_callers(
+    db: &DatabaseManager,
+    function_name: &str,
+    git_sha: &str,
+    buffer: &mut Vec<u8>,
+) -> Result<()> {
+    use semcode::Evidence;
+
+    let indirect = db.find_indirect_callers(function_name, git_sha).await?;
+    if indirect.is_empty() {
+        return Ok(());
+    }
+
+    let (confident, by_name_only): (Vec<_>, Vec<_>) = indirect
+        .iter()
+        .partition(|caller| caller.evidence.is_type_matched());
+
+    if !confident.is_empty() {
+        writeln!(buffer, "\n=== Indirect Callers ===")?;
+        writeln!(
+            buffer,
+            "{} call sites can reach it through a function pointer:",
+            confident.len()
+        )?;
+
+        for (i, caller) in confident.iter().enumerate() {
+            let where_from = if caller.caller_name.is_empty() {
+                "(file scope)"
+            } else {
+                caller.caller_name.as_str()
+            };
+            writeln!(
+                buffer,
+                "  {}. {} at {}:{} [{}]",
+                i + 1,
+                where_from,
+                caller.site_file,
+                caller.site_line,
+                caller.site_kind
+            )?;
+
+            match &caller.evidence {
+                Evidence::StatedAtSite => {
+                    writeln!(buffer, "     names it at the call site")?;
+                }
+                Evidence::Registered {
+                    container_type,
+                    registration_file,
+                    registration_line,
+                    ..
+                } => {
+                    writeln!(
+                        buffer,
+                        "     installed in {}::{} at {}:{}",
+                        container_type, caller.member, registration_file, registration_line
+                    )?;
+                }
+            }
+        }
+    }
+
+    if !by_name_only.is_empty() {
+        writeln!(
+            buffer,
+            "\nNote: {} further call sites go through a member of the same name, but nothing says their receiver has the type the function was installed in.",
+            by_name_only.len()
+        )?;
+    }
+
+    Ok(())
 }
 
 async fn mcp_show_calls(
@@ -1953,6 +2030,8 @@ const TOOL_CATEGORIES: &[ToolCategory] = &[
             "find_callers",
             "find_calls",
             "find_callchain",
+            "find_implementors",
+            "find_registrations",
         ],
     },
     ToolCategory {
@@ -2066,6 +2145,54 @@ fn get_tool_schema(name: &str) -> Option<Value> {
                     "branch": {
                         "type": "string",
                         "description": "Optional branch name to search at (e.g., 'main', 'develop'). Takes precedence over git_sha if both are provided."
+                    }
+                },
+                "required": ["name"]
+            }
+        })),
+        "find_implementors" => Some(json!({
+            "name": "find_implementors",
+            "description": "Find the functions installed in a struct member, which is what a call through that member can reach",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "container_type": {
+                        "type": "string",
+                        "description": "The struct or typedef name, for example 'file_operations'"
+                    },
+                    "member": {
+                        "type": "string",
+                        "description": "The member name, for example 'read'"
+                    },
+                    "git_sha": {
+                        "type": "string",
+                        "description": "Optional git commit SHA to search at (defaults to current HEAD)"
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Optional branch name to search at. Takes precedence over git_sha if both are provided."
+                    }
+                },
+                "required": ["container_type", "member"]
+            }
+        })),
+        "find_registrations" => Some(json!({
+            "name": "find_registrations",
+            "description": "Find where a function is installed in a struct member, which is how it can be called without being named",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The name of the function to look for"
+                    },
+                    "git_sha": {
+                        "type": "string",
+                        "description": "Optional git commit SHA to search at (defaults to current HEAD)"
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Optional branch name to search at. Takes precedence over git_sha if both are provided."
                     }
                 },
                 "required": ["name"]
@@ -2562,6 +2689,8 @@ fn get_all_tool_schemas() -> Vec<Value> {
         "find_callers",
         "find_calls",
         "find_callchain",
+        "find_implementors",
+        "find_registrations",
         "diff_functions",
         "grep_functions",
         "vgrep_functions",
@@ -2843,6 +2972,8 @@ impl McpServer {
             "find_type" => self.handle_find_type(arguments).await,
             "find_callers" => self.handle_find_callers(arguments).await,
             "find_calls" => self.handle_find_calls(arguments).await,
+            "find_implementors" => self.handle_find_implementors(arguments).await,
+            "find_registrations" => self.handle_find_registrations(arguments).await,
             "find_callchain" => self.handle_find_callchain(arguments).await,
             "diff_functions" => self.handle_diff_functions(arguments).await,
             "grep_functions" => self.handle_grep_functions(arguments).await,
@@ -2939,6 +3070,8 @@ impl McpServer {
             "find_type" => self.handle_find_type(tool_args).await,
             "find_callers" => self.handle_find_callers(tool_args).await,
             "find_calls" => self.handle_find_calls(tool_args).await,
+            "find_implementors" => self.handle_find_implementors(tool_args).await,
+            "find_registrations" => self.handle_find_registrations(tool_args).await,
             "find_callchain" => self.handle_find_callchain(tool_args).await,
             "diff_functions" => self.handle_diff_functions(tool_args).await,
             "grep_functions" => self.handle_grep_functions(tool_args).await,
@@ -3079,6 +3212,91 @@ impl McpServer {
             }),
             Err(e) => json!({
                 "error": format!("Failed to find callers: {}", e),
+                "isError": true
+            }),
+        }
+    }
+
+    async fn handle_find_implementors(&self, args: &Value) -> Value {
+        if let Some(status_msg) = self.check_database_status().await {
+            return json!({
+                "content": [{"type": "text", "text": status_msg}]
+            });
+        }
+
+        let container_type = args["container_type"].as_str().unwrap_or("");
+        let container_type = container_type
+            .strip_prefix("struct ")
+            .unwrap_or(container_type);
+        let member = args["member"].as_str().unwrap_or("");
+        let git_sha =
+            self.resolve_git_sha_or_branch(args["git_sha"].as_str(), args["branch"].as_str());
+
+        match self
+            .db
+            .find_registrations_for_slot_git_aware(container_type, member, &git_sha)
+            .await
+        {
+            Ok(found) => {
+                let mut text = format!("Functions installed in {container_type}::{member}\n");
+                if found.is_empty() {
+                    text.push_str("Info: nothing is installed in that member\n");
+                }
+                for (i, registration) in found.iter().enumerate() {
+                    text.push_str(&format!(
+                        "  {}. {} at {}:{} [{}]\n",
+                        i + 1,
+                        registration.target,
+                        registration.file_path,
+                        registration.line,
+                        registration.kind.as_str()
+                    ));
+                }
+                json!({"content": [{"type": "text", "text": truncate_output(text)}]})
+            }
+            Err(e) => json!({
+                "error": format!("Failed to find implementors: {}", e),
+                "isError": true
+            }),
+        }
+    }
+
+    async fn handle_find_registrations(&self, args: &Value) -> Value {
+        if let Some(status_msg) = self.check_database_status().await {
+            return json!({
+                "content": [{"type": "text", "text": status_msg}]
+            });
+        }
+
+        let name = args["name"].as_str().unwrap_or("");
+        let git_sha =
+            self.resolve_git_sha_or_branch(args["git_sha"].as_str(), args["branch"].as_str());
+
+        match self
+            .db
+            .find_registrations_of_git_aware(name, &git_sha)
+            .await
+        {
+            Ok(found) => {
+                let mut text = format!("Where {name} is installed\n");
+                if found.is_empty() {
+                    text.push_str("Info: it is not installed in any struct member\n");
+                }
+                for (i, registration) in found.iter().enumerate() {
+                    text.push_str(&format!(
+                        "  {}. {}::{} at {}:{} [{}]\n",
+                        i + 1,
+                        registration.container_type,
+                        registration.member,
+                        registration.file_path,
+                        registration.line,
+                        registration.kind.as_str()
+                    ));
+                }
+                json!({"content": [{"type": "text", "text": truncate_output(text)}]})
+            }
+            Err(e) => json!({
+                "error": format!("Failed to find registrations: {}", e),
                 "isError": true
             }),
         }
@@ -5978,6 +6196,8 @@ mod tests {
             "find_callers",
             "find_calls",
             "find_callchain",
+            "find_implementors",
+            "find_registrations",
             "diff_functions",
             "grep_functions",
             "vgrep_functions",
@@ -6024,9 +6244,9 @@ mod tests {
     }
 
     #[test]
-    fn test_get_all_tool_schemas_returns_17_tools() {
+    fn test_get_all_tool_schemas_returns_19_tools() {
         let schemas = get_all_tool_schemas();
-        assert_eq!(schemas.len(), 17, "Should return all 17 tool schemas");
+        assert_eq!(schemas.len(), 19, "Should return all 19 tool schemas");
     }
 
     #[test]
@@ -6294,7 +6514,7 @@ mod tests {
         let result = server.handle_list_tools().await;
         let tools = result["tools"].as_array().unwrap();
 
-        // Should return all 17 tools
-        assert_eq!(tools.len(), 17, "Non-lazy mode should return all 17 tools");
+        // Should return all 19 tools
+        assert_eq!(tools.len(), 19, "Non-lazy mode should return all 19 tools");
     }
 }
