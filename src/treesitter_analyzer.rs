@@ -2997,16 +2997,23 @@ impl TreeSitterAnalyzer {
         };
 
         let mut calls = Vec::new();
+        let mut any_call = false;
         let mut cursor = QueryCursor::new();
         let mut captures =
             cursor.captures(&queries.call_query, tree.root_node(), wrapped.as_bytes());
         while let Some((call_match, _)) = captures.next() {
             for capture in call_match.captures {
-                if queries.call_query.capture_names()[capture.index as usize] == "function_name" {
-                    let name = &wrapped[capture.node.byte_range()];
-                    if !name.is_empty() {
-                        calls.push(name.to_string());
+                match queries.call_query.capture_names()[capture.index as usize] {
+                    "function_name" => {
+                        let name = &wrapped[capture.node.byte_range()];
+                        if !name.is_empty() {
+                            calls.push(name.to_string());
+                        }
                     }
+                    // A call that names no function is still a call, and
+                    // knowing one is there is what keeps the scan below off.
+                    "call" | "method_call" | "deref_call" | "macro_call" => any_call = true,
+                    _ => {}
                 }
             }
         }
@@ -3034,7 +3041,11 @@ impl TreeSitterAnalyzer {
         // `"prefix: " fmt` and friends — and parse into something with no call
         // in it. Scanning finds the call there; the parse is what keeps the
         // scan from reading grouping parens as calls in the ordinary case.
-        if calls.is_empty() {
+        //
+        // A body whose only call goes through a member has no function to
+        // name, and scanning it reads the member as one: `(p)->func->target(p)`
+        // is not a call to `target`. The dispatch is recorded as a site.
+        if calls.is_empty() && !any_call {
             calls = Self::scan_macro_body_calls(body);
         }
 
@@ -3545,6 +3556,24 @@ mod tests {
             found.is_empty(),
             "registered against the wrapper: {found:?}"
         );
+    }
+
+    #[test]
+    fn a_macro_that_only_dispatches_calls_no_function() {
+        // drivers/gpu/drm/nouveau writes its accessors this way. The member
+        // is not a function, and recording it as one is the defect the
+        // dispatch sites exist to avoid.
+        let source = "struct ops { int (*target)(void); };\n\
+                      #define nvkm_memory_target(p) (p)->func->target(p)\n";
+        let (_functions, sites) = analyze(source, "test.c");
+
+        assert_eq!(
+            macro_calls(source, "nvkm_memory_target"),
+            Vec::<String>::new(),
+            "member read as a call"
+        );
+        assert_eq!(sites.len(), 1, "dispatch not recorded: {sites:?}");
+        assert_eq!(sites[0].member, "target");
     }
 
     #[test]
