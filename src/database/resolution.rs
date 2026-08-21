@@ -163,6 +163,39 @@ pub fn indirect_callers(
     found
 }
 
+/// The struct or union a field is declared as, with the noise a declaration
+/// carries stripped: `struct file_operations *` is `file_operations`.
+///
+/// A field declared as a plain type, a function pointer, or an array of
+/// something yields nothing: only an aggregate can hold the members a
+/// dispatch goes through.
+pub fn aggregate_of(declared: &str) -> Option<String> {
+    let declared = declared
+        .split('(')
+        .next()
+        .unwrap_or(declared)
+        .replace(['*', '['], " ");
+
+    let mut words = declared.split_whitespace().peekable();
+    let mut kind = None;
+    while let Some(word) = words.next() {
+        match word {
+            "struct" | "union" => {
+                kind = words.peek().copied();
+                break;
+            }
+            "const" | "volatile" | "restrict" | "_Atomic" => continue,
+            // A bare name can be a typedef of a struct; the types table is
+            // keyed by the struct's own name, so a typedef does not resolve
+            // here and says so by returning nothing.
+            _ => break,
+        }
+    }
+
+    kind.filter(|name| !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_'))
+        .map(|name| name.to_string())
+}
+
 /// Sites are grouped by the member they dispatch through, which is the key a
 /// registration joins on.
 pub fn group_by_member(sites: Vec<DispatchSite>) -> HashMap<String, Vec<DispatchSite>> {
@@ -275,6 +308,30 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].evidence, Evidence::StatedAtSite);
         assert!(found[0].evidence.is_type_matched());
+    }
+
+    #[test]
+    fn a_field_declaration_yields_the_struct_it_names() {
+        assert_eq!(
+            aggregate_of("struct file_operations *"),
+            Some("file_operations".to_string())
+        );
+        assert_eq!(
+            aggregate_of("const struct proto_ops *"),
+            Some("proto_ops".to_string())
+        );
+        assert_eq!(aggregate_of("union u *"), Some("u".to_string()));
+    }
+
+    #[test]
+    fn a_field_that_is_not_an_aggregate_yields_nothing() {
+        // Nothing dispatches through these, and a typedef is keyed by a name
+        // the types table does not hold as a struct.
+        assert_eq!(aggregate_of("int"), None);
+        assert_eq!(aggregate_of("unsigned long"), None);
+        assert_eq!(aggregate_of("void *"), None);
+        assert_eq!(aggregate_of("atomic_t"), None);
+        assert_eq!(aggregate_of("int (*)(void)"), None);
     }
 
     #[test]

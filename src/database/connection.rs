@@ -798,11 +798,73 @@ impl DatabaseManager {
             ));
         }
 
+        self.type_chained_receivers(&mut sites).await?;
+
         Ok(indirect_callers(
             &registrations,
             &group_by_member(sites),
             &stated,
         ))
+    }
+
+    /// Finish typing the receivers the analyzer could only half-type.
+    ///
+    /// A site written `file->f_op->read()` stored the type of `file` and the
+    /// field `f_op`. What `f_op` is declared as lives with struct file, in a
+    /// header the analyzer was not looking at, so the last hop happens here,
+    /// where the whole tree's types are available.
+    async fn type_chained_receivers(&self, sites: &mut [crate::types::DispatchSite]) -> Result<()> {
+        use crate::database::resolution::aggregate_of;
+
+        let mut resolved: std::collections::HashMap<(String, String), Option<String>> =
+            std::collections::HashMap::new();
+
+        for site in sites.iter_mut() {
+            if site.receiver_type.is_some() {
+                continue;
+            }
+            let (Some(base), Some(field)) = (
+                site.receiver_base_type.as_deref(),
+                site.receiver_field.as_deref(),
+            ) else {
+                continue;
+            };
+
+            let key = (base.to_string(), field.to_string());
+            let field_type = match resolved.get(&key) {
+                Some(known) => known.clone(),
+                None => {
+                    // A tree holds more than one `struct file`. Every
+                    // definition of the name has to agree on what the field
+                    // is, or the answer is a guess between them.
+                    let mut agreed: Option<String> = None;
+                    let mut conflicting = false;
+                    for container in self.type_store.find_all_by_name(base).await? {
+                        let Some(field_type) = container
+                            .members
+                            .iter()
+                            .find(|member| member.name == field)
+                            .and_then(|member| aggregate_of(&member.type_name))
+                        else {
+                            continue;
+                        };
+
+                        match &agreed {
+                            Some(known) if *known != field_type => conflicting = true,
+                            _ => agreed = Some(field_type),
+                        }
+                    }
+
+                    let looked_up = if conflicting { None } else { agreed };
+                    resolved.insert(key, looked_up.clone());
+                    looked_up
+                }
+            };
+
+            site.receiver_type = field_type;
+        }
+
+        Ok(())
     }
 
     /// Dispatch sites that go through the named member.

@@ -35,7 +35,8 @@ fn write_fixture(repo: &Path) {
          \tint (*handler)(struct sk_buff *skb);\n\
          \tint no_policy;\n\
          };\n\
-         struct hotdata { struct net_protocol tcp_protocol; };\n",
+         struct hotdata { struct net_protocol tcp_protocol; };\n\
+         struct inet_stack { struct net_protocol *proto; };\n",
     )
     .unwrap();
 
@@ -83,6 +84,10 @@ fn write_fixture(repo: &Path) {
          int deliver_untyped(struct sk_buff *skb)\n\
          {\n\
          \treturn proto_table->handler(skb);\n\
+         }\n\
+         int deliver_chained(struct inet_stack *stack, struct sk_buff *skb)\n\
+         {\n\
+         \treturn stack->proto->handler(skb);\n\
          }\n",
     )
     .unwrap();
@@ -153,12 +158,23 @@ async fn a_handler_reached_only_through_a_pointer_has_callers() {
         .collect();
     assert_eq!(
         named,
-        vec!["deliver_plain", "ip_protocol_deliver_rcu"],
-        "expected both typed candidates, got {indirect:?}"
+        vec![
+            "deliver_chained",
+            "deliver_plain",
+            "ip_protocol_deliver_rcu"
+        ],
+        "expected every typed candidate, got {indirect:?}"
     );
     assert!(named_at_site
         .iter()
         .all(|caller| caller.site_file == "ip_input.c" && caller.member == "handler"));
+
+    // The chained receiver `stack->proto` is typed by what the field is
+    // declared as, which is in the header rather than in the calling file.
+    assert!(
+        named.contains(&"deliver_chained"),
+        "field chain not resolved through the types table: {indirect:?}"
+    );
 
     // The call on a receiver the file never declares matches by member name
     // alone; it stays weaker evidence, and says so rather than being dropped.
