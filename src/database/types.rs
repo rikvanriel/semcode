@@ -294,6 +294,37 @@ impl TypeStore {
         self.extract_type_from_batch(batch, 0).await
     }
 
+    /// Every definition of a type name, not just the first one stored.
+    ///
+    /// A tree holds several `struct file`: the kernel's, one in a tool, one
+    /// in a test. `find_by_name` answers with whichever row comes back first,
+    /// which is fine for showing a definition and wrong for deciding what a
+    /// field is declared as. A caller that needs the answer to be true has to
+    /// see all of them.
+    pub async fn find_all_by_name(&self, name: &str) -> Result<Vec<TypeInfo>> {
+        let table = self.connection.open_table("types").execute().await?;
+        let escaped_name = name.replace("'", "''");
+
+        let results = table
+            .query()
+            .only_if(format!("name = '{escaped_name}'"))
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut found = Vec::new();
+        for batch in &results {
+            for row in 0..batch.num_rows() {
+                if let Some(type_info) = self.extract_type_from_batch(batch, row).await? {
+                    found.push(type_info);
+                }
+            }
+        }
+
+        Ok(found)
+    }
+
     pub async fn exists(&self, name: &str, kind: &str, file_path: &str) -> Result<bool> {
         let table = self.connection.open_table("types").execute().await?;
         let escaped_name = name.replace("'", "''");
