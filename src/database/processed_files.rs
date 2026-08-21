@@ -82,7 +82,20 @@ impl ProcessedFileStore {
             ("git_file_sha", Arc::new(git_file_sha_array) as ArrayRef),
         ])?;
 
-        table.add(vec![batch]).execute().await?;
+        // Replace any earlier row for the same file content rather than
+        // adding a second one: re-indexing a tree otherwise grows this table
+        // by a row per file per run.
+        let mut merge = table.merge_insert(&["file", "git_file_sha"]);
+        merge
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        let schema = batch.schema();
+        merge
+            .execute(Box::new(arrow::record_batch::RecordBatchIterator::new(
+                vec![Ok(batch)],
+                schema,
+            )))
+            .await?;
 
         Ok(())
     }
