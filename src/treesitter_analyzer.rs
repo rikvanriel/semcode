@@ -80,6 +80,15 @@ struct CallExtraction {
     registrations: Vec<RawRegistration>,
 }
 
+/// What a macro body yields once parsed.
+#[derive(Debug, Default)]
+struct MacroBodyFacts {
+    calls: Vec<String>,
+    types: Vec<String>,
+    sites: Vec<RawDispatchSite>,
+    registrations: Vec<RawRegistration>,
+}
+
 /// A designated initializer before it is attributed to a function.
 #[derive(Debug, Clone)]
 struct RawRegistration {
@@ -583,7 +592,7 @@ impl TreeSitterAnalyzer {
 
         // Extract macros; the sites in their bodies are dropped on this
         // path, which serves callers that want definitions only.
-        let (extracted_macros, _macro_sites) = self.extract_macros(
+        let (extracted_macros, _macro_sites, _macro_registrations) = self.extract_macros(
             &tree,
             &source_code,
             file_path,
@@ -706,7 +715,7 @@ impl TreeSitterAnalyzer {
         };
 
         // Extract functions with embedded call data
-        let (functions, mut dispatch_sites, registrations) =
+        let (functions, mut dispatch_sites, mut registrations) =
             self.extract_functions_with_calls(&ctx, &extraction)?;
 
         // Extract types (single traversal as before)
@@ -720,7 +729,7 @@ impl TreeSitterAnalyzer {
         )?;
 
         // Extract macros with embedded data (single traversal)
-        let (macros, macro_sites) = self.extract_macros_with_embedded_data(
+        let (macros, macro_sites, macro_registrations) = self.extract_macros_with_embedded_data(
             tree,
             source_code,
             file_path,
@@ -729,6 +738,7 @@ impl TreeSitterAnalyzer {
             language,
         )?;
         dispatch_sites.extend(macro_sites);
+        registrations.extend(macro_registrations);
 
         Ok(FileAnalysis {
             functions,
@@ -1553,7 +1563,7 @@ impl TreeSitterAnalyzer {
         git_hash: &str,
         source_root: Option<&Path>,
         language: Language,
-    ) -> Result<(Vec<FunctionInfo>, Vec<DispatchSite>)> {
+    ) -> Result<(Vec<FunctionInfo>, Vec<DispatchSite>, Vec<Registration>)> {
         // This is the same as extract_macros but named differently for clarity
         // Macros are not as performance-critical as functions since they're fewer in number
         self.extract_macros(tree, source, file_path, git_hash, source_root, language)
@@ -1959,11 +1969,12 @@ impl TreeSitterAnalyzer {
         git_hash: &str,
         source_root: Option<&Path>,
         language: Language,
-    ) -> Result<(Vec<FunctionInfo>, Vec<DispatchSite>)> {
+    ) -> Result<(Vec<FunctionInfo>, Vec<DispatchSite>, Vec<Registration>)> {
         // Macro bodies are re-parsed as C; one parser serves the whole file.
         let mut body_parser = tree_sitter::Parser::new();
         body_parser.set_language(&tree_sitter_c::LANGUAGE.into())?;
         let mut dispatch_sites: Vec<DispatchSite> = Vec::new();
+        let mut registrations: Vec<Registration> = Vec::new();
         let queries = self.get_queries(language);
         let mut cursor = QueryCursor::new();
         // matches(), not captures(): a match arrives once with every capture
@@ -2007,35 +2018,46 @@ impl TreeSitterAnalyzer {
 
             if let Some(name) = macro_name {
                 // Extract calls and types from macro definition
-                let (macro_calls, macro_types, body_sites) = match body {
+                let facts = match body {
                     Some(body) => {
-                        let (calls, types, mut sites) = Self::macro_body_calls_and_types(
+                        let mut facts = Self::macro_body_calls_and_types(
                             &mut body_parser,
                             queries,
                             &source[body.byte_range()],
                         );
 
                         // Positions come back relative to the body; place them
-                        // in the file so the site is where the macro is.
+                        // in the file so a fact is where the macro is.
                         let body_start = body.start_byte();
                         let body_line = body.start_position().row as u32 + 1;
-                        for site in &mut sites {
+                        for site in &mut facts.sites {
                             site.byte_start += body_start;
                             site.line = body_line + site.line.saturating_sub(1);
                         }
+                        for registration in &mut facts.registrations {
+                            registration.byte_start += body_start;
+                            registration.line = body_line + registration.line.saturating_sub(1);
+                        }
 
-                        (calls, types, sites)
+                        facts
                     }
-                    None => (Vec::new(), Vec::new(), Vec::new()),
+                    None => MacroBodyFacts::default(),
                 };
+                let (macro_calls, macro_types) = (facts.calls, facts.types);
 
-                dispatch_sites.extend(body_sites.iter().map(|raw| {
-                    raw.attribute(
-                        &name,
-                        &self.make_relative_path(file_path, source_root),
-                        git_hash,
-                    )
-                }));
+                let relative_path = self.make_relative_path(file_path, source_root);
+                dispatch_sites.extend(
+                    facts
+                        .sites
+                        .iter()
+                        .map(|raw| raw.attribute(&name, &relative_path, git_hash)),
+                );
+                registrations.extend(
+                    facts
+                        .registrations
+                        .iter()
+                        .map(|raw| raw.attribute(&name, &relative_path, git_hash)),
+                );
 
                 let macro_info = FunctionInfo::from_macro(MacroParams {
                     name,
@@ -2065,7 +2087,7 @@ impl TreeSitterAnalyzer {
             }
         }
 
-        Ok((macros, dispatch_sites))
+        Ok((macros, dispatch_sites, registrations))
     }
 
     fn parse_parameters_from_node(
@@ -2928,14 +2950,17 @@ impl TreeSitterAnalyzer {
         parser: &mut tree_sitter::Parser,
         queries: &LanguageQueries,
         body: &str,
-    ) -> (Vec<String>, Vec<String>, Vec<RawDispatchSite>) {
+    ) -> MacroBodyFacts {
         let body = body.trim();
         if body.is_empty() {
-            return (Vec::new(), Vec::new(), Vec::new());
+            return MacroBodyFacts::default();
         }
 
         let Some((tree, wrapped, prefix_len)) = Self::parse_macro_body(parser, body) else {
-            return (Self::scan_macro_body_calls(body), Vec::new(), Vec::new());
+            return MacroBodyFacts {
+                calls: Self::scan_macro_body_calls(body),
+                ..Default::default()
+            };
         };
 
         let mut calls = Vec::new();
@@ -2996,6 +3021,18 @@ impl TreeSitterAnalyzer {
             Ok(extraction) => extraction.member_sites,
             Err(_) => Vec::new(),
         };
+
+        // A macro body can install a function as well as call one, when it
+        // declares the thing it initialises:
+        //
+        //     #define DEFINE_OPS(name, fn) struct ops name = { .run = fn }
+        //
+        // A bare `{ .run = fn }` states no type — the wrapper's type is the
+        // wrapper's, not the macro's — so it registers nothing, as elsewhere.
+        let mut registrations = Self::collect_registrations(tree.root_node(), &wrapped);
+        registrations.extend(Self::collect_assignments(tree.root_node(), &wrapped));
+        registrations.retain(|r| !r.container_type.starts_with("__semcode_"));
+
         // The wrapper sits on one line before the body, so a position maps
         // back by subtracting its length; a body spanning several lines keeps
         // its own line offsets.
@@ -3003,8 +3040,17 @@ impl TreeSitterAnalyzer {
         for site in &mut sites {
             site.byte_start -= prefix_len;
         }
+        registrations.retain(|r| r.byte_start >= prefix_len);
+        for registration in &mut registrations {
+            registration.byte_start -= prefix_len;
+        }
 
-        (calls, types, sites)
+        MacroBodyFacts {
+            calls,
+            types,
+            sites,
+            registrations,
+        }
     }
 
     /// Parse a macro body in whichever context it fits, returning the tree and
@@ -3406,6 +3452,45 @@ mod tests {
             .calls
             .clone()
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_macro_that_declares_an_ops_table_registers_it() {
+        // ACPI and the error-injection macros build tables this way: the
+        // macro declares the thing it initialises, so its type is stated.
+        let found = registrations_of(
+            "struct ops { int (*run)(void); };\n\
+             #define DEFINE_OPS(name, fn) struct ops name = { .run = fn }\n",
+            "test.c",
+        );
+
+        assert_eq!(
+            found,
+            vec![(
+                "ops".to_string(),
+                "run".to_string(),
+                "fn".to_string(),
+                "DEFINE_OPS".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_bare_initializer_macro_registers_nothing() {
+        // `{ .run = impl }` states no type. Reading one off the context the
+        // body was parsed in would file the registration under a type that
+        // exists nowhere in the source.
+        let found = registrations_of(
+            "int impl(void);\n\
+             #define OPS_BODY { .run = impl }\n\
+             #define OPS_BODY_FN(f) { .run = f }\n",
+            "test.c",
+        );
+
+        assert!(
+            found.is_empty(),
+            "registered against the wrapper: {found:?}"
+        );
     }
 
     #[test]
