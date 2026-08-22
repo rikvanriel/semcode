@@ -886,10 +886,19 @@ impl TreeSitterAnalyzer {
         Self::type_receivers(tree.root_node(), source_code, &mut extraction.member_sites);
 
         // A keyword is not a member, so anything named after one came from a
-        // misread, not from the code.
-        extraction
-            .member_sites
-            .retain(|site| !Self::is_c_keyword(&site.member));
+        // misread, not from the code. Neither is a member reached from
+        // nothing: every dispatch has a receiver, and a site without one came
+        // from the same kind of misread — assembly in a macro body, read as C.
+        extraction.member_sites.retain(|site| {
+            !Self::is_c_keyword(&site.member)
+                && !matches!(
+                    site.kind,
+                    DispatchKind::MemberArrow | DispatchKind::MemberDot
+                ) | site
+                    .receiver_expr
+                    .as_deref()
+                    .is_some_and(|receiver| !receiver.trim().is_empty())
+        });
         extraction
             .registrations
             .retain(|registration| !Self::is_c_keyword(&registration.member));
@@ -1061,11 +1070,66 @@ impl TreeSitterAnalyzer {
     /// keyword drops those without needing to know which bodies are assembly
     /// — the same reading is wrong wherever it happens.
     fn is_c_keyword(name: &str) -> bool {
-        const KEYWORDS: [&str; 34] = [
-            "auto", "break", "case", "char", "const", "continue", "default", "do", "double",
-            "else", "enum", "extern", "float", "for", "goto", "if", "inline", "int", "long",
-            "register", "restrict", "return", "short", "signed", "sizeof", "static", "struct",
-            "switch", "typedef", "union", "unsigned", "void", "volatile", "while",
+        const KEYWORDS: [&str; 55] = [
+            // C89 and C99
+            "auto",
+            "break",
+            "case",
+            "char",
+            "const",
+            "continue",
+            "default",
+            "do",
+            "double",
+            "else",
+            "enum",
+            "extern",
+            "float",
+            "for",
+            "goto",
+            "if",
+            "inline",
+            "int",
+            "long",
+            "register",
+            "restrict",
+            "return",
+            "short",
+            "signed",
+            "sizeof",
+            "static",
+            "struct",
+            "switch",
+            "typedef",
+            "union",
+            "unsigned",
+            "void",
+            "volatile",
+            "while",
+            // C11
+            "_Alignas",
+            "_Alignof",
+            "_Atomic",
+            "_Bool",
+            "_Complex",
+            "_Generic",
+            "_Imaginary",
+            "_Noreturn",
+            "_Static_assert",
+            "_Thread_local",
+            // C23, and the spellings the older headers get from <stdbool.h>
+            // and friends, which a member cannot use either
+            "alignas",
+            "alignof",
+            "bool",
+            "constexpr",
+            "false",
+            "nullptr",
+            "static_assert",
+            "thread_local",
+            "true",
+            "typeof",
+            "typeof_unqual",
         ];
 
         KEYWORDS.contains(&name)
