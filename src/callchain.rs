@@ -363,9 +363,13 @@ fn show_indirect_callers(
         return Ok(());
     }
 
+    // The header goes up whenever anything indirect was found, including the
+    // case where all of it is member-name evidence: a bare `Note:` hanging
+    // off the direct callers reads as a footnote to them, and "further" says
+    // there was a list above when there was not.
+    let header = format!("\n{}", "=== Indirect Callers ===".bold().green());
+    writeln!(writer, "{header}")?;
     if !confident.is_empty() {
-        let header = format!("\n{}", "=== Indirect Callers ===".bold().green());
-        writeln!(writer, "{header}")?;
         writeln!(
             writer,
             "{} call sites can reach it through a function pointer:",
@@ -425,12 +429,14 @@ fn show_indirect_callers(
     }
 
     if !by_name_only.is_empty() {
+        let further = if confident.is_empty() { "" } else { "further " };
         let note = format!(
-            "\n{} {} further call sites go through a member of the same name, \
+            "\n{} {} {}call sites go through a member of the same name, \
              but nothing says their receiver has the type the function was \
              installed in.",
             "Note:".yellow(),
-            by_name_only.len()
+            by_name_only.len(),
+            further
         );
         writeln!(writer, "{note}")?;
     }
@@ -887,4 +893,56 @@ pub async fn show_callees(
     git_sha: &str,
 ) -> Result<()> {
     show_callees_to_writer(db, name, &mut stdout(), verbose, git_sha).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::show_indirect_callers;
+    use crate::database::resolution::{Evidence, IndirectCaller};
+
+    fn caller(name: &str, type_matched: bool) -> IndirectCaller {
+        IndirectCaller {
+            caller_name: name.to_string(),
+            site_file: "fs/read_write.c".to_string(),
+            site_line: 572,
+            site_byte_start: 100,
+            member: "read".to_string(),
+            site_kind: "member_arrow".to_string(),
+            evidence: Evidence::Registered {
+                container_type: "file_operations".to_string(),
+                registration_file: "fs/proc/inode.c".to_string(),
+                registration_line: 556,
+                registration_count: 1,
+                type_matched,
+            },
+        }
+    }
+
+    fn rendered(callers: &[IndirectCaller]) -> String {
+        let mut out = Vec::new();
+        show_indirect_callers(callers, &mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn the_count_alone_still_gets_a_heading() {
+        // Without one the note hangs off the direct callers above it and
+        // reads as a footnote to them.
+        let text = rendered(&[caller("vfs_read", false)]);
+
+        assert!(text.contains("Indirect Callers"), "{text}");
+        assert!(text.contains("1 call sites"), "{text}");
+        assert!(
+            !text.contains("further"),
+            "nothing was listed above the note: {text}"
+        );
+    }
+
+    #[test]
+    fn a_note_after_answers_says_further() {
+        let text = rendered(&[caller("vfs_read", true), caller("loop_rw_iter", false)]);
+
+        assert!(text.contains("1 call sites can reach it"), "{text}");
+        assert!(text.contains("1 further call sites"), "{text}");
+    }
 }
