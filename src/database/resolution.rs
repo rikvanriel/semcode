@@ -200,6 +200,8 @@ pub fn indirect_callers(
 /// something yields nothing: only an aggregate can hold the members a
 /// dispatch goes through.
 pub fn aggregate_of(declared: &str) -> Option<String> {
+    // A function-pointer member declares a signature, not an aggregate:
+    // `int (*read)(...)` has nothing to dispatch through.
     let declared = declared
         .split('(')
         .next()
@@ -207,23 +209,64 @@ pub fn aggregate_of(declared: &str) -> Option<String> {
         .replace(['*', '['], " ");
 
     let mut words = declared.split_whitespace().peekable();
-    let mut kind = None;
+    let mut named = None;
     while let Some(word) = words.next() {
         match word {
             "struct" | "union" => {
-                kind = words.peek().copied();
+                named = words.peek().copied();
                 break;
             }
             "const" | "volatile" | "restrict" | "_Atomic" => continue,
-            // A bare name can be a typedef of a struct; the types table is
-            // keyed by the struct's own name, so a typedef does not resolve
-            // here and says so by returning nothing.
-            _ => break,
+            // A bare name is either a typedef or a builtin. A typedef of a
+            // struct is a container something can be registered under —
+            // `aggregate_type_name` files registrations under the typedef
+            // name, so refusing it here leaves the two halves of the join
+            // unable to meet. A builtin names no aggregate and is dropped
+            // below, along with anything else that is not one identifier.
+            other => {
+                named = Some(other);
+                break;
+            }
         }
     }
 
-    kind.filter(|name| !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_'))
+    named
+        .filter(|name| {
+            !name.is_empty()
+                && !name.starts_with(|c: char| c.is_numeric())
+                && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                && !is_builtin_type(name)
+        })
         .map(|name| name.to_string())
+}
+
+/// A type C provides, which no struct is declared as and nothing is
+/// registered under.
+fn is_builtin_type(name: &str) -> bool {
+    matches!(
+        name,
+        "void"
+            | "char"
+            | "short"
+            | "int"
+            | "long"
+            | "float"
+            | "double"
+            | "signed"
+            | "unsigned"
+            | "bool"
+            | "_Bool"
+            | "size_t"
+            | "ssize_t"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "s8"
+            | "s16"
+            | "s32"
+            | "s64"
+    )
 }
 
 /// Sites are grouped by the member they dispatch through, which is the key a
@@ -355,13 +398,24 @@ mod tests {
 
     #[test]
     fn a_field_that_is_not_an_aggregate_yields_nothing() {
-        // Nothing dispatches through these, and a typedef is keyed by a name
-        // the types table does not hold as a struct.
+        // Nothing is registered under a builtin, and a function pointer
+        // declares a signature rather than something to dispatch through.
         assert_eq!(aggregate_of("int"), None);
         assert_eq!(aggregate_of("unsigned long"), None);
         assert_eq!(aggregate_of("void *"), None);
-        assert_eq!(aggregate_of("atomic_t"), None);
         assert_eq!(aggregate_of("int (*)(void)"), None);
+    }
+
+    #[test]
+    fn a_typedef_name_is_a_container_like_any_other() {
+        // `aggregate_type_name` files a registration under the typedef it
+        // sees, so resolution has to arrive at the same key or the two halves
+        // never meet.
+        assert_eq!(aggregate_of("atomic_t"), Some("atomic_t".to_string()));
+        assert_eq!(
+            aggregate_of("const nvkm_ior_func_bl *"),
+            Some("nvkm_ior_func_bl".to_string())
+        );
     }
 
     #[test]
