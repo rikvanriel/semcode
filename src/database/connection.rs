@@ -878,7 +878,7 @@ impl DatabaseManager {
             ));
         }
 
-        self.type_chained_receivers(&mut sites).await?;
+        self.type_chained_receivers(&mut sites, &manifest).await?;
 
         Ok(indirect_callers(
             &registrations,
@@ -893,8 +893,12 @@ impl DatabaseManager {
     /// field `f_op`. What `f_op` is declared as lives with struct file, in a
     /// header the analyzer was not looking at, so the last hop happens here,
     /// where the whole tree's types are available.
-    async fn type_chained_receivers(&self, sites: &mut [crate::types::DispatchSite]) -> Result<()> {
-        use crate::database::resolution::aggregate_of;
+    async fn type_chained_receivers(
+        &self,
+        sites: &mut [crate::types::DispatchSite],
+        manifest: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        use crate::database::resolution::{aggregate_of, at_revision};
 
         let mut resolved: std::collections::HashMap<(String, String), Option<String>> =
             std::collections::HashMap::new();
@@ -917,9 +921,21 @@ impl DatabaseManager {
                     // A tree holds more than one `struct file`. Every
                     // definition of the name has to agree on what the field
                     // is, or the answer is a guess between them.
+                    //
+                    // Only definitions at the revision being queried count.
+                    // The table also holds the same struct as it was at other
+                    // indexed commits, and a field whose type changed between
+                    // them reads as two definitions disagreeing, which turns
+                    // typing off for that field with nothing said about why.
+                    let definitions = at_revision(
+                        self.type_store.find_all_by_name(base).await?,
+                        manifest,
+                        |t| (t.file_path.as_str(), t.git_file_hash.as_str()),
+                    );
+
                     let mut agreed: Option<String> = None;
                     let mut conflicting = false;
-                    for container in self.type_store.find_all_by_name(base).await? {
+                    for container in definitions {
                         let Some(field_type) = container
                             .members
                             .iter()
