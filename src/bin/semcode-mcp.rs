@@ -1880,6 +1880,42 @@ async fn mcp_show_callchain_with_limits(
             }
         }
 
+        // Where the chain leaves by a member rather than by name, the same as
+        // the callchain command prints. A chain that stops at a dispatch and
+        // says nothing reads as a chain that ended.
+        let mut reachable: Vec<String> = vec![function_name.to_string()];
+        reachable.extend(callees.iter().cloned());
+        if let Ok(dispatched) = db.resolve_dispatches_in(&reachable, git_sha).await {
+            if !dispatched.is_empty() {
+                writeln!(buffer, "\n=== Dispatches ===")?;
+                for from in &reachable {
+                    let Some(sites) = dispatched.get(from) else {
+                        continue;
+                    };
+                    for site in sites {
+                        writeln!(
+                            buffer,
+                            "{} {}->{} ({}:{})",
+                            from, site.receiver_expr, site.member, site.file_path, site.line
+                        )?;
+                        for target in site.targets.iter().take(3) {
+                            writeln!(buffer, "   └─ {target}")?;
+                        }
+                        if site.targets.len() > 3 {
+                            writeln!(
+                                buffer,
+                                "   └─ {} more of {} installed in {}::{}, see find_implementors",
+                                site.targets.len() - 3,
+                                site.targets.len(),
+                                site.container_type,
+                                site.member
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+
         // Summary
         writeln!(buffer, "\n=== Summary ===")?;
         writeln!(buffer, "Total direct callers: {}", callers.len())?;

@@ -42,7 +42,8 @@ function-like macros.
     installed in whose receiver has the matching type. Sites that match on
     member name alone are reported as a count, not as answers
 **find_implementors**: functions installed in a struct member
-  - name: `type.member`, e.g. `file_operations.read`
+  - container_type: struct or typedef name, e.g. `file_operations`
+  - member: member name, e.g. `read`
   - answers "what can be called here?" for a dispatch through that member
 **find_registrations**: where a function is installed as a callback
   - name: function to search
