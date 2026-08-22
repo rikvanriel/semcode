@@ -1213,13 +1213,11 @@ pub async fn process_git_range(
 
     let start_time = std::time::Instant::now();
 
-    // Step 1: Get already processed files from database for deduplication
+    // Step 1: Get already processed files from database for deduplication. As
+    // in the tree path, a row written by an older extractor does not count as
+    // processed: the file has not changed, the reading of it has.
     info!("Loading processed files from database for deduplication");
-    let processed_files_records = db_manager.get_all_processed_files().await?;
-    let processed_files: HashSet<String> = processed_files_records
-        .into_iter()
-        .map(|record| record.git_file_sha)
-        .collect();
+    let processed_files: HashSet<String> = db_manager.processed_by_this_extractor().await?;
 
     info!(
         "Found {} already processed files in database",
@@ -1357,7 +1355,8 @@ pub async fn process_git_range(
         }
     }
 
-    db_manager.record_index_build(extensions, no_macros).await?;
+    // Do not write a database version. Part of the database was updated here,
+    // but other parts could have been written by an older version of semcode.
 
     Ok(())
 }
