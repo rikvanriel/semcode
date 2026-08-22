@@ -3255,7 +3255,7 @@ impl TreeSitterAnalyzer {
             return MacroBodyFacts::default();
         }
 
-        let Some((tree, wrapped, prefix_len, _clean)) = Self::parse_macro_body(parser, body) else {
+        let Some((tree, wrapped, prefix_len)) = Self::parse_macro_body(parser, body) else {
             return MacroBodyFacts {
                 calls: Self::scan_macro_body_calls(body),
                 ..Default::default()
@@ -3363,16 +3363,26 @@ impl TreeSitterAnalyzer {
         }
     }
 
-    /// Parse a macro body in whichever context it fits, returning the tree and
-    /// the text that was parsed, so node ranges can be read back.
-    /// The parse of a macro body: the tree, the text it was parsed in, how
-    /// far the wrapper pushed the body along, and whether the parse is clean.
-    /// A body that parses with errors still yields usable call names, but its
-    /// structure is whatever error recovery invented.
+    /// Parse a macro body in whichever context it fits: the tree, the text it
+    /// was parsed in, and how far the wrapper pushed the body along, so node
+    /// ranges can be read back into the file.
+    ///
+    /// A body that does not parse cleanly is used anyway, structure included.
+    /// That is deliberate and measured: harvesting sites and registrations
+    /// only from an error-free parse costs 819 registrations and 134 dispatch
+    /// sites on a Linux tree, to remove 29 wrong rows. A body full of token
+    /// pasting never parses cleanly, and its `.read = seq_read` says what it
+    /// installs regardless.
+    ///
+    /// What error recovery does invent is filtered where it can be recognised
+    /// rather than by refusing the tree: a member named after a keyword and a
+    /// member call with no receiver are both impossible in C, and both are
+    /// dropped. Between them they cover the assembler bodies, which is where
+    /// invented structure was actually coming from.
     fn parse_macro_body(
         parser: &mut tree_sitter::Parser,
         body: &str,
-    ) -> Option<(Tree, String, usize, bool)> {
+    ) -> Option<(Tree, String, usize)> {
         const CONTEXTS: [(&str, &str); 3] = [
             ("void __semcode_body(void) { ", "; }"),
             ("", ""),
@@ -3389,7 +3399,7 @@ impl TreeSitterAnalyzer {
 
             let errors = Self::count_parse_errors(tree.root_node());
             if errors == 0 {
-                return Some((tree, wrapped, prefix.len(), true));
+                return Some((tree, wrapped, prefix.len()));
             }
 
             match &best {
@@ -3398,7 +3408,7 @@ impl TreeSitterAnalyzer {
             }
         }
 
-        best.map(|(tree, wrapped, prefix_len, _)| (tree, wrapped, prefix_len, false))
+        best.map(|(tree, wrapped, prefix_len, _)| (tree, wrapped, prefix_len))
     }
 
     fn count_parse_errors(node: tree_sitter::Node) -> usize {
