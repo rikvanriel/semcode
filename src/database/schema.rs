@@ -144,8 +144,10 @@ impl SchemaManager {
         let schema = Arc::new(Schema::new(vec![
             // Empty when the site is not inside a function at all: Python
             // module level and class bodies, C++ and Rust static
-            // initializers. file_path and line always locate it.
-            Field::new("caller_name", DataType::Utf8, true),
+            // initializers. Empty rather than null, because that is what the
+            // extractor writes and what every reader expects; file_path and
+            // line always locate the site either way.
+            Field::new("caller_name", DataType::Utf8, false),
             Field::new("file_path", DataType::Utf8, false),
             Field::new("git_file_hash", DataType::Utf8, false),
             // Byte offset of the site: unique within a file, stable across a

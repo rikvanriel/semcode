@@ -111,7 +111,8 @@ pub struct FieldInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DispatchSite {
     /// Function containing the call site, empty when there is none: Python
-    /// module level and class bodies, C++ and Rust static initializers.
+    /// module level and class bodies, C++ and Rust static initializers. The
+    /// empty string is the stored form; the column is not nullable.
     pub caller_name: String,
     pub file_path: String,
     pub git_file_hash: String,
