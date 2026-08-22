@@ -226,15 +226,14 @@ impl SchemaManager {
         Ok(())
     }
 
-    /// Schema version and per-feature population marks.
-    ///
-    /// A column being present says the schema was migrated; it does not say
-    /// which rows were indexed under which rules. Indexing is incremental per
-    /// file hash, so a database can hold a feature's column while most of its
-    /// rows predate the feature. The marks here record when a feature started
-    /// being populated, which is what makes a backfill decidable.
     /// The version the index was written by, or `None` when the table
     /// predates versioning entirely.
+    ///
+    /// Which rows were indexed under which rules is a separate question, and
+    /// a mark on the database cannot answer it: indexing is per file, so a
+    /// database can hold a feature's column while most of its rows predate
+    /// the feature. `processed_files.extractor_version` answers that one, per
+    /// file, and is what decides whether a file is read again.
     pub async fn stored_schema_version(&self) -> Result<Option<u32>> {
         Ok(self
             .meta_value("schema_version")
@@ -335,13 +334,9 @@ impl SchemaManager {
             .map(|d| d.as_secs())
             .unwrap_or(0)
             .to_string();
-        let keys = vec![
-            "schema_version",
-            "populated_since:dispatch_sites",
-            "populated_since:registrations",
-        ];
+        let keys = vec!["schema_version", "created"];
         let written_by = if preexisting { 0 } else { SCHEMA_VERSION };
-        let values = vec![written_by.to_string(), now.clone(), now];
+        let values = vec![written_by.to_string(), now];
 
         let batch = RecordBatch::try_new(
             schema,
