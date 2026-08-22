@@ -30,6 +30,29 @@ pub struct TypeStore {
     content_store: ContentStore,
 }
 
+/// Keep one row per merge key, for the same reason `functions` does: a batch
+/// carrying two rows for one key is rejected whole, and a file can define the
+/// same type twice under two preprocessor branches. Not seen on a Linux tree,
+/// where the collision that does happen is in `functions`, but the failure is
+/// the same shape and costs the whole batch.
+fn one_type_per_key(types: &[TypeInfo]) -> Vec<TypeInfo> {
+    let mut seen = std::collections::HashSet::new();
+    let mut kept = Vec::with_capacity(types.len());
+    for type_info in types {
+        let key = (
+            type_info.name.clone(),
+            type_info.kind.clone(),
+            type_info.file_path.clone(),
+            type_info.git_file_hash.clone(),
+        );
+        if seen.insert(key) {
+            kept.push(type_info.clone());
+        }
+    }
+
+    kept
+}
+
 impl TypeStore {
     pub fn new(connection: Connection) -> Self {
         let content_store = ContentStore::new(connection.clone());
@@ -63,6 +86,7 @@ impl TypeStore {
         let table = self.connection.open_table("types").execute().await?;
 
         // Process in optimal batch sizes
+        let filtered_types = one_type_per_key(&filtered_types);
         for chunk in filtered_types.chunks(OPTIMAL_BATCH_SIZE) {
             self.insert_chunk(&table, chunk).await?;
         }
@@ -78,6 +102,7 @@ impl TypeStore {
         let table = self.connection.open_table("types").execute().await?;
 
         // Process in optimal batch sizes
+        let types = one_type_per_key(&types);
         for chunk in types.chunks(OPTIMAL_BATCH_SIZE) {
             self.insert_metadata_chunk(&table, chunk).await?;
         }

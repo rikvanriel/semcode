@@ -32,6 +32,38 @@ pub struct FunctionStore {
     content_store: ContentStore,
 }
 
+/// Keep one row per merge key.
+///
+/// A file can define the same name twice — the same static inline under two
+/// preprocessor branches, or a macro defined once per configuration — and the
+/// extractor records both. Merging a batch that holds two rows for one key is
+/// rejected outright by lance, which fails the whole batch and loses every
+/// function in it, so the choice has to be made here. The first definition in
+/// the file wins, which is stable across runs.
+fn one_per_key(functions: &[FunctionInfo]) -> Vec<FunctionInfo> {
+    let mut seen = std::collections::HashSet::new();
+    let mut kept = Vec::with_capacity(functions.len());
+    for function in functions {
+        let key = (
+            function.name.clone(),
+            function.file_path.clone(),
+            function.git_file_hash.clone(),
+        );
+        if seen.insert(key) {
+            kept.push(function.clone());
+        }
+    }
+
+    if kept.len() != functions.len() {
+        tracing::debug!(
+            "dropped {} duplicate definitions within one batch",
+            functions.len() - kept.len()
+        );
+    }
+
+    kept
+}
+
 impl FunctionStore {
     pub fn new(connection: Connection) -> Self {
         let content_store = ContentStore::new(connection.clone());
@@ -67,6 +99,7 @@ impl FunctionStore {
         let table = self.connection.open_table("functions").execute().await?;
 
         // Process in optimal batch sizes
+        let filtered_functions = one_per_key(&filtered_functions);
         for chunk in filtered_functions.chunks(OPTIMAL_BATCH_SIZE) {
             self.insert_chunk(&table, chunk).await?;
         }
@@ -82,6 +115,7 @@ impl FunctionStore {
         let table = self.connection.open_table("functions").execute().await?;
 
         // Process in optimal batch sizes
+        let functions = one_per_key(&functions);
         for chunk in functions.chunks(OPTIMAL_BATCH_SIZE) {
             self.insert_metadata_chunk(&table, chunk).await?;
         }
