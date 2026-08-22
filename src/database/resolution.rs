@@ -15,6 +15,10 @@ pub struct IndirectCaller {
     pub caller_name: String,
     pub site_file: String,
     pub site_line: u32,
+    /// Byte offset of the site. Two dispatches can share a line — `a->f()`
+    /// and `b->f()`, or a chain resolved twice — and without this they are
+    /// one answer whose registration count is the sum of both.
+    pub site_byte_start: u64,
     pub member: String,
     /// How the site was written: a member call, a call through a pointer, a
     /// candidate an indirect-call macro named.
@@ -72,6 +76,7 @@ pub fn indirect_callers(
             caller_name: site.caller_name.clone(),
             site_file: site.file_path.clone(),
             site_line: site.line,
+            site_byte_start: site.byte_start,
             member: site.member.clone(),
             site_kind: site.kind.as_str().to_string(),
             evidence: Evidence::StatedAtSite,
@@ -82,7 +87,7 @@ pub fn indirect_callers(
     // places install the function there: seq_read sits in file_operations
     // ::read in 430 of them, and listing fs/read_write.c once per
     // registration buries the three call sites that matter.
-    type SiteKey = (String, String, u32, String, String, String, bool);
+    type SiteKey = (String, String, u32, u64, String, String, String, bool);
     let mut by_site: HashMap<SiteKey, (&Registration, usize)> = HashMap::new();
 
     for registration in registrations {
@@ -108,6 +113,7 @@ pub fn indirect_callers(
                 site.caller_name.clone(),
                 site.file_path.clone(),
                 site.line,
+                site.byte_start,
                 site.member.clone(),
                 site.kind.as_str().to_string(),
                 registration.container_type.clone(),
@@ -131,7 +137,16 @@ pub fn indirect_callers(
     }
 
     for (
-        (caller_name, site_file, site_line, member, site_kind, container_type, type_matched),
+        (
+            caller_name,
+            site_file,
+            site_line,
+            site_byte_start,
+            member,
+            site_kind,
+            container_type,
+            type_matched,
+        ),
         (exemplar, count),
     ) in by_site
     {
@@ -139,6 +154,7 @@ pub fn indirect_callers(
             caller_name,
             site_file,
             site_line,
+            site_byte_start,
             member,
             site_kind,
             evidence: Evidence::Registered {
@@ -151,12 +167,26 @@ pub fn indirect_callers(
         });
     }
 
+    // Sort on everything that distinguishes an answer, not on the three
+    // fields a reader sees first: dedup only drops neighbours, so two equal
+    // rows with a third between them both survive a partial sort.
     found.sort_by(|a, b| {
-        (&a.caller_name, &a.site_file, a.site_line).cmp(&(
-            &b.caller_name,
-            &b.site_file,
-            b.site_line,
-        ))
+        (
+            &a.caller_name,
+            &a.site_file,
+            a.site_line,
+            a.site_byte_start,
+            &a.member,
+            &a.site_kind,
+        )
+            .cmp(&(
+                &b.caller_name,
+                &b.site_file,
+                b.site_line,
+                b.site_byte_start,
+                &b.member,
+                &b.site_kind,
+            ))
     });
     found.dedup();
 
@@ -379,5 +409,31 @@ mod tests {
         );
 
         assert_eq!(found.len(), 2, "{found:?}");
+    }
+
+    #[test]
+    fn two_dispatches_on_one_line_are_two_answers() {
+        // `a->run(); b->run();` is two calls, and the answer for each has to
+        // count its own installations rather than both.
+        let mut first = site("run", "caller", Some("ops"));
+        let mut second = site("run", "caller", Some("ops"));
+        first.byte_start = 100;
+        second.byte_start = 140;
+
+        let found = indirect_callers(
+            &[registration("ops", "run", "impl")],
+            &group_by_member(vec![first, second]),
+            &[],
+        );
+
+        assert_eq!(found.len(), 2, "one line swallowed both: {found:?}");
+        for caller in &found {
+            match &caller.evidence {
+                Evidence::Registered {
+                    registration_count, ..
+                } => assert_eq!(*registration_count, 1, "count doubled: {caller:?}"),
+                other => panic!("unexpected evidence: {other:?}"),
+            }
+        }
     }
 }
