@@ -360,6 +360,54 @@ async fn show_callchain_with_limits(
         }
     }
 
+    // Where the chain leaves by a member rather than by name. Without this
+    // the chain simply stops: svc_handle_xprt appears with its callees and
+    // nothing says that the work happens in whatever is installed in
+    // svc_xprt_ops::xpo_recvfrom.
+    let mut reachable: Vec<String> = vec![function_name.to_string()];
+    reachable.extend(callees.iter().cloned());
+    let dispatched = db.resolve_dispatches_in(&reachable, git_sha).await?;
+
+    if !dispatched.is_empty() {
+        println!("\n{}", "=== Dispatches ===".bold().blue());
+
+        for from in &reachable {
+            let Some(sites) = dispatched.get(from) else {
+                continue;
+            };
+
+            for site in sites {
+                let where_ = format!("{}:{}", site.file_path, site.line);
+                println!(
+                    "{} {}->{} ({})",
+                    if from == function_name {
+                        from.cyan().to_string()
+                    } else {
+                        from.bright_black().to_string()
+                    },
+                    site.receiver_expr.bright_black(),
+                    site.member.cyan(),
+                    where_.bright_black()
+                );
+
+                for target in site.targets.iter().take(3) {
+                    println!("   └─ {}", target.yellow());
+                }
+                if site.targets.len() > 3 {
+                    println!(
+                        "   └─ {} more of {} installed in {}::{}, see `implementors {}.{}`",
+                        (site.targets.len() - 3).to_string().yellow(),
+                        site.targets.len(),
+                        site.container_type,
+                        site.member,
+                        site.container_type,
+                        site.member
+                    );
+                }
+            }
+        }
+    }
+
     // Summary
     println!("\n{}", "=== Summary ===".bold().green());
     println!("Total direct callers: {}", callers.len());
