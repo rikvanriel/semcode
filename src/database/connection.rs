@@ -861,6 +861,46 @@ impl DatabaseManager {
         Ok(resolved)
     }
 
+    /// What a field of a type is declared as, when every definition of that
+    /// type at this revision agrees.
+    ///
+    /// A tree holds more than one `struct file`, and the types table holds
+    /// each of them at every indexed commit. Disagreement means not enough is
+    /// known, so the answer is nothing rather than one of the candidates.
+    async fn field_aggregate(
+        &self,
+        container_name: &str,
+        field: &str,
+        manifest: &std::collections::HashMap<String, String>,
+    ) -> Result<Option<String>> {
+        use crate::database::resolution::{aggregate_of, at_revision};
+
+        let definitions = at_revision(
+            self.type_store.find_all_by_name(container_name).await?,
+            manifest,
+            |t| (t.file_path.as_str(), t.git_file_hash.as_str()),
+        );
+
+        let mut agreed: Option<String> = None;
+        for container in definitions {
+            let Some(field_type) = container
+                .members
+                .iter()
+                .find(|member| member.name == field)
+                .and_then(|member| aggregate_of(&member.type_name))
+            else {
+                continue;
+            };
+
+            match &agreed {
+                Some(known) if *known != field_type => return Ok(None),
+                _ => agreed = Some(field_type),
+            }
+        }
+
+        Ok(agreed)
+    }
+
     pub async fn find_registrations_for_slot_git_aware(
         &self,
         container_type: &str,
@@ -983,8 +1023,6 @@ impl DatabaseManager {
         sites: &mut [crate::types::DispatchSite],
         manifest: &std::collections::HashMap<String, String>,
     ) -> Result<()> {
-        use crate::database::resolution::{aggregate_of, at_revision};
-
         let mut resolved: std::collections::HashMap<(String, String), Option<String>> =
             std::collections::HashMap::new();
 
@@ -1003,42 +1041,20 @@ impl DatabaseManager {
             let field_type = match resolved.get(&key) {
                 Some(known) => known.clone(),
                 None => {
-                    // A tree holds more than one `struct file`. Every
-                    // definition of the name has to agree on what the field
-                    // is, or the answer is a guess between them.
-                    //
-                    // Only definitions at the revision being queried count.
-                    // The table also holds the same struct as it was at other
-                    // indexed commits, and a field whose type changed between
-                    // them reads as two definitions disagreeing, which turns
-                    // typing off for that field with nothing said about why.
-                    let definitions = at_revision(
-                        self.type_store.find_all_by_name(base).await?,
-                        manifest,
-                        |t| (t.file_path.as_str(), t.git_file_hash.as_str()),
-                    );
-
-                    let mut agreed: Option<String> = None;
-                    let mut conflicting = false;
-                    for container in definitions {
-                        let Some(field_type) = container
-                            .members
-                            .iter()
-                            .find(|member| member.name == field)
-                            .and_then(|member| aggregate_of(&member.type_name))
-                        else {
-                            continue;
+                    // Walk the path one field at a time: `display->parent->dsb`
+                    // needs the type of `parent` before the type of `dsb`.
+                    let mut current = Some(base.to_string());
+                    for step in field.split('.') {
+                        let Some(container_name) = current.take() else {
+                            break;
                         };
-
-                        match &agreed {
-                            Some(known) if *known != field_type => conflicting = true,
-                            _ => agreed = Some(field_type),
-                        }
+                        current = self
+                            .field_aggregate(&container_name, step, manifest)
+                            .await?;
                     }
 
-                    let looked_up = if conflicting { None } else { agreed };
-                    resolved.insert(key, looked_up.clone());
-                    looked_up
+                    resolved.insert(key, current.clone());
+                    current
                 }
             };
 

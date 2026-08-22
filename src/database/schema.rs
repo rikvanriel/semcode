@@ -27,7 +27,10 @@ pub enum OptimizeOutcome {
 /// 2: dispatch sites and registrations, receiver types, calls and facts from
 ///    macro bodies. An index written by version 1 holds none of them for a
 ///    file it has already seen.
-pub const SCHEMA_VERSION: u32 = 2;
+/// 3: `receiver_field` holds the whole path of fields a receiver reads, not
+///    only the first, so `a->b->c->m()` resolves. A version 2 row holds one
+///    field where this reads a path.
+pub const SCHEMA_VERSION: u32 = 3;
 
 pub struct SchemaManager {
     connection: Connection,

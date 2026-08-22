@@ -171,19 +171,27 @@ fn is_plain_name(text: &str) -> bool {
         && text.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
-/// `base->field` or `base.field`, where both sides are plain names. A longer
-/// chain needs the type of an intermediate field, which needs the same
-/// lookup again; one step is what the types table answers in one hop.
-fn field_step(text: &str) -> Option<(&str, &str)> {
-    for separator in ["->", "."] {
-        if let Some((base, field)) = text.split_once(separator) {
-            if is_plain_name(base) && is_plain_name(field) {
-                return Some((base, field));
-            }
-        }
+/// `base->field`, `base.field`, or a longer chain of them: the base and the
+/// fields read from it, in order.
+///
+/// `display->parent->dsb` gives `display` and `parent.dsb`. Every part has to
+/// be a plain name — an index, a call or a cast in the middle needs more than
+/// a field lookup, and the whole receiver is left untyped rather than
+/// half-read.
+fn field_path(text: &str) -> Option<(&str, String)> {
+    let mut parts = text.split("->").flat_map(|part| part.split('.'));
+
+    let base = parts.next()?;
+    if !is_plain_name(base) {
+        return None;
     }
 
-    None
+    let fields: Vec<&str> = parts.collect();
+    if fields.is_empty() || !fields.iter().all(|field| is_plain_name(field)) {
+        return None;
+    }
+
+    Some((base, fields.join(".")))
 }
 
 /// Collapse runs of whitespace (including newlines) into single spaces.
@@ -975,13 +983,13 @@ impl TreeSitterAnalyzer {
             }
 
             // `inode->i_fop->read()`: the file proves what `inode` is, and
-            // the field says which member of it the receiver reads. What
-            // `i_fop` is declared as belongs to whichever file declares
-            // struct inode, so the pair is stored and resolution finishes it.
-            if let Some((base, field)) = field_step(receiver) {
+            // the fields say what is read from it. What `i_fop` is declared
+            // as belongs to whichever file declares struct inode, so the path
+            // is stored and resolution walks it.
+            if let Some((base, fields)) = field_path(receiver) {
                 if let Some(base_type) = declared_type(base) {
                     site.receiver_base_type = Some(base_type);
-                    site.receiver_field = Some(field.to_string());
+                    site.receiver_field = Some(fields);
                 }
             }
         }
@@ -3859,9 +3867,10 @@ mod tests {
     }
 
     #[test]
-    fn a_longer_chain_records_nothing() {
-        // `a->b->c` needs the type of `b` before the type of `c`: the same
-        // lookup twice, which is not what one stored pair answers.
+    fn a_longer_chain_records_every_step() {
+        // `a->b->c` needs the type of `b` before the type of `c`. Both hops
+        // are lookups in the types table, so record the path and let
+        // resolution walk it.
         let (_functions, sites) = analyze(
             "struct outer { struct middle *b; };\n\
              int probe(struct outer *a) { return a->b->c->run(); }\n",
@@ -3870,6 +3879,22 @@ mod tests {
 
         let run = sites.iter().find(|s| s.member == "run").unwrap();
         assert_eq!(run.receiver_expr.as_deref(), Some("a->b->c"));
+        assert_eq!(run.receiver_base_type.as_deref(), Some("outer"));
+        assert_eq!(run.receiver_field.as_deref(), Some("b.c"));
+    }
+
+    #[test]
+    fn a_chain_through_a_call_records_nothing() {
+        // `ath9k_hw_common(_ah)->ops` needs the return type of a function,
+        // which is a different lookup; reading half the chain would file the
+        // site under the wrong type.
+        let (_functions, sites) = analyze(
+            "struct ops { int (*run)(void); };\n\
+             int probe(void *ah) { return common(ah)->ops->run(); }\n",
+            "test.c",
+        );
+
+        let run = sites.iter().find(|s| s.member == "run").unwrap();
         assert_eq!(run.receiver_base_type, None);
     }
 
