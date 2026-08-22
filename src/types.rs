@@ -139,6 +139,21 @@ pub struct DispatchSite {
     pub target: Option<String>,
 }
 
+/// A dispatch site with the functions it can reach, which is what a call
+/// chain needs to continue through it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDispatch {
+    pub receiver_expr: String,
+    pub container_type: String,
+    pub member: String,
+    pub file_path: String,
+    pub line: u32,
+    /// Everything installed in that member of that type, as written. A
+    /// target that is not a function in the tree drops out when the caller
+    /// looks it up.
+    pub targets: Vec<String>,
+}
+
 /// How a dispatch site was written. Stored, so values are append-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DispatchKind {

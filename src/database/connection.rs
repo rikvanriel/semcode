@@ -776,6 +776,91 @@ impl DatabaseManager {
     }
 
     /// Everything installed in one member of one type, at a revision.
+    /// What each dispatch inside these functions can reach.
+    ///
+    /// A call chain that stops at `file->f_op->read()` stops one lookup short
+    /// of the answer: the site is recorded, the registrations are recorded,
+    /// and joining them is what the chain needs to keep going.
+    pub async fn resolve_dispatches_in(
+        &self,
+        callers: &[String],
+        git_sha: &str,
+    ) -> Result<std::collections::HashMap<String, Vec<crate::types::ResolvedDispatch>>> {
+        use crate::database::resolution::at_revision;
+
+        let manifest = self.git_manifest_cached(git_sha).await?;
+        let mut resolved = std::collections::HashMap::new();
+        // A slot is asked about once per function that dispatches through it,
+        // and ops tables are shared: cache what each one holds.
+        let mut slots: std::collections::HashMap<(String, String), Vec<String>> =
+            std::collections::HashMap::new();
+
+        for caller in callers {
+            let mut sites = at_revision(
+                self.dispatch_site_store.find_by_caller(caller).await?,
+                &manifest,
+                |s| (s.file_path.as_str(), s.git_file_hash.as_str()),
+            );
+            if sites.is_empty() {
+                continue;
+            }
+            self.type_chained_receivers(&mut sites, &manifest).await?;
+
+            let mut dispatches = Vec::new();
+            for site in sites {
+                // A site whose receiver type is unknown reaches every member
+                // of that name in the tree, which is not an answer a chain
+                // can follow. `callers` reports those as a count.
+                let Some(container_type) = site.receiver_type.clone() else {
+                    continue;
+                };
+
+                let key = (container_type.clone(), site.member.clone());
+                let targets = match slots.get(&key) {
+                    Some(known) => known.clone(),
+                    None => {
+                        let mut targets: Vec<String> = at_revision(
+                            self.registration_store
+                                .find_by_slot(&container_type, &site.member)
+                                .await?,
+                            &manifest,
+                            |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
+                        )
+                        .into_iter()
+                        .map(|registration| registration.target)
+                        .collect();
+                        targets.sort();
+                        targets.dedup();
+                        slots.insert(key, targets.clone());
+                        targets
+                    }
+                };
+
+                if targets.is_empty() {
+                    continue;
+                }
+
+                dispatches.push(crate::types::ResolvedDispatch {
+                    receiver_expr: site.receiver_expr.clone().unwrap_or_default(),
+                    container_type,
+                    member: site.member.clone(),
+                    file_path: site.file_path.clone(),
+                    line: site.line,
+                    targets,
+                });
+            }
+
+            if !dispatches.is_empty() {
+                dispatches.sort_by(|a, b| {
+                    (&a.file_path, a.line, &a.member).cmp(&(&b.file_path, b.line, &b.member))
+                });
+                resolved.insert(caller.clone(), dispatches);
+            }
+        }
+
+        Ok(resolved)
+    }
+
     pub async fn find_registrations_for_slot_git_aware(
         &self,
         container_type: &str,
