@@ -74,6 +74,11 @@ fn write_fixture(repo: &Path) {
          \t\t\t     struct shrink_control *sc)\n\
          {\n\
          \treturn shrinker->scan_objects(shrinker, sc);\n\
+         }\n\
+         unsigned long shrink_slab_all(struct shrinker *shrinker,\n\
+         \t\t\t      struct shrink_control *sc)\n\
+         {\n\
+         \treturn do_shrink_slab(shrinker, sc);\n\
          }\n",
     )
     .unwrap();
@@ -403,5 +408,65 @@ async fn a_path_of_three_fields_resolves_on_both_sides() {
     assert!(
         typed.contains(&"call_deep"),
         "a dispatch three fields deep was not matched: {indirect:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_callback_reached_only_through_a_pointer_has_a_chain_above_it() {
+    // A shrinker callback is called by nobody and reached by everybody. Built
+    // from calls alone the reverse chain renders it as a root, so `callers`
+    // named the dispatch while `callchain` reported none, from one index. The
+    // chain continues above the dispatching function.
+    let dir = tempfile::tempdir().unwrap();
+    let (db, git_sha) = index_fixture(dir.path()).await;
+
+    let mut rendered = Vec::new();
+    let shown = semcode::callchain::write_indirect_reverse_chain(
+        &db,
+        "super_cache_scan",
+        &git_sha,
+        2,
+        10,
+        &mut rendered,
+    )
+    .await
+    .unwrap();
+    let text = String::from_utf8(rendered).unwrap();
+
+    assert!(shown >= 1, "no dispatching site shown: {text}");
+    assert!(
+        text.contains("do_shrink_slab"),
+        "the dispatch is missing: {text}"
+    );
+    assert!(
+        text.contains("shrink_slab_all"),
+        "the chain above the dispatch is missing: {text}"
+    );
+}
+
+#[tokio::test]
+async fn a_function_with_ordinary_callers_gets_no_pointer_chain() {
+    // The section is for what calls cannot show. A function called by name
+    // has nothing to add here, and an empty heading is a wrong answer.
+    let dir = tempfile::tempdir().unwrap();
+    let (db, git_sha) = index_fixture(dir.path()).await;
+
+    let mut rendered = Vec::new();
+    let shown = semcode::callchain::write_indirect_reverse_chain(
+        &db,
+        "do_shrink_slab",
+        &git_sha,
+        2,
+        10,
+        &mut rendered,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(shown, 0);
+    assert!(
+        rendered.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&rendered)
     );
 }

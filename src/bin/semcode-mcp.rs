@@ -1758,6 +1758,27 @@ async fn mcp_show_callchain_with_limits(
             .get_function_callees_git_aware(function_name, git_sha)
             .await?;
 
+        // A function reached only through a pointer has no direct callers, so
+        // without this the reverse side of the chain is silent about it while
+        // find_callers answers from the same index.
+        let dispatched = if up_levels > 0 {
+            semcode::callchain::write_indirect_reverse_chain(
+                db,
+                function_name,
+                git_sha,
+                up_levels.saturating_sub(1),
+                if calls_limit == 0 {
+                    usize::MAX
+                } else {
+                    calls_limit
+                },
+                &mut buffer,
+            )
+            .await?
+        } else {
+            0
+        };
+
         // Show callers with depth and limit control
         if !callers.is_empty() && up_levels > 0 {
             writeln!(
@@ -1921,7 +1942,11 @@ async fn mcp_show_callchain_with_limits(
         writeln!(buffer, "Total direct callers: {}", callers.len())?;
         writeln!(buffer, "Total direct callees: {}", callees.len())?;
 
-        if callers.is_empty() && callees.is_empty() {
+        if dispatched > 0 {
+            writeln!(buffer, "Dispatching sites that reach it: {dispatched}")?;
+        }
+
+        if callers.is_empty() && callees.is_empty() && dispatched == 0 {
             writeln!(buffer, "This function is isolated (no callers or callees)")?;
         }
     }

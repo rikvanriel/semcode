@@ -238,6 +238,28 @@ async fn show_callchain_with_limits(
         .get_function_callees_git_aware(function_name, git_sha)
         .await?;
 
+    // A function reached only through a pointer has no direct callers, so
+    // without this the reverse side is silent about it while `callers`
+    // answers from the same index.
+    let reached_through_pointer = if up_levels > 0 {
+        let mut out = std::io::stdout();
+        semcode::callchain::write_indirect_reverse_chain(
+            db,
+            function_name,
+            git_sha,
+            up_levels.saturating_sub(1),
+            if calls_limit == 0 {
+                usize::MAX
+            } else {
+                calls_limit
+            },
+            &mut out,
+        )
+        .await?
+    } else {
+        0
+    };
+
     // Show callers with depth and limit control
     if !callers.is_empty() && up_levels > 0 {
         println!(
@@ -413,7 +435,11 @@ async fn show_callchain_with_limits(
     println!("Total direct callers: {}", callers.len());
     println!("Total direct callees: {}", callees.len());
 
-    if callers.is_empty() && callees.is_empty() {
+    if reached_through_pointer > 0 {
+        println!("Dispatching sites that reach it: {reached_through_pointer}");
+    }
+
+    if callers.is_empty() && callees.is_empty() && reached_through_pointer == 0 {
         println!(
             "{} This function is isolated (no callers or callees)",
             "Info:".yellow()

@@ -646,6 +646,161 @@ pub async fn show_callees_to_writer(
     Ok(())
 }
 
+/// The sites that reach a function through a pointer, and the chain above each.
+///
+/// A function only ever called through a pointer has no direct callers, so a
+/// reverse chain built from calls alone renders it as a root: `callers
+/// super_cache_scan` named three sites while `callchain super_cache_scan`
+/// reported none, from the same index. The dispatching function is where the
+/// chain continues upward, and is walked like any other caller.
+///
+/// A site outside any function — a store into a table at file scope — has
+/// nothing above it and is named without a chain.
+///
+/// Returns the number of dispatching sites shown.
+/// One caller above a dispatching site, and the callers above it.
+///
+/// Kept separate from the tree printer used for a direct chain, which marks an
+/// unexpanded node with `(...)`. Here every entry is one already, and a column
+/// of them says nothing.
+fn write_caller_above(
+    node: &CallNode,
+    indent: usize,
+    remaining: usize,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let pad = "  ".repeat(indent);
+    if node.file.is_empty() {
+        writeln!(writer, "{}└─ {}", pad, node.name.yellow())?;
+    } else {
+        writeln!(
+            writer,
+            "{}└─ {} ({}:{})",
+            pad,
+            node.name.yellow(),
+            node.file.bright_black(),
+            node.line
+        )?;
+    }
+
+    if remaining > 1 {
+        for child in &node.children {
+            write_caller_above(child, indent + 1, remaining - 1, writer)?;
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn write_indirect_reverse_chain(
+    db: &DatabaseManager,
+    name: &str,
+    git_sha: &str,
+    depth: usize,
+    limit: usize,
+    writer: &mut dyn Write,
+) -> Result<usize> {
+    let indirect = db.find_indirect_callers(name, git_sha).await?;
+    if indirect.is_empty() {
+        return Ok(0);
+    }
+
+    // One entry per dispatching function: a function dispatching through the
+    // same member twice is one way in, not two.
+    let mut order: Vec<String> = Vec::new();
+    let mut sites: HashMap<String, Vec<&crate::database::resolution::IndirectCaller>> =
+        HashMap::new();
+    for caller in &indirect {
+        let key = if caller.caller_name.is_empty() {
+            format!("{}:{}", caller.site_file, caller.site_line)
+        } else {
+            caller.caller_name.clone()
+        };
+        if !sites.contains_key(&key) {
+            order.push(key.clone());
+        }
+        sites.entry(key).or_default().push(caller);
+    }
+
+    writeln!(
+        writer,
+        "\n{}",
+        "=== Reverse Chain (Through a Function Pointer) ==="
+            .bold()
+            .magenta()
+    )?;
+
+    let shown = order.len().min(limit.max(1));
+    for key in order.iter().take(shown) {
+        let group = &sites[key];
+        let first = group[0];
+        let more = if group.len() > 1 {
+            format!(" ({} sites)", group.len())
+        } else {
+            String::new()
+        };
+
+        if first.caller_name.is_empty() {
+            writeln!(
+                writer,
+                "{} at {}:{} dispatches {}{}",
+                "STORE".yellow(),
+                first.site_file.bright_black(),
+                first.site_line,
+                first.member,
+                more
+            )?;
+            continue;
+        }
+
+        writeln!(
+            writer,
+            "{} ({}:{}) dispatches {}{}",
+            first.caller_name.yellow(),
+            first.site_file.bright_black(),
+            first.site_line,
+            first.member,
+            more
+        )?;
+
+        // A chain above the site can only be walked by name, so the name must
+        // belong to the code the site is in. bcache writes its sysfs stores
+        // with a STORE() macro and lib/raid has another, so walking `STORE`
+        // answers with the callers of every macro sharing the name — the
+        // altivec xor routines, under a shrinker callback.
+        //
+        // One definition, in the file the site is in, or no chain.
+        let definitions = db
+            .find_all_functions_git_aware(&first.caller_name, git_sha)
+            .await?;
+        let names_the_site = definitions.len() == 1
+            && definitions
+                .first()
+                .is_some_and(|f| f.file_path == first.site_file);
+
+        if depth > 0 && names_the_site {
+            // One level deeper than is printed, so the printed nodes carry the
+            // file and line the deeper walk resolves for them.
+            let above =
+                build_reverse_callchain_with_git(db, &first.caller_name, depth + 1, Some(git_sha))
+                    .await?;
+            for child in &above.children {
+                write_caller_above(child, 1, depth, writer)?;
+            }
+        }
+    }
+
+    if order.len() > shown {
+        writeln!(
+            writer,
+            "{}",
+            format!("... and {} more dispatching sites", order.len() - shown).bright_black()
+        )?;
+    }
+
+    Ok(shown)
+}
+
 pub async fn show_callchain_to_writer(
     db: &DatabaseManager,
     name: &str,
@@ -693,6 +848,8 @@ pub async fn show_callchain_to_writer(
                 print_callchain_tree_to_writer(&reverse_chain, 0, writer)?;
             }
 
+            let dispatched = write_indirect_reverse_chain(db, name, git_sha, 2, 10, writer).await?;
+
             // Show forward callchain (callees)
             if !callees.is_empty() {
                 let callees_header =
@@ -704,7 +861,7 @@ pub async fn show_callchain_to_writer(
                 print_callchain_tree_to_writer(&forward_chain, 0, writer)?;
             }
 
-            if callers.is_empty() && callees.is_empty() {
+            if callers.is_empty() && callees.is_empty() && dispatched == 0 {
                 let info_msg = format!(
                     "\n{} This function is isolated (no callers or callees)",
                     "Info:".yellow()
