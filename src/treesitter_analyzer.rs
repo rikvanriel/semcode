@@ -1168,8 +1168,15 @@ impl TreeSitterAnalyzer {
                 continue;
             }
 
-            let Some(container_type) = Self::initializer_container_type(node, source) else {
+            let Some((outer_type, path)) = Self::initializer_container(node, source) else {
                 continue;
+            };
+            // An empty path means the list fills the type the file named, so
+            // the container is known outright.
+            let (container_type, container_base_type, container_field) = if path.is_empty() {
+                (outer_type, None, None)
+            } else {
+                (String::new(), Some(outer_type), Some(path.join(".")))
             };
 
             let mut cursor = node.walk();
@@ -1212,8 +1219,8 @@ impl TreeSitterAnalyzer {
 
                 found.push(RawRegistration {
                     container_type: container_type.clone(),
-                    container_base_type: None,
-                    container_field: None,
+                    container_base_type: container_base_type.clone(),
+                    container_field: container_field.clone(),
                     member,
                     target,
                     byte_start: pair.start_byte(),
@@ -1373,16 +1380,39 @@ impl TreeSitterAnalyzer {
     /// compound literal that holds it. A nested initializer states no type of
     /// its own, and inferring one would need the member's declared type,
     /// which usually lives in another file.
-    fn initializer_container_type(list: tree_sitter::Node, source: &str) -> Option<String> {
+    /// The type an initializer list fills in, and the path of fields to reach
+    /// it from the type the file states.
+    ///
+    /// A list directly under a declaration or a compound literal names its
+    /// own type and the path is empty. A nested one does not:
+    ///
+    /// ```text
+    /// static struct nft_set_type nft_set_rbtree_type = {
+    ///         .ops = {
+    ///                 .activate = nft_rbtree_activate,
+    /// ```
+    ///
+    /// `activate` belongs to whatever `ops` is declared as within
+    /// `nft_set_type`, which lives with that struct rather than here. The
+    /// outer type and the path `ops` are what this file proves; resolution
+    /// turns them into the container, exactly as it does for a receiver that
+    /// reads through a field.
+    fn initializer_container(
+        list: tree_sitter::Node,
+        source: &str,
+    ) -> Option<(String, Vec<String>)> {
         let mut node = list;
+        let mut path: Vec<String> = Vec::new();
 
         while let Some(parent) = node.parent() {
             match parent.kind() {
                 // `(struct net_protocol) { .handler = tcp_v4_rcv }`
                 "compound_literal_expression" => {
-                    return parent
+                    let outer = parent
                         .child_by_field_name("type")
-                        .and_then(|t| Self::aggregate_type_name(t, source));
+                        .and_then(|t| Self::aggregate_type_name(t, source))?;
+                    path.reverse();
+                    return Some((outer, path));
                 }
                 // `static const struct file_operations fops = { ... };`
                 "init_declarator" | "declaration" => {
@@ -1391,12 +1421,23 @@ impl TreeSitterAnalyzer {
                     } else {
                         parent.parent()?
                     };
-                    return declaration
+                    let outer = declaration
                         .child_by_field_name("type")
-                        .and_then(|t| Self::aggregate_type_name(t, source));
+                        .and_then(|t| Self::aggregate_type_name(t, source))?;
+                    path.reverse();
+                    return Some((outer, path));
                 }
-                // A nested initializer: the inner type is not stated here.
-                "initializer_pair" | "initializer_list" => return None,
+                // One level in: remember which field this list is filling and
+                // keep looking outward for a type.
+                "initializer_pair" => {
+                    let designator = parent.child_by_field_name("designator")?;
+                    if designator.kind() != "field_designator" {
+                        // An array slot names no field, so the path breaks.
+                        return None;
+                    }
+                    path.push(source[designator.named_child(0)?.byte_range()].to_string());
+                    node = parent;
+                }
                 _ => node = parent,
             }
         }
@@ -4342,22 +4383,42 @@ mod tests {
     }
 
     #[test]
-    fn an_initializer_whose_type_is_not_stated_registers_nothing() {
-        // A nested initializer names no type here: the member's type is
-        // declared with the struct, usually in another file. Filing the
-        // registration under a guessed type would join it to the wrong
-        // dispatch sites.
-        let found = registrations_of(
+    fn a_nested_initializer_records_the_path_to_its_container() {
+        // The inner member belongs to whatever `in` is declared as, which is
+        // stated with struct outer rather than here. That used to be a reason
+        // to record nothing; it is now the same field lookup a chained
+        // receiver does, so record the outer type and the path.
+        let found = registration_rows(
             "struct outer { struct inner { int (*run)(void); } in; };\n\
              int impl(void);\n\
              static struct outer o = { .in = { .run = impl } };\n",
             "test.c",
         );
 
-        let members: Vec<&str> = found.iter().map(|(_, m, _, _)| m.as_str()).collect();
+        let run = found
+            .iter()
+            .find(|r| r.member == "run")
+            .expect("nested initializer not recorded at all");
+        assert_eq!(run.container_type, "");
+        assert_eq!(run.container_base_type.as_deref(), Some("outer"));
+        assert_eq!(run.container_field.as_deref(), Some("in"));
+        assert_eq!(run.target, "impl");
+    }
+
+    #[test]
+    fn an_array_slot_breaks_the_path() {
+        // `[0] = { .run = impl }` names no field to look up, so the container
+        // cannot be reached from the type the file states.
+        let found = registration_rows(
+            "struct entry { int (*run)(void); };\n\
+             int impl(void);\n\
+             static struct entry table[] = { [0] = { .run = impl } };\n",
+            "test.c",
+        );
+
         assert!(
-            !members.contains(&"run"),
-            "nested initializer registered under a guessed type: {found:?}"
+            found.iter().all(|r| r.member != "run"),
+            "recorded a container it cannot name: {found:?}"
         );
     }
 
