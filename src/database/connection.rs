@@ -135,6 +135,13 @@ impl DatabaseManager {
 
     /// Mark the index as holding what this build writes, with the options it
     /// was built with.
+    /// Forget files an older extractor read, after this one has read the tree.
+    pub async fn forget_older_processed_files(&self) -> Result<usize> {
+        self.processed_file_store
+            .forget_older_than(crate::SCHEMA_VERSION)
+            .await
+    }
+
     pub async fn record_index_build(&self, extensions: &[String], no_macros: bool) -> Result<()> {
         self.schema_manager
             .set_index_build(extensions, no_macros)

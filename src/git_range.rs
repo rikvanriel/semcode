@@ -1186,10 +1186,19 @@ pub async fn process_git_tree(
         }
     }
 
-    // The tree has been read with this build, so the index now holds what
-    // this version writes, for the extensions it was told to read. Recorded
-    // last: an interrupted run leaves the older version in place and is
-    // re-read next time.
+    // The whole tree has been read with this build, so a file still recorded
+    // against an older extractor is content the tree no longer holds. Left in
+    // place it keeps the index answering "older than this build" for ever, so
+    // re-indexing never clears the refusal it is meant to clear.
+    match db_manager.forget_older_processed_files().await {
+        Ok(0) => {}
+        Ok(forgotten) => info!("Forgot {forgotten} files read by an older extractor"),
+        Err(e) => error!("Failed to forget files read by an older extractor: {e}"),
+    }
+
+    // The index now holds what this version writes, for the extensions it was
+    // told to read. Recorded last: an interrupted run leaves the older version
+    // in place and is re-read next time.
     db_manager.record_index_build(extensions, no_macros).await?;
 
     Ok(())

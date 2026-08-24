@@ -181,6 +181,29 @@ impl ProcessedFileStore {
     }
 
     /// Remove processed file records for a specific git_sha (e.g., when git commit changes)
+    /// Forget files read by an older extractor.
+    ///
+    /// Called once the whole tree has been read: a row still carrying an
+    /// older version at that point describes content that is not in the tree,
+    /// usually an earlier revision of a file the last commit touched. Keeping
+    /// it makes the index answer "older than this build" forever, so
+    /// re-indexing never clears the refusal it is supposed to clear. Losing
+    /// the row costs a re-read if that content ever comes back.
+    pub async fn forget_older_than(&self, version: u32) -> Result<usize> {
+        let table = self
+            .connection
+            .open_table("processed_files")
+            .execute()
+            .await?;
+        let before = table.count_rows(None).await?;
+        table
+            .delete(&format!(
+                "extractor_version IS NULL OR extractor_version < {version}"
+            ))
+            .await?;
+        Ok(before - table.count_rows(None).await?)
+    }
+
     pub async fn remove_for_git_sha(&self, git_sha: Option<&str>) -> Result<()> {
         let table = self
             .connection
