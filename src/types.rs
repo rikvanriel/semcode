@@ -102,6 +102,162 @@ pub struct FieldInfo {
     pub offset: Option<u64>,
 }
 
+/// A call that dispatches through a value rather than naming a function:
+/// `ops->read(...)`, `(*fp)(...)`, a callback handed to another function.
+///
+/// The candidates are not known when the site is recorded. Resolution joins
+/// `(receiver_type, member)` against the functions installed in that slot, so
+/// what is stored here is only what the containing file itself proves.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DispatchSite {
+    /// Function containing the call site, empty when there is none: Python
+    /// module level and class bodies, C++ and Rust static initializers. The
+    /// empty string is the stored form; the column is not nullable.
+    pub caller_name: String,
+    pub file_path: String,
+    pub git_file_hash: String,
+    /// Byte offset of the site within the file: unique per site, and stable
+    /// across a reindex of unchanged content.
+    pub byte_start: u64,
+    pub line: u32,
+    /// Member dispatched through, empty when the call goes through a plain
+    /// pointer value with no member involved.
+    pub member: String,
+    /// Receiver text as written, for display and for later type resolution.
+    pub receiver_expr: Option<String>,
+    /// Receiver type when the containing file proves it.
+    pub receiver_type: Option<String>,
+    /// For a receiver that is itself a field access, `inode->i_fop->read()`,
+    /// the type of the base and the field read from it: `inode` and `i_fop`.
+    /// The receiver's own type is the type of that field, which lives in
+    /// whichever file declares the struct, so resolution finishes the job
+    /// against the types table. Both are set together or not at all.
+    pub receiver_base_type: Option<String>,
+    pub receiver_field: Option<String>,
+    pub kind: DispatchKind,
+    /// A target the site itself names, such as a local pointer's initializer.
+    pub target: Option<String>,
+}
+
+/// A dispatch site with the functions it can reach, which is what a call
+/// chain needs to continue through it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDispatch {
+    pub receiver_expr: String,
+    pub container_type: String,
+    pub member: String,
+    pub file_path: String,
+    pub line: u32,
+    /// Everything installed in that member of that type, as written. A
+    /// target that is not a function in the tree drops out when the caller
+    /// looks it up.
+    pub targets: Vec<String>,
+}
+
+/// How a dispatch site was written. Stored, so values are append-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DispatchKind {
+    /// `receiver->member(...)`
+    MemberArrow,
+    /// `receiver.member(...)`
+    MemberDot,
+    /// `(*fp)(...)`
+    PointerDeref,
+    /// `fp(...)` where `fp` is a function pointer declared in this function
+    PointerLocal,
+    /// `fp(...)` where `fp` is a function-pointer parameter
+    PointerParam,
+    /// A candidate the source itself names, as the kernel's INDIRECT_CALL_n
+    /// macros do to help the branch predictor.
+    MacroDeclared,
+}
+
+impl DispatchKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DispatchKind::MemberArrow => "member_arrow",
+            DispatchKind::MemberDot => "member_dot",
+            DispatchKind::PointerDeref => "pointer_deref",
+            DispatchKind::PointerLocal => "pointer_local",
+            DispatchKind::PointerParam => "pointer_param",
+            DispatchKind::MacroDeclared => "macro_declared",
+        }
+    }
+
+    /// Parse a stored `kind`. An unknown value is an error for the caller
+    /// rather than a silent default: a newer writer must not read as a
+    /// member call.
+    pub fn from_column_value(text: &str) -> Option<Self> {
+        match text {
+            "member_arrow" => Some(DispatchKind::MemberArrow),
+            "member_dot" => Some(DispatchKind::MemberDot),
+            "pointer_deref" => Some(DispatchKind::PointerDeref),
+            "pointer_local" => Some(DispatchKind::PointerLocal),
+            "pointer_param" => Some(DispatchKind::PointerParam),
+            "macro_declared" => Some(DispatchKind::MacroDeclared),
+            _ => None,
+        }
+    }
+}
+
+/// A function installed in a struct member: the other half of a dispatch
+/// site. `.read = my_read` in a `struct file_operations` initializer says
+/// that a call through `file_operations::read` can reach `my_read`.
+///
+/// The target is recorded as written. Whether it names a function is not
+/// knowable while parsing one file, and does not need to be: resolution
+/// joins the target against the functions table, and an initializer holding
+/// a constant simply never joins.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Registration {
+    /// Struct or typedef whose member is being initialised. Empty when the
+    /// file did not state it and `container_base_type` did: an assignment
+    /// through a field, `s->s_shrink->scan_objects = f`, knows what `s` is
+    /// but not what `s_shrink` is declared as. Resolution fills it in.
+    pub container_type: String,
+    pub member: String,
+    /// Identifier the member is initialised with.
+    pub target: String,
+    pub file_path: String,
+    pub git_file_hash: String,
+    pub byte_start: u64,
+    pub line: u32,
+    /// Function containing the initializer, empty at file scope.
+    pub enclosing_function: String,
+    pub kind: RegistrationKind,
+    /// For `base->field->member = f`, the type of the base and the path of
+    /// fields read from it. Set together, and only when the container type
+    /// could not be read from the file directly.
+    pub container_base_type: Option<String>,
+    pub container_field: Option<String>,
+}
+
+/// How a function came to be installed. Stored, so values are append-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RegistrationKind {
+    /// `.member = target` inside an initializer
+    DesignatedInit,
+    /// `x->member = target;` or `x.member = target;`
+    Assignment,
+}
+
+impl RegistrationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RegistrationKind::DesignatedInit => "designated_init",
+            RegistrationKind::Assignment => "assignment",
+        }
+    }
+
+    pub fn from_column_value(text: &str) -> Option<Self> {
+        match text {
+            "designated_init" => Some(RegistrationKind::DesignatedInit),
+            "assignment" => Some(RegistrationKind::Assignment),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TypedefInfo {
     pub name: String,

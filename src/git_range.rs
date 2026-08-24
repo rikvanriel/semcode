@@ -3,8 +3,8 @@
 use crate::git::walk_tree_at_commit_with_repo;
 use crate::indexer::{list_shas_in_range, process_commits_pipeline};
 use crate::{
-    DatabaseManager, FunctionInfo, GitFileEntry, GitFileManifestEntry, ProcessedFileRecord,
-    TreeSitterAnalyzer, TypeInfo,
+    DatabaseManager, DispatchSite, FunctionInfo, GitFileEntry, GitFileManifestEntry,
+    ProcessedFileRecord, Registration, TreeSitterAnalyzer, TypeInfo,
 };
 use anyhow::Result;
 use dashmap::DashSet;
@@ -29,6 +29,8 @@ struct GitFileTuple {
 struct GitTupleResults {
     functions: Vec<FunctionInfo>,
     types: Vec<TypeInfo>,
+    dispatch_sites: Vec<DispatchSite>,
+    registrations: Vec<Registration>,
     processed_files: Vec<ProcessedFileRecord>,
     files_processed: usize,
 }
@@ -37,6 +39,8 @@ impl GitTupleResults {
     fn merge(&mut self, other: GitTupleResults) {
         self.functions.extend(other.functions);
         self.types.extend(other.types);
+        self.dispatch_sites.extend(other.dispatch_sites);
+        self.registrations.extend(other.registrations);
         self.processed_files.extend(other.processed_files);
         self.files_processed += other.files_processed;
     }
@@ -245,7 +249,14 @@ fn process_git_file_tuple_with_repo(
     }
 
     // Check analysis results
-    let (mut functions, types, macros) = analysis_result?;
+    let analysis = analysis_result?;
+    let (mut functions, types, dispatch_sites, registrations) = (
+        analysis.functions,
+        analysis.types,
+        analysis.dispatch_sites,
+        analysis.registrations,
+    );
+    let macros = analysis.macros;
 
     // Macros are now stored as functions - combine them
     if !no_macros {
@@ -260,11 +271,14 @@ fn process_git_file_tuple_with_repo(
         file: tuple.file_path.to_string_lossy().to_string(),
         git_sha: None, // Will be set by caller if available
         git_file_sha: tuple.file_sha.clone(),
+        extractor_version: Some(crate::SCHEMA_VERSION),
     };
 
     let results = GitTupleResults {
         functions,
         types,
+        dispatch_sites,
+        registrations,
         processed_files: vec![processed_file_record],
         files_processed: 1,
     };
@@ -596,7 +610,13 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
                         let type_count = batch.types.len();
 
                         // Insert all three types in parallel
-                        let (func_result, type_result, processed_files_result) = tokio::join!(
+                        let (
+                            func_result,
+                            type_result,
+                            dispatch_result,
+                            registration_result,
+                            processed_files_result,
+                        ) = tokio::join!(
                             async {
                                 if !batch.functions.is_empty() {
                                     db_manager_clone.insert_functions(batch.functions).await
@@ -607,6 +627,24 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
                             async {
                                 if !batch.types.is_empty() {
                                     db_manager_clone.insert_types(batch.types).await
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                            async {
+                                if !batch.dispatch_sites.is_empty() {
+                                    db_manager_clone
+                                        .insert_dispatch_sites(batch.dispatch_sites)
+                                        .await
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                            async {
+                                if !batch.registrations.is_empty() {
+                                    db_manager_clone
+                                        .insert_registrations(batch.registrations)
+                                        .await
                                 } else {
                                     Ok(())
                                 }
@@ -635,6 +673,20 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
                             insertion_successful = false;
                         } else {
                             types_counter.fetch_add(type_count, Ordering::Relaxed);
+                        }
+                        if let Err(e) = dispatch_result {
+                            error!(
+                                "Inserter {} failed to insert dispatch sites: {}",
+                                inserter_id, e
+                            );
+                            insertion_successful = false;
+                        }
+                        if let Err(e) = registration_result {
+                            error!(
+                                "Inserter {} failed to insert registrations: {}",
+                                inserter_id, e
+                            );
+                            insertion_successful = false;
                         }
                         if let Err(e) = processed_files_result {
                             error!(
@@ -904,7 +956,13 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
                         let func_count = batch.functions.len();
                         let type_count = batch.types.len();
 
-                        let (func_result, type_result, processed_files_result) = tokio::join!(
+                        let (
+                            func_result,
+                            type_result,
+                            dispatch_result,
+                            registration_result,
+                            processed_files_result,
+                        ) = tokio::join!(
                             async {
                                 if !batch.functions.is_empty() {
                                     db_manager_clone.insert_functions(batch.functions).await
@@ -915,6 +973,24 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
                             async {
                                 if !batch.types.is_empty() {
                                     db_manager_clone.insert_types(batch.types).await
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                            async {
+                                if !batch.dispatch_sites.is_empty() {
+                                    db_manager_clone
+                                        .insert_dispatch_sites(batch.dispatch_sites)
+                                        .await
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                            async {
+                                if !batch.registrations.is_empty() {
+                                    db_manager_clone
+                                        .insert_registrations(batch.registrations)
+                                        .await
                                 } else {
                                     Ok(())
                                 }
@@ -942,6 +1018,20 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
                             insertion_successful = false;
                         } else {
                             types_counter.fetch_add(type_count, Ordering::Relaxed);
+                        }
+                        if let Err(e) = dispatch_result {
+                            error!(
+                                "Inserter {} failed to insert dispatch sites: {}",
+                                inserter_id, e
+                            );
+                            insertion_successful = false;
+                        }
+                        if let Err(e) = registration_result {
+                            error!(
+                                "Inserter {} failed to insert registrations: {}",
+                                inserter_id, e
+                            );
+                            insertion_successful = false;
                         }
                         if let Err(e) = processed_files_result {
                             error!(
@@ -1025,13 +1115,12 @@ pub async fn process_git_tree(
 
     let start_time = std::time::Instant::now();
 
-    // Get already processed files from database for deduplication
+    // Get already processed files from database for deduplication. A row
+    // written by an older extractor does not qualify: the file has not
+    // changed, the reading of it has, so it is absent from this set and gets
+    // read again on its own account.
     info!("Loading processed files from database for deduplication");
-    let processed_files_records = db_manager.get_all_processed_files().await?;
-    let processed_files: HashSet<String> = processed_files_records
-        .into_iter()
-        .map(|record| record.git_file_sha)
-        .collect();
+    let processed_files: HashSet<String> = db_manager.processed_by_this_extractor().await?;
 
     info!(
         "Found {} already processed files in database",
@@ -1097,6 +1186,21 @@ pub async fn process_git_tree(
         }
     }
 
+    // The whole tree has been read with this build, so a file still recorded
+    // against an older extractor is content the tree no longer holds. Left in
+    // place it keeps the index answering "older than this build" for ever, so
+    // re-indexing never clears the refusal it is meant to clear.
+    match db_manager.forget_older_processed_files().await {
+        Ok(0) => {}
+        Ok(forgotten) => info!("Forgot {forgotten} files read by an older extractor"),
+        Err(e) => error!("Failed to forget files read by an older extractor: {e}"),
+    }
+
+    // The index now holds what this version writes, for the extensions it was
+    // told to read. Recorded last: an interrupted run leaves the older version
+    // in place and is re-read next time.
+    db_manager.record_index_build(extensions, no_macros).await?;
+
     Ok(())
 }
 
@@ -1118,13 +1222,11 @@ pub async fn process_git_range(
 
     let start_time = std::time::Instant::now();
 
-    // Step 1: Get already processed files from database for deduplication
+    // Step 1: Get already processed files from database for deduplication. As
+    // in the tree path, a row written by an older extractor does not count as
+    // processed: the file has not changed, the reading of it has.
     info!("Loading processed files from database for deduplication");
-    let processed_files_records = db_manager.get_all_processed_files().await?;
-    let processed_files: HashSet<String> = processed_files_records
-        .into_iter()
-        .map(|record| record.git_file_sha)
-        .collect();
+    let processed_files: HashSet<String> = db_manager.processed_by_this_extractor().await?;
 
     info!(
         "Found {} already processed files in database",
@@ -1261,6 +1363,9 @@ pub async fn process_git_range(
             error!("Failed to check database health: {}", e);
         }
     }
+
+    // Do not write a database version. Part of the database was updated here,
+    // but other parts could have been written by an older version of semcode.
 
     Ok(())
 }

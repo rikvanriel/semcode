@@ -36,6 +36,14 @@ fn print_command_help() {
         "calls".yellow()
     );
     println!(
+        "  {} <type>.<member>  - Show functions installed in a struct member",
+        "implementors".yellow()
+    );
+    println!(
+        "  {} <name>     - Show where <name> is installed as a callback",
+        "registrations".yellow()
+    );
+    println!(
         "  {} <name>           - Show complete callchain for <name>",
         "callchain".yellow()
     );

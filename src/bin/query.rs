@@ -80,6 +80,102 @@ struct Args {
     /// Disable working directory overlay (only query committed code)
     #[arg(long)]
     git_only: bool,
+
+    /// Rebuild the index in place when it was written by an older semcode,
+    /// instead of refusing. Reads the whole tree, which takes as long as
+    /// indexing it did, and writes to the database.
+    #[arg(long)]
+    reindex_if_stale: bool,
+}
+
+/// What to do about an index written before this build.
+///
+/// Answering from it is the one thing not on the list. It holds whatever the
+/// older extractor knew, so a query returns fewer callers, fewer
+/// registrations, no receiver types — an answer shaped exactly like a real
+/// one. Refusing costs a command; answering costs the reader's trust in every
+/// answer they already acted on.
+async fn refuse_or_rebuild_stale_index(
+    db_manager: &Arc<DatabaseManager>,
+    database_path: &str,
+    git_repo: &str,
+    rebuild: bool,
+) -> Result<()> {
+    if !db_manager.index_predates_reader().await? {
+        return Ok(());
+    }
+
+    let written_by = db_manager.stored_schema_version().await?.unwrap_or(0);
+    let current = semcode::SCHEMA_VERSION;
+
+    if !rebuild {
+        // The command has to be one the reader can paste, so the paths are
+        // absolute: the database is often given relative to a directory the
+        // reader is not standing in.
+        let tree = std::fs::canonicalize(git_repo)
+            .unwrap_or_else(|_| std::path::PathBuf::from(git_repo))
+            .display()
+            .to_string();
+        let database = std::path::Path::new(database_path)
+            .parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok())
+            .map(|parent| parent.display().to_string())
+            .unwrap_or_else(|| tree.clone());
+
+        anyhow::bail!(
+            "{}",
+            [
+                format!(
+                    "this index was written by an older semcode (version {written_by}; \
+                     this build writes {current})."
+                ),
+                "It does not hold everything this build extracts, so answers from it would"
+                    .to_string(),
+                "be incomplete without saying so.".to_string(),
+                String::new(),
+                "Rebuild it with:".to_string(),
+                String::new(),
+                format!("    semcode-index -s {tree} -d {database}"),
+                String::new(),
+                "or pass --reindex-if-stale to rebuild it now.".to_string(),
+            ]
+            .join("\n")
+        );
+    }
+
+    // Whichever tree the caller pointed at is the one that gets indexed, and
+    // it need not be the one the index was built from. That is why this is
+    // asked for rather than done by default.
+    // Rebuild with the options the index records. An index too old to record
+    // them gets the indexer's defaults, said out loud: rebuilding a `c,h`
+    // index as `c,h,rs` is not what the reader asked for, and finding that
+    // out from the output beats finding it out from a wrong answer later.
+    let (extensions, no_macros) = match db_manager.recorded_index_options().await? {
+        Some(recorded) => recorded,
+        None => {
+            println!(
+                "Index does not record how it was built; using defaults (c,h,rs, macros indexed)"
+            );
+            (
+                vec!["c".to_string(), "h".to_string(), "rs".to_string()],
+                false,
+            )
+        }
+    };
+
+    println!("Index was written by an older semcode: reading {git_repo} again");
+    let repo = gix::discover(git_repo).map_err(|e| anyhow::anyhow!("not a git repository: {e}"))?;
+    let head = repo.head_commit()?.id().to_string();
+
+    semcode::git_range::process_git_tree(
+        &std::path::PathBuf::from(git_repo),
+        &head,
+        &extensions,
+        db_manager.clone(),
+        no_macros,
+        2,
+    )
+    .await
 }
 
 /// Check if the current commit needs indexing and perform incremental indexing if needed
@@ -239,6 +335,14 @@ async fn main() -> Result<()> {
 
     // Ensure tables exist
     db_manager.create_tables().await?;
+
+    refuse_or_rebuild_stale_index(
+        &db_manager,
+        &database_path,
+        &args.git_repo,
+        args.reindex_if_stale,
+    )
+    .await?;
 
     // Handle --diffinfo flag: process diff and exit
     if let Some(file_path) = args.diffinfo {

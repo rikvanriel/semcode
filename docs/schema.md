@@ -38,6 +38,9 @@ The database consists of the following tables:
 9. **lore_vectors** - Vector embeddings for semantic search of lore emails
 10. **indexed_branches** - Tracks which git branches have been indexed with their tip commits
 11. **content_0 through content_15** - Deduplicated content storage (16 shards)
+12. **dispatch_sites** - Calls that go through a value rather than naming a function
+13. **registrations** - Functions installed in a struct member
+14. **schema_meta** - What wrote the index
 
 ## Table Schemas
 
@@ -159,12 +162,17 @@ Tracks which files have been processed for incremental indexing.
 file                (Utf8, NOT NULL)     - File path
 git_sha             (Utf8, nullable)     - Git commit SHA as hex string (for incremental processing)
 git_file_sha        (Utf8, NOT NULL)     - SHA-1 hash of specific file content as hex string
+extractor_version   (Int64, nullable)    - Schema version of the extractor that read the file
 ```
 
 **Notes:**
 - Enables incremental processing by tracking which files have been analyzed
 - `git_sha` tracks the commit context for git-range based indexing
 - `git_file_sha` provides content-based deduplication
+- `extractor_version` decides whether the file has to be read again: unchanged
+  content is skipped only when the extractor that read it is the one running
+  now. Absent on rows written before the column existed, which is why such a
+  table is recreated rather than migrated in place
 
 **Indices:**
 - BTree on `file` (fast file lookups)
@@ -411,6 +419,85 @@ content             (Utf8, NOT NULL)     - The actual content (function bodies, 
 **Indices (per shard):**
 - BTree on `blake3_hash` (primary key for deduplication and fast lookups)
 - BTree on `content` (text searches and pattern matching)
+
+### 12. dispatch_sites
+
+Calls that dispatch through a value rather than naming a function:
+`ops->read(...)`, `(*fp)(...)`, a candidate named by an indirect-call macro.
+A site records what the containing file proves and nothing more; the
+candidates come from joining it against `registrations` at query time.
+
+**Schema:**
+```
+caller_name         (Utf8, NOT NULL)     - Function containing the site, empty when there is none
+file_path           (Utf8, NOT NULL)     - File containing the site
+git_file_hash       (Utf8, NOT NULL)     - Content hash of that file
+byte_start          (Int64, NOT NULL)    - Byte offset of the site within the file
+line                (Int64, NOT NULL)    - Line of the site
+member              (Utf8, NOT NULL)     - Member dispatched through, empty for a plain pointer call
+receiver_expr       (Utf8, nullable)     - Receiver as written
+receiver_type       (Utf8, nullable)     - Type of the receiver, when the file declares it
+receiver_base_type  (Utf8, nullable)     - For `base->field->m()`, the type of the base
+receiver_field      (Utf8, nullable)     - For `base->field->m()`, the field read from it
+kind                (Utf8, NOT NULL)     - member_arrow, member_dot, pointer_param, pointer_local,
+                                           pointer_deref, macro_declared
+target              (Utf8, NOT NULL)     - A target the site names itself, empty otherwise
+```
+
+**Notes:**
+- `receiver_base_type` and `receiver_field` are set together, and only when
+  the receiver is one field step from a declared name. Resolution turns the
+  pair into a receiver type against the `types` table, which is a cross-file
+  lookup and so cannot happen while parsing
+- A site is keyed by `(file_path, git_file_hash, byte_start, target)`, so
+  re-indexing unchanged content merges rather than duplicates
+
+**Indices:**
+- BTree on `member`, `target` and `caller_name`
+
+### 13. registrations
+
+Functions installed in a struct member: `.read = my_read`, or
+`ops->handler = my_handler`. The other half of the join.
+
+**Schema:**
+```
+container_type      (Utf8, NOT NULL)     - Struct or union the member belongs to
+member              (Utf8, NOT NULL)     - Member being installed into
+target              (Utf8, NOT NULL)     - What is installed, as written
+file_path           (Utf8, NOT NULL)     - File containing the registration
+git_file_hash       (Utf8, NOT NULL)     - Content hash of that file
+byte_start          (Int64, NOT NULL)    - Byte offset within the file
+line                (Int64, NOT NULL)    - Line of the registration
+enclosing_function  (Utf8, NOT NULL)     - Function containing it, empty at file scope
+kind                (Utf8, NOT NULL)     - designated_init or assignment
+```
+
+**Notes:**
+- The target is recorded as written, so a member set to a constant is stored
+  too; the join against known functions filters those without a separate rule
+- An initializer whose container type the file does not state is skipped
+  rather than guessed at
+
+**Indices:**
+- BTree on `target`, `member` and `container_type`
+
+### 14. schema_meta
+
+What wrote the index.
+
+**Schema:**
+```
+key                 (Utf8, NOT NULL)     - schema_version, created
+value               (Utf8, NOT NULL)     - The value
+```
+
+**Notes:**
+- `schema_version` is bumped when the meaning of stored data changes, not
+  when its shape does. A reader that finds an older version refuses rather
+  than answering from rows that predate what it extracts
+- Which rows were indexed under which rules is a per-file question, answered
+  by `processed_files.extractor_version` rather than here
 
 ## Key Features
 

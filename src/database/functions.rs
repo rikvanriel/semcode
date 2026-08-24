@@ -32,6 +32,38 @@ pub struct FunctionStore {
     content_store: ContentStore,
 }
 
+/// Keep one row per merge key.
+///
+/// A file can define the same name twice — the same static inline under two
+/// preprocessor branches, or a macro defined once per configuration — and the
+/// extractor records both. Merging a batch that holds two rows for one key is
+/// rejected outright by lance, which fails the whole batch and loses every
+/// function in it, so the choice has to be made here. The first definition in
+/// the file wins, which is stable across runs.
+fn one_per_key(functions: &[FunctionInfo]) -> Vec<FunctionInfo> {
+    let mut seen = std::collections::HashSet::new();
+    let mut kept = Vec::with_capacity(functions.len());
+    for function in functions {
+        let key = (
+            function.name.clone(),
+            function.file_path.clone(),
+            function.git_file_hash.clone(),
+        );
+        if seen.insert(key) {
+            kept.push(function.clone());
+        }
+    }
+
+    if kept.len() != functions.len() {
+        tracing::debug!(
+            "dropped {} duplicate definitions within one batch",
+            functions.len() - kept.len()
+        );
+    }
+
+    kept
+}
+
 impl FunctionStore {
     pub fn new(connection: Connection) -> Self {
         let content_store = ContentStore::new(connection.clone());
@@ -67,6 +99,7 @@ impl FunctionStore {
         let table = self.connection.open_table("functions").execute().await?;
 
         // Process in optimal batch sizes
+        let filtered_functions = one_per_key(&filtered_functions);
         for chunk in filtered_functions.chunks(OPTIMAL_BATCH_SIZE) {
             self.insert_chunk(&table, chunk).await?;
         }
@@ -82,6 +115,7 @@ impl FunctionStore {
         let table = self.connection.open_table("functions").execute().await?;
 
         // Process in optimal batch sizes
+        let functions = one_per_key(&functions);
         for chunk in functions.chunks(OPTIMAL_BATCH_SIZE) {
             self.insert_metadata_chunk(&table, chunk).await?;
         }
@@ -564,7 +598,7 @@ impl FunctionStore {
         let calls = if calls_array.is_null(row) {
             None
         } else {
-            serde_json::from_str::<Vec<String>>(calls_array.value(row)).ok()
+            Some(crate::database::parse_call_list(calls_array.value(row))?)
         };
 
         let types = if types_array.is_null(row) {
@@ -654,32 +688,58 @@ impl FunctionStore {
         Ok(functions)
     }
 
-    /// Get functions by a list of names (batch lookup) - optimized to minimize content queries
+    /// Get functions by a list of names (batch lookup) - optimized to minimize content
+    /// queries. A name maps to every definition carrying it, since C statics in different
+    /// files, and same-named definitions generally, are distinct functions.
     pub async fn get_by_names(
         &self,
         names: &[String],
-    ) -> Result<std::collections::HashMap<String, FunctionInfo>> {
+    ) -> Result<std::collections::HashMap<String, Vec<FunctionInfo>>> {
         if names.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
 
+        let (all_function_data, all_body_hashes) = self.fetch_metadata_by_names(names).await?;
+        let content_map = self.fetch_bodies_for_hashes(all_body_hashes).await?;
+
+        let mut result: std::collections::HashMap<String, Vec<FunctionInfo>> =
+            std::collections::HashMap::new();
+        for func_data in all_function_data {
+            let name = func_data.name.clone();
+            result
+                .entry(name)
+                .or_default()
+                .push(Self::metadata_into_function(func_data, &content_map));
+        }
+
+        Ok(result)
+    }
+
+    /// Build a `name IN (...)` filter for one chunk of names.
+    fn name_in_filter(names: &[String]) -> String {
+        let name_list = names
+            .iter()
+            .map(|name| format!("'{}'", name.replace("'", "''")))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        format!("name IN ({name_list})")
+    }
+
+    /// Fetch metadata for every row whose name is in `names`, along with the
+    /// set of body hashes those rows reference.
+    async fn fetch_metadata_by_names(
+        &self,
+        names: &[String],
+    ) -> Result<(Vec<FunctionMetadata>, std::collections::HashSet<String>)> {
         let table = self.connection.open_table("functions").execute().await?;
         let mut all_function_data = Vec::new();
         let mut all_body_hashes = std::collections::HashSet::new();
 
-        // Step 1: Fetch all function metadata and collect unique body hashes
         for chunk in names.chunks(100) {
-            let name_list = chunk
-                .iter()
-                .map(|name| format!("'{}'", name.replace("'", "''")))
-                .collect::<Vec<_>>()
-                .join(",");
-
-            let filter = format!("name IN ({name_list})");
-
             let results = table
                 .query()
-                .only_if(filter)
+                .only_if(Self::name_in_filter(chunk))
                 .execute()
                 .await?
                 .try_collect::<Vec<_>>()
@@ -689,7 +749,6 @@ impl FunctionStore {
                 for i in 0..batch.num_rows() {
                     if let Ok(Some(func_data)) = self.extract_function_metadata_from_batch(batch, i)
                     {
-                        // Collect body hash if not null
                         if let Some(ref body_hash) = func_data.body_hash {
                             all_body_hashes.insert(body_hash.clone());
                         }
@@ -699,38 +758,43 @@ impl FunctionStore {
             }
         }
 
-        // Step 2: Bulk fetch all content for the collected hashes
-        let content_map = if !all_body_hashes.is_empty() {
-            let hash_vec: Vec<String> = all_body_hashes.into_iter().collect();
-            self.bulk_get_content(&hash_vec).await?
-        } else {
-            std::collections::HashMap::new()
-        };
+        Ok((all_function_data, all_body_hashes))
+    }
 
-        // Step 3: Reconstruct FunctionInfo objects with content
-        let mut result = std::collections::HashMap::new();
-        for func_data in all_function_data {
-            let body = match func_data.body_hash {
-                Some(hash) => content_map.get(&hash).cloned().unwrap_or_default(),
-                None => String::new(),
-            };
-
-            let function_info = FunctionInfo {
-                name: func_data.name.clone(),
-                file_path: func_data.file_path,
-                git_file_hash: func_data.git_file_hash,
-                line_start: func_data.line_start,
-                line_end: func_data.line_end,
-                return_type: func_data.return_type,
-                parameters: func_data.parameters,
-                body,
-                calls: func_data.calls,
-                types: func_data.types,
-            };
-
-            result.insert(func_data.name, function_info);
+    /// Bulk fetch the bodies for a set of content hashes.
+    async fn fetch_bodies_for_hashes(
+        &self,
+        hashes: std::collections::HashSet<String>,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        if hashes.is_empty() {
+            return Ok(std::collections::HashMap::new());
         }
 
-        Ok(result)
+        let hash_vec: Vec<String> = hashes.into_iter().collect();
+        self.bulk_get_content(&hash_vec).await
+    }
+
+    /// Attach the body to one metadata row.
+    fn metadata_into_function(
+        func_data: FunctionMetadata,
+        content_map: &std::collections::HashMap<String, String>,
+    ) -> FunctionInfo {
+        let body = match func_data.body_hash {
+            Some(hash) => content_map.get(&hash).cloned().unwrap_or_default(),
+            None => String::new(),
+        };
+
+        FunctionInfo {
+            name: func_data.name,
+            file_path: func_data.file_path,
+            git_file_hash: func_data.git_file_hash,
+            line_start: func_data.line_start,
+            line_end: func_data.line_end,
+            return_type: func_data.return_type,
+            parameters: func_data.parameters,
+            body,
+            calls: func_data.calls,
+            types: func_data.types,
+        }
     }
 }

@@ -37,6 +37,17 @@ function-like macros.
   - name: type/typedef name or regex
 **find_callers**: find callers (functions or macros) of the named entity
   - name: function or macro to search
+  - also reports callers that reach it through a function pointer, with the
+    evidence for each: a site that names it outright, or a member it is
+    installed in whose receiver has the matching type. Sites that match on
+    member name alone are reported as a count, not as answers
+**find_implementors**: functions installed in a struct member
+  - container_type: struct or typedef name, e.g. `file_operations`
+  - member: member name, e.g. `read`
+  - answers "what can be called here?" for a dispatch through that member
+**find_registrations**: where a function is installed as a callback
+  - name: function to search
+  - answers "who can reach this?", the reverse of find_implementors
 **find_calls**: find callees (functions or macros) of the named entity
   - name: function or macro to search
 **find_callchain**: complete call chain (forward and reverse)

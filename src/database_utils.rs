@@ -60,13 +60,22 @@ pub fn process_database_path(database_arg: Option<&str>, source_dir: Option<&Pat
 fn resolve_path(path: &str) -> String {
     let path_obj = Path::new(path);
 
-    if path.ends_with(".semcode.db") {
+    if path.ends_with(".semcode.db") || is_database(path_obj) {
         path.to_string()
-    } else if path_obj.is_dir() {
-        path_obj.join(".semcode.db").to_string_lossy().to_string()
     } else {
-        path.to_string()
+        path_obj.join(".semcode.db").to_string_lossy().to_string()
     }
+}
+
+/// Whether a path is itself a database rather than a directory holding one.
+///
+/// Asked of what is on disk, so that one argument names one database whatever
+/// order the commands run in. Deciding on whether the directory merely exists
+/// splits it in two: `-d dir` writes the database at `dir` when nothing is
+/// there yet, and every later command reads `dir/.semcode.db`, which is
+/// empty, so a freshly written index answers every query with "not found".
+fn is_database(path: &Path) -> bool {
+    path.join("functions.lance").exists()
 }
 
 #[cfg(test)]
@@ -80,20 +89,18 @@ mod tests {
 
     #[test]
     fn test_process_database_path_with_explicit_path() {
-        // Test with explicit file path
-        let result = process_database_path(Some("/path/to/my.db"), None);
-        assert_eq!(result, "/path/to/my.db");
+        // A path naming the database itself is used as given.
+        let result = process_database_path(Some("/path/to/.semcode.db"), None);
+        assert_eq!(result, "/path/to/.semcode.db");
     }
 
     #[test]
     fn test_process_database_path_with_directory() {
-        // Test with directory - should append .semcode.db
-        // Note: In a real test environment, we'd need to create actual directories
-        // For now, we test the logic with a hypothetical directory
+        // Anything else names a directory to hold one, whether or not it is
+        // there yet: the indexer creates it, and a later query must be told
+        // the same place.
         let result = process_database_path(Some("/existing/dir"), None);
-        // This would be "/existing/dir/.semcode.db" if the directory exists
-        // For this unit test, it will treat it as a file since we don't have real filesystem
-        assert_eq!(result, "/existing/dir");
+        assert_eq!(result, "/existing/dir/.semcode.db");
     }
 
     #[test]
@@ -187,5 +194,42 @@ mod tests {
             Some(v) => std::env::set_var("SEMCODE_DB", v),
             None => std::env::remove_var("SEMCODE_DB"),
         }
+    }
+}
+
+#[cfg(test)]
+mod one_argument_one_database {
+    use super::*;
+
+    #[test]
+    fn a_directory_that_does_not_exist_yet_holds_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("index");
+        assert_eq!(
+            resolve_path(fresh.to_str().unwrap()),
+            fresh.join(".semcode.db").to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn the_same_argument_names_the_same_database_once_it_exists() {
+        // What the indexer wrote is what a later query must read.
+        let dir = tempfile::tempdir().unwrap();
+        let arg = dir.path().join("index");
+        let written = resolve_path(arg.to_str().unwrap());
+        std::fs::create_dir_all(&written).unwrap();
+        std::fs::create_dir_all(Path::new(&written).join("functions.lance")).unwrap();
+
+        assert_eq!(resolve_path(arg.to_str().unwrap()), written);
+    }
+
+    #[test]
+    fn a_database_written_at_the_path_itself_is_read_there() {
+        // Databases already written this way keep working.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("functions.lance")).unwrap();
+        let arg = dir.path().to_str().unwrap();
+
+        assert_eq!(resolve_path(arg), arg);
     }
 }

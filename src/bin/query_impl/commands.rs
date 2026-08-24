@@ -7,7 +7,9 @@ use regex;
 use semcode::{git, DatabaseManager, LoreEmailFilters};
 
 use owo_colors::OwoColorize as _;
-use semcode::callchain::{find_all_paths, show_callees, show_callers};
+use semcode::callchain::{
+    find_all_paths, show_callees, show_callers, show_implementors, show_registrations,
+};
 use semcode::display::print_help;
 use semcode::file_survey::survey_file_json_with_references;
 use semcode::lore_writers::{
@@ -236,6 +238,28 @@ async fn show_callchain_with_limits(
         .get_function_callees_git_aware(function_name, git_sha)
         .await?;
 
+    // A function reached only through a pointer has no direct callers, so
+    // without this the reverse side is silent about it while `callers`
+    // answers from the same index.
+    let reached_through_pointer = if up_levels > 0 {
+        let mut out = std::io::stdout();
+        semcode::callchain::write_indirect_reverse_chain(
+            db,
+            function_name,
+            git_sha,
+            up_levels.saturating_sub(1),
+            if calls_limit == 0 {
+                usize::MAX
+            } else {
+                calls_limit
+            },
+            &mut out,
+        )
+        .await?
+    } else {
+        0
+    };
+
     // Show callers with depth and limit control
     if !callers.is_empty() && up_levels > 0 {
         println!(
@@ -358,12 +382,64 @@ async fn show_callchain_with_limits(
         }
     }
 
+    // Where the chain leaves by a member rather than by name. Without this
+    // the chain simply stops: svc_handle_xprt appears with its callees and
+    // nothing says that the work happens in whatever is installed in
+    // svc_xprt_ops::xpo_recvfrom.
+    let mut reachable: Vec<String> = vec![function_name.to_string()];
+    reachable.extend(callees.iter().cloned());
+    let dispatched = db.resolve_dispatches_in(&reachable, git_sha).await?;
+
+    if !dispatched.is_empty() {
+        println!("\n{}", "=== Dispatches ===".bold().blue());
+
+        for from in &reachable {
+            let Some(sites) = dispatched.get(from) else {
+                continue;
+            };
+
+            for site in sites {
+                let where_ = format!("{}:{}", site.file_path, site.line);
+                println!(
+                    "{} {}->{} ({})",
+                    if from == function_name {
+                        from.cyan().to_string()
+                    } else {
+                        from.bright_black().to_string()
+                    },
+                    site.receiver_expr.bright_black(),
+                    site.member.cyan(),
+                    where_.bright_black()
+                );
+
+                for target in site.targets.iter().take(3) {
+                    println!("   └─ {}", target.yellow());
+                }
+                if site.targets.len() > 3 {
+                    println!(
+                        "   └─ {} more of {} installed in {}::{}, see `implementors {}.{}`",
+                        (site.targets.len() - 3).to_string().yellow(),
+                        site.targets.len(),
+                        site.container_type,
+                        site.member,
+                        site.container_type,
+                        site.member
+                    );
+                }
+            }
+        }
+    }
+
     // Summary
     println!("\n{}", "=== Summary ===".bold().green());
     println!("Total direct callers: {}", callers.len());
     println!("Total direct callees: {}", callees.len());
 
-    if callers.is_empty() && callees.is_empty() {
+    if reached_through_pointer > 0 {
+        println!("Dispatching sites that reach it: {reached_through_pointer}");
+    }
+
+    if callers.is_empty() && callees.is_empty() && reached_through_pointer == 0 {
         println!(
             "{} This function is isolated (no callers or callees)",
             "Info:".yellow()
@@ -1078,6 +1154,54 @@ pub async fn handle_command(
             } else {
                 let name = parsed_parts[1..].join(" ");
                 show_callers(db, &name, verbose, &git_sha).await?;
+            }
+        }
+        "implementors" => {
+            let (parsed_parts, _verbose) = parse_verbose_flag(&parts);
+
+            // `type.member`, or the two written separately.
+            let slot: Option<(String, String)> = match parsed_parts.len() {
+                2 => parsed_parts[1]
+                    .split_once('.')
+                    .map(|(t, m)| (t.to_string(), m.to_string())),
+                3 => Some((parsed_parts[1].to_string(), parsed_parts[2].to_string())),
+                _ => None,
+            };
+
+            match slot {
+                Some((container_type, member))
+                    if !container_type.is_empty() && !member.is_empty() =>
+                {
+                    // `struct file_operations` and `file_operations` name the
+                    // same type; registrations are keyed by the bare name.
+                    let container_type = container_type
+                        .strip_prefix("struct ")
+                        .unwrap_or(&container_type)
+                        .to_string();
+                    show_implementors(db, &container_type, &member, &git_sha).await?;
+                }
+                _ => {
+                    println!(
+                        "{}",
+                        "Usage: implementors [--git <sha>] <type>.<member>".red()
+                    );
+                    println!("  Show the functions installed in a struct member");
+                    println!("  Example: implementors file_operations.read");
+                }
+            }
+        }
+        "registrations" => {
+            let (parsed_parts, _verbose) = parse_verbose_flag(&parts);
+
+            if parsed_parts.len() < 2 {
+                println!(
+                    "{}",
+                    "Usage: registrations [--git <sha>] <function_name>".red()
+                );
+                println!("  Show the struct members a function is installed in");
+            } else {
+                let name = parsed_parts[1..].join(" ");
+                show_registrations(db, &name, &git_sha).await?;
             }
         }
         "calls" => {
