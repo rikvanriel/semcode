@@ -318,7 +318,9 @@ impl WorkdirIndex {
                 content_hash,
                 source_root,
             ) {
-                Ok((file_functions, file_types, file_macros)) => {
+                Ok(analysis) => {
+                    let (file_functions, file_types, file_macros) =
+                        (analysis.functions, analysis.types, analysis.macros);
                     // Update the cache entry with analysis results
                     if let Some(entry) = file_cache.get_mut(rel_path) {
                         entry.functions = file_functions.clone();

@@ -782,6 +782,14 @@ async fn run_branch_indexing(args: Args, branches: Vec<semcode::git::BranchRef>)
     let mut branches_indexed = 0;
     let mut branches_skipped = 0;
 
+    let stale_index = db_manager.index_predates_reader().await?;
+    if stale_index {
+        println!(
+            "{} Index was written by an older semcode: reading every file again",
+            "→".yellow()
+        );
+    }
+
     for branch in &branches {
         let branch_name = &branch.name;
         let tip_commit = &branch.tip_commit;
@@ -795,6 +803,7 @@ async fn run_branch_indexing(args: Args, branches: Vec<semcode::git::BranchRef>)
 
         // Check if branch is already indexed at current tip (if --update-branches)
         if args.update_branches
+            && !stale_index
             && db_manager
                 .is_branch_current(branch_name, tip_commit)
                 .await?
@@ -814,8 +823,18 @@ async fn run_branch_indexing(args: Args, branches: Vec<semcode::git::BranchRef>)
             .map(|s| s.trim().to_string())
             .collect();
 
+        // An index written before this build does not hold what this build
+        // extracts, however current its recorded tip is. Indexing the commits
+        // since that tip would add nothing: the files have not changed, and
+        // it is the extractor that has. Read the tree again instead.
+        let indexed_tip = if stale_index {
+            None
+        } else {
+            db_manager.get_branch_tip(branch_name).await?
+        };
+
         // Check if this is initial or incremental indexing
-        if let Some(indexed_tip) = db_manager.get_branch_tip(branch_name).await? {
+        if let Some(indexed_tip) = indexed_tip {
             // Incremental indexing: commits from last indexed tip to current tip
             let range = format!("{}..{}", indexed_tip, tip_commit);
             info!("Incremental indexing: {} for branch {}", range, branch_name);
@@ -1537,17 +1556,44 @@ async fn run_pipeline(args: Args) -> Result<()> {
             }
         };
 
-        // Use git range processing for all modes (both explicit --git and auto-detected HEAD)
-        info!("Running git commit-based indexing for: {}", git_range);
-        semcode::git_range::process_git_range(
-            &args.source,
-            &git_range,
-            &extensions,
-            db_manager.clone(),
-            args.no_macros,
-            args.db_threads,
-        )
-        .await?;
+        // An index written by an older semcode holds rows that no commit
+        // range will refresh: the files have not changed, so a range covers
+        // none of them. Read the whole tree instead — but only when the
+        // caller did not name a range. `--git A..B` asks a question, and
+        // answering a different one without saying so is the behaviour this
+        // series exists to remove.
+        if args.git.is_none() && db_manager.index_predates_reader().await? {
+            let repo = gix::discover(&args.source)
+                .map_err(|e| anyhow::anyhow!("Not in a git repository: {}", e))?;
+            let head = repo.head_commit()?.id().to_string();
+
+            println!(
+                "{} Index was written by an older semcode: reading the tree at {} again",
+                "→".yellow(),
+                &head[..8.min(head.len())]
+            );
+            semcode::git_range::process_git_tree(
+                &args.source,
+                &head,
+                &extensions,
+                db_manager.clone(),
+                args.no_macros,
+                args.db_threads,
+            )
+            .await?;
+        } else {
+            // Use git range processing for all modes (both explicit --git and auto-detected HEAD)
+            info!("Running git commit-based indexing for: {}", git_range);
+            semcode::git_range::process_git_range(
+                &args.source,
+                &git_range,
+                &extensions,
+                db_manager.clone(),
+                args.no_macros,
+                args.db_threads,
+            )
+            .await?;
+        }
     } else {
         println!("Skipping source indexing - vectorization only mode");
     }

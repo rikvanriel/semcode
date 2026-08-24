@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-use anyhow::Result;
+use anyhow::{Context, Result};
 use arrow::array::Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -20,6 +20,17 @@ pub enum OptimizeOutcome {
     /// Optimization was attempted but one or more operations failed
     PartialFailure,
 }
+
+/// Bumped when the meaning of stored data changes, not merely its shape: a
+/// reader that does not understand a version must refuse rather than guess.
+///
+/// 2: dispatch sites and registrations, receiver types, calls and facts from
+///    macro bodies. An index written by version 1 holds none of them for a
+///    file it has already seen.
+/// 3: `receiver_field` holds the whole path of fields a receiver reads, not
+///    only the first, so `a->b->c->m()` resolves. A version 2 row holds one
+///    field where this reads a path.
+pub const SCHEMA_VERSION: u32 = 3;
 
 pub struct SchemaManager {
     connection: Connection,
@@ -47,10 +58,29 @@ impl SchemaManager {
 
         if !table_names.iter().any(|n| n == "processed_files") {
             self.create_processed_files_table().await?;
+        } else {
+            self.migrate_processed_files_table().await?;
         }
 
         if !table_names.iter().any(|n| n == "symbol_filename") {
             self.create_symbol_filename_table().await?;
+        }
+
+        if !table_names.iter().any(|n| n == "dispatch_sites") {
+            self.create_dispatch_sites_table().await?;
+        }
+
+        if !table_names.iter().any(|n| n == "registrations") {
+            self.create_registrations_table().await?;
+        }
+
+        if !table_names.iter().any(|n| n == "schema_meta") {
+            // An index that already holds functions was written before this
+            // table existed, so it was written by something older. Stamping
+            // it with the current version here would claim it holds what this
+            // build writes, and nothing would ever re-read it.
+            let preexisting = table_names.iter().any(|n| n == "functions");
+            self.create_schema_meta_table_for(preexisting).await?;
         }
 
         if !table_names.iter().any(|n| n == "git_commits") {
@@ -105,6 +135,222 @@ impl SchemaManager {
             .create_table("functions", vec![empty_batch])
             .execute()
             .await?;
+
+        Ok(())
+    }
+
+    /// Calls that dispatch through a value: `ops->read(...)` and friends. The
+    /// candidate targets are resolved by joining against the functions
+    /// installed in that slot, so only what the containing file proves is
+    /// stored here.
+    pub async fn create_dispatch_sites_table(&self) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            // Empty when the site is not inside a function at all: Python
+            // module level and class bodies, C++ and Rust static
+            // initializers. Empty rather than null, because that is what the
+            // extractor writes and what every reader expects; file_path and
+            // line always locate the site either way.
+            Field::new("caller_name", DataType::Utf8, false),
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("git_file_hash", DataType::Utf8, false),
+            // Byte offset of the site: unique within a file, stable across a
+            // reindex of unchanged content, so a re-merge is idempotent.
+            Field::new("byte_start", DataType::Int64, false),
+            Field::new("line", DataType::Int64, false),
+            Field::new("member", DataType::Utf8, false),
+            Field::new("receiver_expr", DataType::Utf8, true),
+            Field::new("receiver_type", DataType::Utf8, true),
+            Field::new("receiver_base_type", DataType::Utf8, true),
+            Field::new("receiver_field", DataType::Utf8, true),
+            Field::new("kind", DataType::Utf8, false),
+            // Part of the merge key, so it carries "" rather than null: a
+            // null key column matches nothing and the row is dropped.
+            Field::new("target", DataType::Utf8, false),
+        ]));
+
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+
+        let table = self
+            .connection
+            .create_table("dispatch_sites", vec![empty_batch])
+            .execute()
+            .await?;
+
+        // Indices belong with the table, not in create_scalar_indices(): that
+        // one returns as soon as the database holds rows, so anything added
+        // there reaches neither an existing index nor a fresh one, which
+        // fills before it runs.
+        for (columns, what) in [
+            (["member"], "BTree index on dispatch_sites.member"),
+            (["target"], "BTree index on dispatch_sites.target"),
+            (["caller_name"], "BTree index on dispatch_sites.caller_name"),
+        ] {
+            self.try_create_index(&table, &columns, what).await;
+        }
+
+        Ok(())
+    }
+
+    /// Functions installed in struct members: `.read = my_read`. Resolution
+    /// joins these against the members dispatch sites go through.
+    pub async fn create_registrations_table(&self) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("container_type", DataType::Utf8, false),
+            Field::new("member", DataType::Utf8, false),
+            Field::new("target", DataType::Utf8, false),
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("git_file_hash", DataType::Utf8, false),
+            Field::new("byte_start", DataType::Int64, false),
+            Field::new("line", DataType::Int64, false),
+            // Empty at file scope, which is where most ops tables live.
+            Field::new("enclosing_function", DataType::Utf8, false),
+            Field::new("kind", DataType::Utf8, false),
+        ]));
+
+        let table = self
+            .connection
+            .create_table("registrations", vec![RecordBatch::new_empty(schema)])
+            .execute()
+            .await?;
+
+        // Every resolution query filters on one of these three: the target
+        // when asking where a function is installed, the member when joining
+        // dispatch sites, the container type when asking what implements a
+        // slot.
+        for (columns, what) in [
+            (["target"], "BTree index on registrations.target"),
+            (["member"], "BTree index on registrations.member"),
+            (
+                ["container_type"],
+                "BTree index on registrations.container_type",
+            ),
+        ] {
+            self.try_create_index(&table, &columns, what).await;
+        }
+
+        Ok(())
+    }
+
+    /// The version the index was written by, or `None` when the table
+    /// predates versioning entirely.
+    ///
+    /// Which rows were indexed under which rules is a separate question, and
+    /// a mark on the database cannot answer it: indexing is per file, so a
+    /// database can hold a feature's column while most of its rows predate
+    /// the feature. `processed_files.extractor_version` answers that one, per
+    /// file, and is what decides whether a file is read again.
+    pub async fn stored_schema_version(&self) -> Result<Option<u32>> {
+        Ok(self
+            .meta_value("schema_version")
+            .await?
+            .and_then(|value| value.parse().ok()))
+    }
+
+    /// Record that the index now holds what this version writes, and how it
+    /// was built.
+    ///
+    /// The options matter as much as the version: an index built for `c,h`
+    /// does not hold what one built for `c,h,rs` holds, and rebuilding it
+    /// with different options silently changes what a query can find.
+    pub async fn set_index_build(&self, extensions: &[String], no_macros: bool) -> Result<()> {
+        let table = self.connection.open_table("schema_meta").execute().await?;
+        let keys = ["schema_version", "index:extensions", "index:macros"];
+        for key in keys {
+            table
+                .delete(&format!("key = '{key}'"))
+                .await
+                .with_context(|| format!("clearing {key}"))?;
+        }
+
+        let values = [
+            SCHEMA_VERSION.to_string(),
+            extensions.join(","),
+            if no_macros { "skipped" } else { "indexed" }.to_string(),
+        ];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(keys.to_vec())) as arrow::array::ArrayRef,
+                Arc::new(arrow::array::StringArray::from(values.to_vec()))
+                    as arrow::array::ArrayRef,
+            ],
+        )?;
+        table.add(vec![batch]).execute().await?;
+
+        Ok(())
+    }
+
+    /// The value recorded under a key, absent when the index does not say.
+    pub async fn meta_value(&self, key: &str) -> Result<Option<String>> {
+        let names = self.connection.table_names().execute().await?;
+        if !names.iter().any(|name| name == "schema_meta") {
+            return Ok(None);
+        }
+
+        let escaped = key.replace('\'', "''");
+        let batches: Vec<arrow::record_batch::RecordBatch> = self
+            .connection
+            .open_table("schema_meta")
+            .execute()
+            .await?
+            .query()
+            .only_if(format!("key = '{escaped}'"))
+            .execute()
+            .await?
+            .try_collect()
+            .await?;
+
+        for batch in &batches {
+            let Some(values) = batch
+                .column_by_name("value")
+                .and_then(|c| c.as_any().downcast_ref::<arrow::array::StringArray>())
+            else {
+                continue;
+            };
+            for row in 0..values.len() {
+                if values.is_valid(row) {
+                    return Ok(Some(values.value(row).to_string()));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub async fn create_schema_meta_table_for(&self, preexisting: bool) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+
+        let table = self
+            .connection
+            .create_table("schema_meta", vec![RecordBatch::new_empty(schema.clone())])
+            .execute()
+            .await?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            .to_string();
+        let keys = vec!["schema_version", "created"];
+        let written_by = if preexisting { 0 } else { SCHEMA_VERSION };
+        let values = vec![written_by.to_string(), now];
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(keys)) as arrow::array::ArrayRef,
+                Arc::new(arrow::array::StringArray::from(values)) as arrow::array::ArrayRef,
+            ],
+        )?;
+        table.add(vec![batch]).execute().await?;
 
         Ok(())
     }
@@ -203,6 +449,11 @@ impl SchemaManager {
             Field::new("file", DataType::Utf8, false),   // File path
             Field::new("git_sha", DataType::Utf8, true), // Current git head SHA as hex string (nullable)
             Field::new("git_file_sha", DataType::Utf8, false), // SHA of specific file content as hex string
+            // Which extractor read this file. Unchanged content is skipped on
+            // a later run, which is right only when the reading would produce
+            // what it produced before; after the extractor learns something,
+            // the row is stale even though the file is not.
+            Field::new("extractor_version", DataType::Int64, true),
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());
@@ -213,6 +464,40 @@ impl SchemaManager {
             .await?;
 
         Ok(())
+    }
+
+    /// Give an older `processed_files` table the column that says which
+    /// extractor read each file, by starting it again.
+    ///
+    /// The rows cannot be carried over because there is nothing to carry them
+    /// to: a row written before the column existed was written by an unknown
+    /// older extractor, which is exactly the state that must not be trusted
+    /// to skip a file. Dropping them costs one re-read of a tree that was
+    /// going to be re-read anyway.
+    ///
+    /// Without this the column is missing on every database that predates it,
+    /// so nothing can record a version and nothing can read one back: the
+    /// index would report itself stale forever, and re-indexing would never
+    /// settle it.
+    async fn migrate_processed_files_table(&self) -> Result<()> {
+        let table = self
+            .connection
+            .open_table("processed_files")
+            .execute()
+            .await?;
+        let has_column = table
+            .schema()
+            .await?
+            .fields()
+            .iter()
+            .any(|field| field.name() == "extractor_version");
+        if has_column {
+            return Ok(());
+        }
+
+        tracing::info!("processed_files predates the extractor version column: starting it again");
+        self.connection.drop_table("processed_files", &[]).await?;
+        self.create_processed_files_table().await
     }
 
     async fn create_symbol_filename_table(&self) -> Result<()> {

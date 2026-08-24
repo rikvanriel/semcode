@@ -122,7 +122,7 @@ async fn build_reverse_callchain_with_git(
 }
 
 fn build_callchain_recursive_sync(
-    function_map: &HashMap<String, FunctionInfo>,
+    function_map: &HashMap<String, Vec<FunctionInfo>>,
     call_relationships: &CallRelationships,
     func_name: &str,
     remaining_depth: usize,
@@ -148,7 +148,7 @@ fn build_callchain_recursive_sync(
         children: vec![],
     };
 
-    if let Some(func) = function_map.get(func_name) {
+    if let Some(func) = function_map.get(func_name).and_then(|f| f.first()) {
         node.file = func.file_path.clone();
         node.line = func.line_start;
 
@@ -204,7 +204,7 @@ pub fn print_callchain_tree(node: &CallNode, indent: usize) {
 }
 
 fn find_paths_bfs(
-    function_map: &HashMap<String, FunctionInfo>,
+    function_map: &HashMap<String, Vec<FunctionInfo>>,
     call_relationships: &CallRelationships,
     start: &str,
     target: &str,
@@ -271,10 +271,11 @@ pub async fn show_callers_to_writer(
         Some(func) => {
             // Always use git-aware callers query
             let callers = db.get_function_callers_git_aware(name, git_sha).await?;
-            if callers.is_empty() {
+            let indirect = db.find_indirect_callers(name, git_sha).await?;
+            if callers.is_empty() && indirect.is_empty() {
                 let info_msg = format!("{} No functions call '{}'", "Info:".yellow(), name);
                 writeln!(writer, "{info_msg}")?;
-            } else {
+            } else if !callers.is_empty() {
                 let header = format!("\n{}", "=== Direct Callers ===".bold().green());
                 writeln!(writer, "{header}")?;
 
@@ -321,6 +322,8 @@ pub async fn show_callers_to_writer(
                     }
                 }
             }
+
+            show_indirect_callers(&indirect, writer)?;
         }
         None => {
             let error_msg = format!(
@@ -333,6 +336,229 @@ pub async fn show_callers_to_writer(
     }
 
     Ok(())
+}
+
+/// Callers that reach the function without naming it, with the evidence for
+/// each: a reader has to be able to check the claim, since a member call can
+/// reach anything installed in that member.
+fn show_indirect_callers(
+    indirect: &[crate::database::resolution::IndirectCaller],
+    writer: &mut dyn Write,
+) -> Result<()> {
+    use crate::database::resolution::Evidence;
+
+    if indirect.is_empty() {
+        return Ok(());
+    }
+
+    // A member-name match with no receiver type reaches every call through a
+    // member of that name anywhere in the tree, which for a name like
+    // `handler` is most of the kernel. Those are reported as a count, not as
+    // an answer.
+    let (confident, by_name_only): (Vec<_>, Vec<_>) = indirect
+        .iter()
+        .partition(|caller| caller.evidence.is_type_matched());
+
+    if confident.is_empty() && by_name_only.is_empty() {
+        return Ok(());
+    }
+
+    // The header goes up whenever anything indirect was found, including the
+    // case where all of it is member-name evidence: a bare `Note:` hanging
+    // off the direct callers reads as a footnote to them, and "further" says
+    // there was a list above when there was not.
+    let header = format!("\n{}", "=== Indirect Callers ===".bold().green());
+    writeln!(writer, "{header}")?;
+    if !confident.is_empty() {
+        writeln!(
+            writer,
+            "{} call sites can reach it through a function pointer:",
+            confident.len()
+        )?;
+    }
+
+    for (i, caller) in confident.iter().enumerate() {
+        let where_from = if caller.caller_name.is_empty() {
+            "(file scope)".to_string()
+        } else {
+            caller.caller_name.clone()
+        };
+
+        writeln!(
+            writer,
+            "  {}. {} at {}:{} [{}]",
+            (i + 1).to_string().yellow(),
+            where_from.cyan(),
+            caller.site_file.bright_black(),
+            caller.site_line,
+            caller.site_kind.bright_black()
+        )?;
+
+        match &caller.evidence {
+            Evidence::StatedAtSite => {
+                writeln!(writer, "     names it at the call site")?;
+            }
+            Evidence::Registered {
+                container_type,
+                registration_file,
+                registration_line,
+                registration_count,
+                type_matched,
+            } => {
+                let confidence = if *type_matched {
+                    "receiver type matches"
+                } else {
+                    "member name matches, receiver type unknown"
+                };
+                let elsewhere = match registration_count {
+                    1 => String::new(),
+                    n => format!(" and {} other places", n - 1),
+                };
+                writeln!(
+                    writer,
+                    "     installed in {}::{} at {}:{}{} ({})",
+                    container_type.cyan(),
+                    caller.member.cyan(),
+                    registration_file.bright_black(),
+                    registration_line,
+                    elsewhere.bright_black(),
+                    confidence.bright_black()
+                )?;
+            }
+        }
+    }
+
+    if !by_name_only.is_empty() {
+        let further = if confident.is_empty() { "" } else { "further " };
+        let note = format!(
+            "\n{} {} {}call sites go through a member of the same name, \
+             but nothing says their receiver has the type the function was \
+             installed in.",
+            "Note:".yellow(),
+            by_name_only.len(),
+            further
+        );
+        writeln!(writer, "{note}")?;
+    }
+
+    Ok(())
+}
+
+/// Functions installed in one member of one type: the other side of the
+/// question `callers` answers.
+pub async fn show_implementors_to_writer(
+    db: &DatabaseManager,
+    container_type: &str,
+    member: &str,
+    writer: &mut dyn Write,
+    git_sha: &str,
+) -> Result<()> {
+    writeln!(
+        writer,
+        "Finding functions installed in {}::{}",
+        container_type.cyan(),
+        member.cyan()
+    )?;
+
+    let found = db
+        .find_registrations_for_slot_git_aware(container_type, member, git_sha)
+        .await?;
+
+    if found.is_empty() {
+        writeln!(
+            writer,
+            "{} Nothing is installed in {}::{}",
+            "Info:".yellow(),
+            container_type,
+            member
+        )?;
+        return Ok(());
+    }
+
+    let header = format!("\n{}", "=== Implementors ===".bold().green());
+    writeln!(writer, "{header}")?;
+    writeln!(writer, "{} installed:", found.len())?;
+
+    for (i, registration) in found.iter().enumerate() {
+        let where_from = if registration.enclosing_function.is_empty() {
+            String::new()
+        } else {
+            format!(" in {}", registration.enclosing_function)
+        };
+        writeln!(
+            writer,
+            "  {}. {} at {}:{}{} [{}]",
+            (i + 1).to_string().yellow(),
+            registration.target.cyan(),
+            registration.file_path.bright_black(),
+            registration.line,
+            where_from.bright_black(),
+            registration.kind.as_str().bright_black()
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Where a function is installed, which is how it can be reached without
+/// being named.
+pub async fn show_registrations_to_writer(
+    db: &DatabaseManager,
+    name: &str,
+    writer: &mut dyn Write,
+    git_sha: &str,
+) -> Result<()> {
+    writeln!(writer, "Finding where {} is installed", name.cyan())?;
+
+    let found = db.find_registrations_of_git_aware(name, git_sha).await?;
+
+    if found.is_empty() {
+        writeln!(
+            writer,
+            "{} {} is not installed in any struct member",
+            "Info:".yellow(),
+            name
+        )?;
+        return Ok(());
+    }
+
+    let header = format!("\n{}", "=== Registrations ===".bold().green());
+    writeln!(writer, "{header}")?;
+    writeln!(writer, "{} places install it:", found.len())?;
+
+    for (i, registration) in found.iter().enumerate() {
+        let where_from = if registration.enclosing_function.is_empty() {
+            String::new()
+        } else {
+            format!(" in {}", registration.enclosing_function)
+        };
+        writeln!(
+            writer,
+            "  {}. {}::{} at {}:{}{} [{}]",
+            (i + 1).to_string().yellow(),
+            registration.container_type.cyan(),
+            registration.member.cyan(),
+            registration.file_path.bright_black(),
+            registration.line,
+            where_from.bright_black(),
+            registration.kind.as_str().bright_black()
+        )?;
+    }
+
+    Ok(())
+}
+
+pub async fn show_implementors(
+    db: &DatabaseManager,
+    container_type: &str,
+    member: &str,
+    git_sha: &str,
+) -> Result<()> {
+    show_implementors_to_writer(db, container_type, member, &mut stdout(), git_sha).await
+}
+
+pub async fn show_registrations(db: &DatabaseManager, name: &str, git_sha: &str) -> Result<()> {
+    show_registrations_to_writer(db, name, &mut stdout(), git_sha).await
 }
 
 pub async fn show_callees_to_writer(
@@ -667,4 +893,56 @@ pub async fn show_callees(
     git_sha: &str,
 ) -> Result<()> {
     show_callees_to_writer(db, name, &mut stdout(), verbose, git_sha).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::show_indirect_callers;
+    use crate::database::resolution::{Evidence, IndirectCaller};
+
+    fn caller(name: &str, type_matched: bool) -> IndirectCaller {
+        IndirectCaller {
+            caller_name: name.to_string(),
+            site_file: "fs/read_write.c".to_string(),
+            site_line: 572,
+            site_byte_start: 100,
+            member: "read".to_string(),
+            site_kind: "member_arrow".to_string(),
+            evidence: Evidence::Registered {
+                container_type: "file_operations".to_string(),
+                registration_file: "fs/proc/inode.c".to_string(),
+                registration_line: 556,
+                registration_count: 1,
+                type_matched,
+            },
+        }
+    }
+
+    fn rendered(callers: &[IndirectCaller]) -> String {
+        let mut out = Vec::new();
+        show_indirect_callers(callers, &mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn the_count_alone_still_gets_a_heading() {
+        // Without one the note hangs off the direct callers above it and
+        // reads as a footnote to them.
+        let text = rendered(&[caller("vfs_read", false)]);
+
+        assert!(text.contains("Indirect Callers"), "{text}");
+        assert!(text.contains("1 call sites"), "{text}");
+        assert!(
+            !text.contains("further"),
+            "nothing was listed above the note: {text}"
+        );
+    }
+
+    #[test]
+    fn a_note_after_answers_says_further() {
+        let text = rendered(&[caller("vfs_read", true), caller("loop_rw_iter", false)]);
+
+        assert!(text.contains("1 call sites can reach it"), "{text}");
+        assert!(text.contains("1 further call sites"), "{text}");
+    }
 }

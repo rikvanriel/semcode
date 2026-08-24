@@ -30,6 +30,10 @@ use std::collections::HashSet;
 // Optimal batch size for LanceDB operations
 pub const OPTIMAL_BATCH_SIZE: usize = 65536;
 
+/// A revision's file manifest: path to blob id, shared because building one
+/// walks the whole tree.
+type GitManifest = std::sync::Arc<std::collections::HashMap<String, String>>;
+
 pub struct DatabaseManager {
     connection: Connection,
     git_repo_path: String,
@@ -41,9 +45,14 @@ pub struct DatabaseManager {
     schema_manager: SchemaManager,
     processed_file_store: ProcessedFileStore,
     content_store: ContentStore,
+    dispatch_site_store: crate::database::dispatch_sites::DispatchSiteStore,
+    registration_store: crate::database::registrations::RegistrationStore,
     symbol_filename_store: SymbolFilenameStore,
     branch_store: IndexedBranchStore,
     workdir_index: std::sync::RwLock<Option<WorkdirIndex>>,
+    /// The last manifest generated, kept because a single query asks for the
+    /// same revision several times. Building one walks the whole tree.
+    manifest_cache: std::sync::RwLock<Option<(String, GitManifest)>>,
 }
 
 impl DatabaseManager {
@@ -67,14 +76,93 @@ impl DatabaseManager {
             schema_manager: SchemaManager::new(connection.clone()),
             processed_file_store: ProcessedFileStore::new(connection.clone()),
             content_store: ContentStore::new(connection.clone()),
+            dispatch_site_store: crate::database::dispatch_sites::DispatchSiteStore::new(
+                connection.clone(),
+            ),
+            registration_store: crate::database::registrations::RegistrationStore::new(
+                connection.clone(),
+            ),
             symbol_filename_store: SymbolFilenameStore::new(connection.clone()),
             branch_store: IndexedBranchStore::new(connection.clone()),
             workdir_index: std::sync::RwLock::new(None),
+            manifest_cache: std::sync::RwLock::new(None),
         })
     }
 
     pub async fn list_tables(&self) -> Result<Vec<String>> {
         Ok(self.connection.table_names().execute().await?)
+    }
+
+    /// The schema version the index was written by. `None` means it predates
+    /// versioning, which for these purposes is older than anything.
+    pub async fn stored_schema_version(&self) -> Result<Option<u32>> {
+        self.schema_manager.stored_schema_version().await
+    }
+
+    /// Content hashes this build's extractor has read, which is the set a
+    /// later run may skip. A file read by an older extractor is missing from
+    /// it even though the file itself has not changed.
+    pub async fn processed_by_this_extractor(&self) -> Result<std::collections::HashSet<String>> {
+        Ok(self
+            .get_all_processed_files()
+            .await?
+            .into_iter()
+            .filter(|record| record.extractor_version == Some(crate::SCHEMA_VERSION))
+            .map(|record| record.git_file_sha)
+            .collect())
+    }
+
+    /// True when any file in the index was read by an older extractor, so
+    /// what is stored for it is not what a fresh index would hold.
+    ///
+    /// Asked of the files rather than of a mark on the database as a whole: a
+    /// run over a commit range reads the files that commit touched and no
+    /// others, and a database-wide mark would call the whole index current on
+    /// the strength of those few.
+    pub async fn index_predates_reader(&self) -> Result<bool> {
+        let files = self.get_all_processed_files().await?;
+        if !files.is_empty() {
+            return Ok(files
+                .iter()
+                .any(|record| record.extractor_version != Some(crate::SCHEMA_VERSION)));
+        }
+
+        // No files to ask, so fall back to the mark on the database: an index
+        // holding rows from before that mark existed still predates this
+        // build, and a fresh one does not.
+        Ok(self.stored_schema_version().await?.unwrap_or(0) < crate::SCHEMA_VERSION)
+    }
+
+    /// Mark the index as holding what this build writes, with the options it
+    /// was built with.
+    pub async fn record_index_build(&self, extensions: &[String], no_macros: bool) -> Result<()> {
+        self.schema_manager
+            .set_index_build(extensions, no_macros)
+            .await
+    }
+
+    /// How the index was built: the extensions indexed, and whether macros
+    /// were skipped. `None` when the index does not say, which is every index
+    /// written before this was recorded.
+    pub async fn recorded_index_options(&self) -> Result<Option<(Vec<String>, bool)>> {
+        let Some(extensions) = self.schema_manager.meta_value("index:extensions").await? else {
+            return Ok(None);
+        };
+        if extensions.is_empty() {
+            return Ok(None);
+        }
+
+        let no_macros = self
+            .schema_manager
+            .meta_value("index:macros")
+            .await?
+            .map(|value| value == "skipped")
+            .unwrap_or(false);
+
+        Ok(Some((
+            extensions.split(',').map(|e| e.to_string()).collect(),
+            no_macros,
+        )))
     }
 
     pub async fn create_tables(&self) -> Result<()> {
@@ -670,6 +758,328 @@ impl DatabaseManager {
     }
 
     // Function operations
+    /// Record dispatch sites: calls that go through a value rather than
+    /// naming a function.
+    pub async fn insert_dispatch_sites(
+        &self,
+        sites: Vec<crate::types::DispatchSite>,
+    ) -> Result<()> {
+        self.dispatch_site_store.insert_batch(sites).await
+    }
+
+    /// Record functions installed in struct members.
+    pub async fn insert_registrations(
+        &self,
+        registrations: Vec<crate::types::Registration>,
+    ) -> Result<()> {
+        self.registration_store.insert_batch(registrations).await
+    }
+
+    /// Everything installed in one member of one type, at a revision.
+    /// What each dispatch inside these functions can reach.
+    ///
+    /// A call chain that stops at `file->f_op->read()` stops one lookup short
+    /// of the answer: the site is recorded, the registrations are recorded,
+    /// and joining them is what the chain needs to keep going.
+    pub async fn resolve_dispatches_in(
+        &self,
+        callers: &[String],
+        git_sha: &str,
+    ) -> Result<std::collections::HashMap<String, Vec<crate::types::ResolvedDispatch>>> {
+        use crate::database::resolution::at_revision;
+
+        let manifest = self.git_manifest_cached(git_sha).await?;
+        let mut resolved = std::collections::HashMap::new();
+        // A slot is asked about once per function that dispatches through it,
+        // and ops tables are shared: cache what each one holds.
+        let mut slots: std::collections::HashMap<(String, String), Vec<String>> =
+            std::collections::HashMap::new();
+
+        for caller in callers {
+            let mut sites = at_revision(
+                self.dispatch_site_store.find_by_caller(caller).await?,
+                &manifest,
+                |s| (s.file_path.as_str(), s.git_file_hash.as_str()),
+            );
+            if sites.is_empty() {
+                continue;
+            }
+            self.type_chained_receivers(&mut sites, &manifest).await?;
+
+            let mut dispatches = Vec::new();
+            for site in sites {
+                // A site whose receiver type is unknown reaches every member
+                // of that name in the tree, which is not an answer a chain
+                // can follow. `callers` reports those as a count.
+                let Some(container_type) = site.receiver_type.clone() else {
+                    continue;
+                };
+
+                let key = (container_type.clone(), site.member.clone());
+                let targets = match slots.get(&key) {
+                    Some(known) => known.clone(),
+                    None => {
+                        let mut targets: Vec<String> = at_revision(
+                            self.registration_store
+                                .find_by_slot(&container_type, &site.member)
+                                .await?,
+                            &manifest,
+                            |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
+                        )
+                        .into_iter()
+                        .map(|registration| registration.target)
+                        .collect();
+                        targets.sort();
+                        targets.dedup();
+                        slots.insert(key, targets.clone());
+                        targets
+                    }
+                };
+
+                if targets.is_empty() {
+                    continue;
+                }
+
+                dispatches.push(crate::types::ResolvedDispatch {
+                    receiver_expr: site.receiver_expr.clone().unwrap_or_default(),
+                    container_type,
+                    member: site.member.clone(),
+                    file_path: site.file_path.clone(),
+                    line: site.line,
+                    targets,
+                });
+            }
+
+            if !dispatches.is_empty() {
+                dispatches.sort_by(|a, b| {
+                    (&a.file_path, a.line, &a.member).cmp(&(&b.file_path, b.line, &b.member))
+                });
+                resolved.insert(caller.clone(), dispatches);
+            }
+        }
+
+        Ok(resolved)
+    }
+
+    /// What a field of a type is declared as, when every definition of that
+    /// type at this revision agrees.
+    ///
+    /// A tree holds more than one `struct file`, and the types table holds
+    /// each of them at every indexed commit. Disagreement means not enough is
+    /// known, so the answer is nothing rather than one of the candidates.
+    async fn field_aggregate(
+        &self,
+        container_name: &str,
+        field: &str,
+        manifest: &std::collections::HashMap<String, String>,
+    ) -> Result<Option<String>> {
+        use crate::database::resolution::{aggregate_of, at_revision};
+
+        let definitions = at_revision(
+            self.type_store.find_all_by_name(container_name).await?,
+            manifest,
+            |t| (t.file_path.as_str(), t.git_file_hash.as_str()),
+        );
+
+        let mut agreed: Option<String> = None;
+        for container in definitions {
+            let Some(field_type) = container
+                .members
+                .iter()
+                .find(|member| member.name == field)
+                .and_then(|member| aggregate_of(&member.type_name))
+            else {
+                continue;
+            };
+
+            match &agreed {
+                Some(known) if *known != field_type => return Ok(None),
+                _ => agreed = Some(field_type),
+            }
+        }
+
+        Ok(agreed)
+    }
+
+    pub async fn find_registrations_for_slot_git_aware(
+        &self,
+        container_type: &str,
+        member: &str,
+        git_sha: &str,
+    ) -> Result<Vec<crate::types::Registration>> {
+        let manifest = self.generate_git_manifest(git_sha).await?;
+
+        Ok(crate::database::resolution::at_revision(
+            self.registration_store
+                .find_by_slot(container_type, member)
+                .await?,
+            &manifest,
+            |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
+        ))
+    }
+
+    /// Every place a function is installed, at a revision.
+    pub async fn find_registrations_of_git_aware(
+        &self,
+        target: &str,
+        git_sha: &str,
+    ) -> Result<Vec<crate::types::Registration>> {
+        let manifest = self.generate_git_manifest(git_sha).await?;
+
+        Ok(crate::database::resolution::at_revision(
+            self.registration_store.find_by_target(target).await?,
+            &manifest,
+            |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
+        ))
+    }
+
+    /// Everything installed in one member of one type.
+    pub async fn find_registrations_for_slot(
+        &self,
+        container_type: &str,
+        member: &str,
+    ) -> Result<Vec<crate::types::Registration>> {
+        self.registration_store
+            .find_by_slot(container_type, member)
+            .await
+    }
+
+    /// Every place a function is installed.
+    pub async fn find_registrations_of(
+        &self,
+        target: &str,
+    ) -> Result<Vec<crate::types::Registration>> {
+        self.registration_store.find_by_target(target).await
+    }
+
+    /// Everything installed in a member of this name, whatever the type.
+    pub async fn find_registrations_by_member(
+        &self,
+        member: &str,
+    ) -> Result<Vec<crate::types::Registration>> {
+        self.registration_store.find_by_member(member).await
+    }
+
+    /// Call sites that can reach this function without naming it: a member
+    /// call where the function is installed in that member, or a site that
+    /// names it outright.
+    ///
+    /// Rows are filtered to the revision being queried, the same way function
+    /// lookups are, so a registration removed in a later commit stops
+    /// answering.
+    pub async fn find_indirect_callers(
+        &self,
+        target: &str,
+        git_sha: &str,
+    ) -> Result<Vec<crate::database::resolution::IndirectCaller>> {
+        use crate::database::resolution::{at_revision, group_by_member, indirect_callers};
+
+        let manifest = self.git_manifest_cached(git_sha).await?;
+
+        let registrations = at_revision(
+            self.registration_store.find_by_target(target).await?,
+            &manifest,
+            |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
+        );
+        let stated = at_revision(
+            self.dispatch_site_store.find_by_target(target).await?,
+            &manifest,
+            |s| (s.file_path.as_str(), s.git_file_hash.as_str()),
+        );
+
+        // Only the members the function is actually installed in matter.
+        let mut sites = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for registration in &registrations {
+            if !seen.insert(registration.member.clone()) {
+                continue;
+            }
+            sites.extend(at_revision(
+                self.dispatch_site_store
+                    .find_by_member(&registration.member)
+                    .await?,
+                &manifest,
+                |s| (s.file_path.as_str(), s.git_file_hash.as_str()),
+            ));
+        }
+
+        self.type_chained_receivers(&mut sites, &manifest).await?;
+
+        Ok(indirect_callers(
+            &registrations,
+            &group_by_member(sites),
+            &stated,
+        ))
+    }
+
+    /// Finish typing the receivers the analyzer could only half-type.
+    ///
+    /// A site written `file->f_op->read()` stored the type of `file` and the
+    /// field `f_op`. What `f_op` is declared as lives with struct file, in a
+    /// header the analyzer was not looking at, so the last hop happens here,
+    /// where the whole tree's types are available.
+    async fn type_chained_receivers(
+        &self,
+        sites: &mut [crate::types::DispatchSite],
+        manifest: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        let mut resolved: std::collections::HashMap<(String, String), Option<String>> =
+            std::collections::HashMap::new();
+
+        for site in sites.iter_mut() {
+            if site.receiver_type.is_some() {
+                continue;
+            }
+            let (Some(base), Some(field)) = (
+                site.receiver_base_type.as_deref(),
+                site.receiver_field.as_deref(),
+            ) else {
+                continue;
+            };
+
+            let key = (base.to_string(), field.to_string());
+            let field_type = match resolved.get(&key) {
+                Some(known) => known.clone(),
+                None => {
+                    // Walk the path one field at a time: `display->parent->dsb`
+                    // needs the type of `parent` before the type of `dsb`.
+                    let mut current = Some(base.to_string());
+                    for step in field.split('.') {
+                        let Some(container_name) = current.take() else {
+                            break;
+                        };
+                        current = self
+                            .field_aggregate(&container_name, step, manifest)
+                            .await?;
+                    }
+
+                    resolved.insert(key, current.clone());
+                    current
+                }
+            };
+
+            site.receiver_type = field_type;
+        }
+
+        Ok(())
+    }
+
+    /// Dispatch sites that go through the named member.
+    pub async fn find_dispatch_sites_by_member(
+        &self,
+        member: &str,
+    ) -> Result<Vec<crate::types::DispatchSite>> {
+        self.dispatch_site_store.find_by_member(member).await
+    }
+
+    /// Dispatch sites inside the named function.
+    pub async fn find_dispatch_sites_by_caller(
+        &self,
+        caller_name: &str,
+    ) -> Result<Vec<crate::types::DispatchSite>> {
+        self.dispatch_site_store.find_by_caller(caller_name).await
+    }
+
     pub async fn insert_functions(&self, functions: Vec<FunctionInfo>) -> Result<()> {
         // Extract (symbol_name, filename) pairs for symbol_filename table
         let symbol_filename_pairs: Vec<(String, String)> = functions
@@ -831,7 +1241,7 @@ impl DatabaseManager {
         if let Some(func) = self.workdir_find_function(name) {
             return Ok(Some(func));
         }
-        let git_manifest = self.generate_git_manifest(git_sha).await?;
+        let git_manifest = self.git_manifest_cached(git_sha).await?;
         if git_manifest.is_empty() {
             tracing::info!(
                 "No files resolved for '{}' at commit '{}' - falling back to non-git lookup",
@@ -1845,14 +2255,13 @@ impl DatabaseManager {
                         names.value(row)
                     );
                     if !calls.is_null(row) {
-                        if let Ok(values) = serde_json::from_str::<Vec<String>>(calls.value(row)) {
-                            for target in values {
-                                if function_targets.contains(&target) {
-                                    function_referrers
-                                        .entry(target)
-                                        .or_default()
-                                        .insert(identity.clone());
-                                }
+                        let values = crate::database::parse_call_list(calls.value(row))?;
+                        for target in values {
+                            if function_targets.contains(&target) {
+                                function_referrers
+                                    .entry(target)
+                                    .or_default()
+                                    .insert(identity.clone());
                             }
                         }
                     }
@@ -2015,10 +2424,9 @@ impl DatabaseManager {
 
                         // Parse JSON and verify it actually contains function_name
                         // (the LIKE filter might have false positives)
-                        if let Ok(calls_list) = serde_json::from_str::<Vec<String>>(calls_json) {
-                            if calls_list.contains(&function_name.to_string()) {
-                                callers.insert(caller_name);
-                            }
+                        let calls_list = crate::database::parse_call_list(calls_json)?;
+                        if calls_list.contains(&function_name.to_string()) {
+                            callers.insert(caller_name);
                         }
                     }
                 }
@@ -2048,7 +2456,7 @@ impl DatabaseManager {
         let mut caller_names: Vec<String> =
             workdir_callers.iter().map(|f| f.name.clone()).collect();
 
-        let git_manifest = self.generate_git_manifest(git_sha).await?;
+        let git_manifest = self.git_manifest_cached(git_sha).await?;
         if !git_manifest.is_empty() {
             let db_callers = self
                 .get_function_callers_with_manifest(function_name, &git_manifest)
@@ -2105,13 +2513,12 @@ impl DatabaseManager {
                     // Check if this function makes calls
                     if !calls_array.is_null(i) {
                         let calls_json = calls_array.value(i);
-                        if let Ok(calls_list) = serde_json::from_str::<Vec<String>>(calls_json) {
-                            if !calls_list.is_empty() {
-                                functions_with_calls.insert(function_name.clone());
-                                // Add all called functions to the set
-                                for called_func in calls_list {
-                                    functions_that_are_called.insert(called_func);
-                                }
+                        let calls_list = crate::database::parse_call_list(calls_json)?;
+                        if !calls_list.is_empty() {
+                            functions_with_calls.insert(function_name.clone());
+                            // Add all called functions to the set
+                            for called_func in calls_list {
+                                functions_that_are_called.insert(called_func);
                             }
                         }
                     }
@@ -2132,7 +2539,7 @@ impl DatabaseManager {
     pub async fn get_functions_by_names(
         &self,
         names: &[String],
-    ) -> Result<std::collections::HashMap<String, FunctionInfo>> {
+    ) -> Result<std::collections::HashMap<String, Vec<FunctionInfo>>> {
         self.function_store.get_by_names(names).await
     }
 
@@ -2325,7 +2732,7 @@ impl DatabaseManager {
         if let Some(callees) = self.workdir_find_callees(function_name) {
             return Ok(callees);
         }
-        let git_manifest = self.generate_git_manifest(git_sha).await?;
+        let git_manifest = self.git_manifest_cached(git_sha).await?;
         if git_manifest.is_empty() {
             return Ok(Vec::new());
         }
@@ -2377,17 +2784,15 @@ impl DatabaseManager {
 
                     if !calls_array.is_null(i) {
                         let calls_json = calls_array.value(i);
-                        if let Ok(calls_list) = serde_json::from_str::<Vec<String>>(calls_json) {
-                            for callee_name in calls_list {
-                                // For now, we can't easily get callee git hash without additional lookups
-                                // This is a limitation of the new schema - we'd need to do individual lookups
-                                all_relationships.push(CallRelationship {
-                                    caller: caller_name.clone(),
-                                    callee: callee_name,
-                                    caller_git_file_hash: caller_git_file_hash.clone(),
-                                    callee_git_file_hash: None, // Would require lookup
-                                });
-                            }
+                        let calls_list = crate::database::parse_call_list(calls_json)?;
+                        for callee_name in calls_list {
+                            // Getting the callee's git hash would need a lookup per callee.
+                            all_relationships.push(CallRelationship {
+                                caller: caller_name.clone(),
+                                callee: callee_name,
+                                caller_git_file_hash: caller_git_file_hash.clone(),
+                                callee_git_file_hash: None,
+                            });
                         }
                     }
                 }
@@ -2863,6 +3268,7 @@ impl DatabaseManager {
             file,
             git_sha,
             git_file_sha,
+            extractor_version: Some(crate::SCHEMA_VERSION),
         };
         self.processed_file_store.insert(record).await
     }
@@ -3553,7 +3959,7 @@ impl DatabaseManager {
             "Generating complete git file manifest for commit: {}",
             effective_git_sha
         );
-        let git_manifest = self.generate_git_manifest(&effective_git_sha).await?;
+        let git_manifest = self.git_manifest_cached(&effective_git_sha).await?;
         tracing::info!(
             "Generated manifest with {} files at commit {}",
             git_manifest.len(),
@@ -3600,7 +4006,7 @@ impl DatabaseManager {
         let mut valid_callers = Vec::new();
 
         for caller_name in &all_callers {
-            if let Some(func) = caller_functions.get(caller_name) {
+            if let Some(func) = caller_functions.get(caller_name).and_then(|f| f.first()) {
                 // Check if this function's file SHA matches the git manifest
                 if let Some(expected_hash) = git_manifest.get(&func.file_path) {
                     if &func.git_file_hash == expected_hash {
@@ -3652,6 +4058,30 @@ impl DatabaseManager {
     /// Get callers using pre-loaded git manifest for filtering
     /// Generate a complete manifest of all file paths and their SHAs at a specific git commit
     /// Uses the shared git tree traversal utility for consistency
+    /// The manifest for a revision, walking the tree only when it is not the
+    /// one already in hand.
+    ///
+    /// `callers` asks twice — once for direct callers, once for indirect —
+    /// and each walk reads about 90,000 entries on a Linux tree. The cache
+    /// holds one revision: a query asks about one, and the second ask is
+    /// where the saving is.
+    pub async fn git_manifest_cached(&self, git_sha: &str) -> Result<GitManifest> {
+        if let Ok(cache) = self.manifest_cache.read() {
+            if let Some((sha, manifest)) = cache.as_ref() {
+                if sha == git_sha {
+                    return Ok(manifest.clone());
+                }
+            }
+        }
+
+        let manifest = std::sync::Arc::new(self.generate_git_manifest(git_sha).await?);
+        if let Ok(mut cache) = self.manifest_cache.write() {
+            *cache = Some((git_sha.to_string(), manifest.clone()));
+        }
+
+        Ok(manifest)
+    }
+
     pub async fn generate_git_manifest(
         &self,
         git_sha: &str,
@@ -3687,7 +4117,16 @@ impl DatabaseManager {
         }
 
         let caller_functions = self.function_store.get_by_names(&all_callers).await?;
-        let callers_vec: Vec<FunctionInfo> = caller_functions.into_values().collect();
+        let callers_vec: Vec<FunctionInfo> = caller_functions
+            .into_values()
+            .filter_map(|mut candidates| {
+                if candidates.is_empty() {
+                    None
+                } else {
+                    Some(candidates.swap_remove(0))
+                }
+            })
+            .collect();
 
         tracing::info!(
             "Found {} callers for '{}' (non-git-aware)",
@@ -3845,7 +4284,7 @@ impl DatabaseManager {
                             let calls = if calls_array.is_null(i) {
                                 None
                             } else {
-                                serde_json::from_str::<Vec<String>>(calls_array.value(i)).ok()
+                                Some(crate::database::parse_call_list(calls_array.value(i))?)
                             };
 
                             // Collect lightweight info for selection
@@ -3941,15 +4380,13 @@ impl DatabaseManager {
                         if git_file_hash == expected_hash {
                             let caller_name = name_array.value(i);
                             if !calls_array.is_null(i) {
-                                if let Ok(calls_list) =
-                                    serde_json::from_str::<Vec<String>>(calls_array.value(i))
-                                {
-                                    for callee in calls_list {
-                                        caller_index
-                                            .entry(callee)
-                                            .or_default()
-                                            .push(caller_name.to_string());
-                                    }
+                                let calls_list =
+                                    crate::database::parse_call_list(calls_array.value(i))?;
+                                for callee in calls_list {
+                                    caller_index
+                                        .entry(callee)
+                                        .or_default()
+                                        .push(caller_name.to_string());
                                 }
                             }
                         }
@@ -4030,12 +4467,9 @@ impl DatabaseManager {
                             // This function exists at the git SHA, verify it actually calls our target
                             if !calls_array.is_null(i) {
                                 let calls_json = calls_array.value(i);
-                                if let Ok(calls_list) =
-                                    serde_json::from_str::<Vec<String>>(calls_json)
-                                {
-                                    if calls_list.contains(&function_name.to_string()) {
-                                        callers.push(caller_name.to_string());
-                                    }
+                                let calls_list = crate::database::parse_call_list(calls_json)?;
+                                if calls_list.contains(&function_name.to_string()) {
+                                    callers.push(caller_name.to_string());
                                 }
                             }
                         }
@@ -6206,6 +6640,232 @@ mod tests {
         let dataset = table.dataset().unwrap().get().await.unwrap();
 
         assert_eq!(dataset.manifest().data_storage_format.version, "2.2");
+    }
+
+    fn test_function(name: &str, file_path: &str, git_file_hash: &str) -> FunctionInfo {
+        FunctionInfo {
+            name: name.to_string(),
+            file_path: file_path.to_string(),
+            git_file_hash: git_file_hash.to_string(),
+            line_start: 1,
+            line_end: 3,
+            return_type: "int".to_string(),
+            parameters: Vec::new(),
+            body: format!("int {name}(void) {{ return 0; }}"),
+            calls: Some(vec!["target".to_string()]),
+            types: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn indirect_callers_come_from_the_revision_being_queried() {
+        use crate::types::{DispatchKind, DispatchSite, Registration, RegistrationKind};
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo_path = repo_dir.path();
+        git(repo_path, &["init", "-q"]);
+        std::fs::write(repo_path.join("driver.c"), "/* ops table */\n").unwrap();
+        std::fs::write(repo_path.join("vfs.c"), "/* caller */\n").unwrap();
+        git(repo_path, &["add", "driver.c", "vfs.c"]);
+        git(repo_path, &["commit", "-q", "-m", "initial"]);
+
+        let git_sha = crate::git::get_git_sha(repo_path).unwrap().unwrap();
+        let driver_hash = crate::git::get_git_file_hash_at_commit(repo_path, &git_sha, "driver.c")
+            .unwrap()
+            .unwrap();
+        let vfs_hash = crate::git::get_git_file_hash_at_commit(repo_path, &git_sha, "vfs.c")
+            .unwrap()
+            .unwrap();
+
+        let db_path = repo_path.join(".semcode.db");
+        let db = DatabaseManager::new(
+            db_path.to_str().unwrap(),
+            repo_path.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        db.create_tables().await.unwrap();
+
+        db.insert_functions(vec![test_function("my_read", "driver.c", &driver_hash)])
+            .await
+            .unwrap();
+
+        db.insert_registrations(vec![Registration {
+            container_type: "file_operations".to_string(),
+            member: "read".to_string(),
+            target: "my_read".to_string(),
+            file_path: "driver.c".to_string(),
+            git_file_hash: driver_hash.clone(),
+            byte_start: 0,
+            line: 1,
+            enclosing_function: String::new(),
+            kind: RegistrationKind::DesignatedInit,
+        }])
+        .await
+        .unwrap();
+
+        let site = |file: &str, hash: &str, receiver_type: Option<&str>| DispatchSite {
+            caller_name: "vfs_read".to_string(),
+            file_path: file.to_string(),
+            git_file_hash: hash.to_string(),
+            byte_start: 0,
+            line: 1,
+            member: "read".to_string(),
+            receiver_expr: Some("f->f_op".to_string()),
+            receiver_type: receiver_type.map(|t| t.to_string()),
+            receiver_base_type: None,
+            receiver_field: None,
+            kind: DispatchKind::MemberArrow,
+            target: None,
+        };
+
+        db.insert_dispatch_sites(vec![
+            site("vfs.c", &vfs_hash, Some("file_operations")),
+            // Same site recorded when vfs.c had different content: it is not
+            // part of this revision and must not answer.
+            site("vfs.c", "stale-hash", Some("file_operations")),
+        ])
+        .await
+        .unwrap();
+
+        let found = db.find_indirect_callers("my_read", &git_sha).await.unwrap();
+
+        assert_eq!(found.len(), 1, "stale rows answered too: {found:?}");
+        assert_eq!(found[0].caller_name, "vfs_read");
+        assert!(
+            found[0].evidence.is_type_matched(),
+            "receiver type matched the registration but was not reported as such: {:?}",
+            found[0].evidence
+        );
+    }
+
+    #[tokio::test]
+    async fn registrations_are_looked_up_by_slot_and_by_target() {
+        use crate::types::{Registration, RegistrationKind};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = DatabaseManager::new(
+            temp_dir.path().to_str().unwrap(),
+            temp_dir.path().to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        db.create_tables().await.unwrap();
+
+        let registration = |member: &str, target: &str, byte_start: u64| Registration {
+            container_type: "file_operations".to_string(),
+            member: member.to_string(),
+            target: target.to_string(),
+            file_path: "a.c".to_string(),
+            git_file_hash: "hash-a".to_string(),
+            byte_start,
+            line: 10,
+            enclosing_function: String::new(),
+            kind: RegistrationKind::DesignatedInit,
+        };
+
+        let rows = vec![
+            registration("read", "my_read", 100),
+            registration("write", "my_write", 140),
+        ];
+        db.insert_registrations(rows.clone()).await.unwrap();
+        // Reindexing the same file must not duplicate them.
+        db.insert_registrations(rows).await.unwrap();
+
+        let slot = db
+            .find_registrations_for_slot("file_operations", "read")
+            .await
+            .unwrap();
+        assert_eq!(
+            slot.len(),
+            1,
+            "duplicate rows for one initializer: {slot:?}"
+        );
+        assert_eq!(slot[0].target, "my_read");
+
+        let by_target = db.find_registrations_of("my_write").await.unwrap();
+        assert_eq!(by_target.len(), 1);
+        assert_eq!(by_target[0].member, "write");
+
+        // A member of a different type must not answer for this one.
+        let other = db
+            .find_registrations_for_slot("other_ops", "read")
+            .await
+            .unwrap();
+        assert!(other.is_empty(), "slot lookup ignored the type: {other:?}");
+    }
+
+    #[tokio::test]
+    async fn reindexing_unchanged_content_keeps_one_row_per_dispatch_site() {
+        use crate::types::{DispatchKind, DispatchSite};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = DatabaseManager::new(
+            temp_dir.path().to_str().unwrap(),
+            temp_dir.path().to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        db.create_tables().await.unwrap();
+
+        let site = DispatchSite {
+            caller_name: "go".to_string(),
+            file_path: "a.c".to_string(),
+            git_file_hash: "hash-a".to_string(),
+            byte_start: 120,
+            line: 7,
+            member: "read".to_string(),
+            receiver_expr: Some("ops".to_string()),
+            receiver_type: None,
+            receiver_base_type: None,
+            receiver_field: None,
+            kind: DispatchKind::MemberArrow,
+            target: None,
+        };
+
+        db.insert_dispatch_sites(vec![site.clone()]).await.unwrap();
+        db.insert_dispatch_sites(vec![site.clone()]).await.unwrap();
+
+        let stored = db.find_dispatch_sites_by_member("read").await.unwrap();
+        assert_eq!(
+            stored,
+            vec![site],
+            "re-inserting the same site duplicated it"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_lookup_returns_every_definition_of_a_name() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = DatabaseManager::new(
+            temp_dir.path().to_str().unwrap(),
+            temp_dir.path().to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        db.create_tables().await.unwrap();
+
+        // Two static functions of the same name in different files, as the
+        // kernel has by the thousand.
+        db.insert_functions(vec![
+            test_function("dup_caller", "a.c", "hash-a"),
+            test_function("dup_caller", "b.c", "hash-b"),
+        ])
+        .await
+        .unwrap();
+
+        let map = db
+            .get_functions_by_names(&["dup_caller".to_string()])
+            .await
+            .unwrap();
+
+        let candidates = map
+            .get("dup_caller")
+            .expect("name missing from bulk lookup");
+        let mut files: Vec<&str> = candidates.iter().map(|f| f.file_path.as_str()).collect();
+        files.sort_unstable();
+
+        assert_eq!(files, vec!["a.c", "b.c"]);
     }
 
     #[tokio::test]

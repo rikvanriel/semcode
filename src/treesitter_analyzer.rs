@@ -7,7 +7,8 @@ use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor, Tree};
 
 use crate::types::{
-    FieldInfo, FunctionInfo, GlobalTypeRegistry, MacroParams, ParameterInfo, TypeInfo,
+    DispatchKind, DispatchSite, FieldInfo, FunctionInfo, GlobalTypeRegistry, MacroParams,
+    ParameterInfo, Registration, RegistrationKind, TypeInfo,
 };
 // TemporaryCallRelationship import removed - call relationships are now embedded in function JSON columns
 use crate::hash::compute_file_hash;
@@ -52,6 +53,150 @@ struct LanguageQueries {
     typedef_query: Option<Query>, // Not needed for Rust
     macro_query: Query,
     call_query: Query,
+}
+
+/// What one file yields.
+#[derive(Debug, Default)]
+pub struct FileAnalysis {
+    pub functions: Vec<FunctionInfo>,
+    pub types: Vec<TypeInfo>,
+    pub macros: Vec<FunctionInfo>,
+    /// Calls that dispatch through a value; their targets are resolved later.
+    pub dispatch_sites: Vec<DispatchSite>,
+    /// Functions installed in struct members: what those sites can reach.
+    pub registrations: Vec<Registration>,
+}
+
+/// Calls found in one file: resolved edges, and dispatch sites whose targets
+/// are not known until query time.
+#[derive(Debug, Default)]
+struct CallExtraction {
+    calls: Vec<(String, usize, usize)>,
+    member_sites: Vec<RawDispatchSite>,
+    /// Function-pointer variables declared in this file, so that a call
+    /// naming one of them is recognised as dispatch rather than a call to a
+    /// function of that name.
+    pointer_vars: Vec<PointerVar>,
+    registrations: Vec<RawRegistration>,
+}
+
+/// What a macro body yields once parsed.
+#[derive(Debug, Default)]
+struct MacroBodyFacts {
+    calls: Vec<String>,
+    types: Vec<String>,
+    sites: Vec<RawDispatchSite>,
+    registrations: Vec<RawRegistration>,
+}
+
+/// A designated initializer before it is attributed to a function.
+#[derive(Debug, Clone)]
+struct RawRegistration {
+    container_type: String,
+    member: String,
+    target: String,
+    byte_start: usize,
+    line: u32,
+    kind: RegistrationKind,
+}
+
+impl RawRegistration {
+    fn attribute(&self, enclosing: &str, file_path: &str, git_hash: &str) -> Registration {
+        Registration {
+            container_type: self.container_type.clone(),
+            member: self.member.clone(),
+            target: self.target.clone(),
+            file_path: file_path.to_string(),
+            git_file_hash: git_hash.to_string(),
+            byte_start: self.byte_start as u64,
+            line: self.line,
+            enclosing_function: enclosing.to_string(),
+            kind: self.kind,
+        }
+    }
+}
+
+/// A declared function-pointer variable or parameter.
+#[derive(Debug, Clone)]
+struct PointerVar {
+    name: String,
+    /// Where the declaration sits, used to scope it to its function.
+    byte_start: usize,
+    /// The function it is initialised with, when the declaration says.
+    target: Option<String>,
+    is_parameter: bool,
+}
+
+/// A dispatch site before it is attributed to the function containing it.
+#[derive(Debug, Clone)]
+struct RawDispatchSite {
+    member: String,
+    receiver_expr: Option<String>,
+    /// The struct or union the receiver was declared as, when the file says
+    /// so. Filled in after extraction, once the declarations are in scope.
+    receiver_type: Option<String>,
+    /// For `base->field->member()`, what the file proves about `base` and
+    /// which field the receiver reads from it.
+    receiver_base_type: Option<String>,
+    receiver_field: Option<String>,
+    kind: DispatchKind,
+    byte_start: usize,
+    line: u32,
+    target: Option<String>,
+}
+
+impl RawDispatchSite {
+    fn attribute(&self, caller_name: &str, file_path: &str, git_hash: &str) -> DispatchSite {
+        DispatchSite {
+            caller_name: caller_name.to_string(),
+            file_path: file_path.to_string(),
+            git_file_hash: git_hash.to_string(),
+            byte_start: self.byte_start as u64,
+            line: self.line,
+            member: self.member.clone(),
+            receiver_expr: self.receiver_expr.clone(),
+            receiver_type: self.receiver_type.clone(),
+            receiver_base_type: self.receiver_base_type.clone(),
+            receiver_field: self.receiver_field.clone(),
+            kind: self.kind,
+            target: self.target.clone(),
+        }
+    }
+}
+
+/// An identifier and nothing else: `ops`, but not `ops->fn` or `get()`.
+fn is_plain_name(text: &str) -> bool {
+    !text.is_empty()
+        && !text.starts_with(|c: char| c.is_numeric())
+        && text.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// `base->field`, `base.field`, or a longer chain of them: the base and the
+/// fields read from it, in order.
+///
+/// `display->parent->dsb` gives `display` and `parent.dsb`. Every part has to
+/// be a plain name — an index, a call or a cast in the middle needs more than
+/// a field lookup, and the whole receiver is left untyped rather than
+/// half-read.
+fn field_path(text: &str) -> Option<(&str, String)> {
+    let mut parts = text.split("->").flat_map(|part| part.split('.'));
+
+    let base = parts.next()?;
+    if !is_plain_name(base) {
+        return None;
+    }
+
+    let fields: Vec<&str> = parts.collect();
+    if fields.is_empty() || !fields.iter().all(|field| is_plain_name(field)) {
+        return None;
+    }
+
+    Some((base, fields.join(".")))
+}
+
+/// Collapse runs of whitespace (including newlines) into single spaces.
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 pub struct TreeSitterAnalyzer {
@@ -218,9 +363,22 @@ impl TreeSitterAnalyzer {
 
             (call_expression
                 function: (field_expression
-                    field: (field_identifier) @function_name
+                    argument: (_) @receiver
+                    field: (field_identifier) @member_name
                 )
             ) @method_call
+
+            (call_expression
+                function: (parenthesized_expression
+                    (pointer_expression argument: (_) @pointer_expr)
+                )
+            ) @deref_call
+
+
+            (call_expression
+                function: (identifier) @macro_name
+                arguments: (argument_list) @macro_args
+            ) @macro_call
         "#,
         )?;
 
@@ -293,7 +451,8 @@ impl TreeSitterAnalyzer {
 
             (call_expression
                 function: (field_expression
-                    field: (field_identifier) @function_name
+                    value: (_) @receiver
+                    field: (field_identifier) @member_name
                 )
             ) @method_call
         "#,
@@ -362,7 +521,8 @@ impl TreeSitterAnalyzer {
 
             (call
                 function: (attribute
-                    attribute: (identifier) @function_name
+                    object: (_) @receiver
+                    attribute: (identifier) @member_name
                 )
             ) @method_call
         "#,
@@ -468,15 +628,17 @@ impl TreeSitterAnalyzer {
             )?);
         }
 
-        // Extract macros
-        raw_macros.extend(self.extract_macros(
+        // Extract macros; the sites in their bodies are dropped on this
+        // path, which serves callers that want definitions only.
+        let (extracted_macros, _macro_sites, _macro_registrations) = self.extract_macros(
             &tree,
             &source_code,
             file_path,
             &git_hash,
             source_root,
             language,
-        )?);
+        )?;
+        raw_macros.extend(extracted_macros);
 
         // Call relationships are now embedded in function/macro JSON columns during parsing
 
@@ -512,7 +674,7 @@ impl TreeSitterAnalyzer {
         file_path: &Path,
         git_hash: &str,
         source_root: Option<&Path>,
-    ) -> Result<(Vec<FunctionInfo>, Vec<TypeInfo>, Vec<FunctionInfo>)> {
+    ) -> Result<FileAnalysis> {
         // Detect language from file extension
         let language = Language::from_path(file_path)
             .ok_or_else(|| anyhow::anyhow!("Unsupported file type: {}", file_path.display()))?;
@@ -523,7 +685,13 @@ impl TreeSitterAnalyzer {
         })?;
 
         // Single-pass extraction with optimized call analysis
-        let (raw_functions, mut raw_types, raw_macros) = self.extract_all_with_embedded_data(
+        let FileAnalysis {
+            functions: raw_functions,
+            types: mut raw_types,
+            macros: raw_macros,
+            dispatch_sites,
+            registrations,
+        } = self.extract_all_with_embedded_data(
             &tree,
             source_code,
             file_path,
@@ -550,7 +718,13 @@ impl TreeSitterAnalyzer {
 
         // Call relationships are now embedded in function/macro JSON columns
 
-        Ok((functions, types, macros))
+        Ok(FileAnalysis {
+            functions,
+            types,
+            macros,
+            dispatch_sites,
+            registrations,
+        })
     }
 
     /// Optimized single-pass extraction with embedded JSON data
@@ -563,9 +737,10 @@ impl TreeSitterAnalyzer {
         git_hash: &str,
         source_root: Option<&Path>,
         language: Language,
-    ) -> Result<(Vec<FunctionInfo>, Vec<TypeInfo>, Vec<FunctionInfo>)> {
+    ) -> Result<FileAnalysis> {
         // Single pass: extract all calls once and map them to functions by byte ranges
-        let all_calls = self.extract_all_calls_optimized(tree, source_code, language)?;
+        let extraction =
+            Self::extract_all_calls_optimized(self.get_queries(language), tree, source_code)?;
 
         // Create extraction context
         let ctx = ExtractionContext {
@@ -578,7 +753,8 @@ impl TreeSitterAnalyzer {
         };
 
         // Extract functions with embedded call data
-        let functions = self.extract_functions_with_calls(&ctx, &all_calls)?;
+        let (functions, mut dispatch_sites, mut registrations) =
+            self.extract_functions_with_calls(&ctx, &extraction)?;
 
         // Extract types (single traversal as before)
         let types = self.extract_types(
@@ -591,7 +767,7 @@ impl TreeSitterAnalyzer {
         )?;
 
         // Extract macros with embedded data (single traversal)
-        let macros = self.extract_macros_with_embedded_data(
+        let (macros, macro_sites, macro_registrations) = self.extract_macros_with_embedded_data(
             tree,
             source_code,
             file_path,
@@ -599,54 +775,801 @@ impl TreeSitterAnalyzer {
             source_root,
             language,
         )?;
+        dispatch_sites.extend(macro_sites);
+        registrations.extend(macro_registrations);
 
-        Ok((functions, types, macros))
+        Ok(FileAnalysis {
+            functions,
+            types,
+            macros,
+            dispatch_sites,
+            registrations,
+        })
     }
 
     /// Extract all calls in a single tree traversal and return with byte positions
     fn extract_all_calls_optimized(
-        &self,
+        queries: &LanguageQueries,
         tree: &Tree,
         source_code: &str,
-        language: Language,
-    ) -> Result<Vec<(String, usize, usize)>> {
-        let queries = self.get_queries(language);
-        let mut calls = Vec::new();
+    ) -> Result<CallExtraction> {
+        let mut extraction = CallExtraction::default();
         let mut cursor = QueryCursor::new();
-        let mut captures = cursor.captures(
+        let mut matches = cursor.matches(
             &queries.call_query,
             tree.root_node(),
             source_code.as_bytes(),
         );
 
-        while let Some((call_match, _)) = captures.next() {
+        while let Some(call_match) = matches.next() {
+            let mut member: Option<tree_sitter::Node> = None;
+            let mut receiver: Option<tree_sitter::Node> = None;
+            let mut macro_name: Option<tree_sitter::Node> = None;
+            let mut macro_args: Option<tree_sitter::Node> = None;
+
             for capture in call_match.captures {
-                let capture_name = &queries.call_query.capture_names()[capture.index as usize];
+                match queries.call_query.capture_names()[capture.index as usize] {
+                    "function_name" => {
+                        if let Some(call) = Self::call_site_from_capture(capture.node, source_code)
+                        {
+                            extraction.calls.push(call);
+                        }
+                    }
+                    "member_name" => member = Some(capture.node),
+                    "receiver" => receiver = Some(capture.node),
+                    "macro_name" => macro_name = Some(capture.node),
+                    "macro_args" => macro_args = Some(capture.node),
+                    "pointer_expr" => {
+                        // `(*fp)(...)`: a call through a pointer value, which
+                        // the plain call pattern does not match at all.
+                        let text = collapse_whitespace(&source_code[capture.node.byte_range()]);
+                        if !text.is_empty() {
+                            extraction.member_sites.push(RawDispatchSite {
+                                member: String::new(),
+                                receiver_expr: Some(text),
+                                receiver_type: None,
+                                receiver_base_type: None,
+                                receiver_field: None,
+                                kind: DispatchKind::PointerDeref,
+                                byte_start: capture.node.start_byte(),
+                                line: capture.node.start_position().row as u32 + 1,
+                                target: None,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
 
-                if *capture_name == "function_name" {
-                    let node = capture.node;
-                    let function_name = node
-                        .utf8_text(source_code.as_bytes())
-                        .unwrap_or("")
-                        .to_string();
+            // An indirect-call macro names the targets it expects, which is
+            // the one place the source states the answer outright.
+            if let (Some(name), Some(args)) = (macro_name, macro_args) {
+                let name = &source_code[name.byte_range()];
+                if let Some(candidates) = Self::indirect_call_candidate_count(name) {
+                    extraction.member_sites.extend(Self::indirect_call_sites(
+                        args,
+                        source_code,
+                        candidates,
+                    ));
+                }
+            }
 
-                    // Skip empty function names or obvious non-functions
-                    if !function_name.is_empty() && !function_name.chars().all(|c| c.is_numeric()) {
-                        calls.push((function_name, node.start_byte(), node.end_byte()));
+            // A member call names a member, not a function. Record where the
+            // dispatch happens; what it can reach is resolved by joining
+            // against the functions installed in that member.
+            if let Some(member) = member {
+                let name = &source_code[member.byte_range()];
+                if name.is_empty() {
+                    continue;
+                }
+
+                let (receiver_expr, kind) = match receiver {
+                    Some(receiver) => (
+                        Some(collapse_whitespace(&source_code[receiver.byte_range()])),
+                        Self::member_kind(member, source_code),
+                    ),
+                    None => (None, DispatchKind::MemberArrow),
+                };
+
+                extraction.member_sites.push(RawDispatchSite {
+                    member: name.to_string(),
+                    receiver_expr,
+                    receiver_type: None,
+                    receiver_base_type: None,
+                    receiver_field: None,
+                    kind,
+                    byte_start: member.start_byte(),
+                    line: member.start_position().row as u32 + 1,
+                    target: None,
+                });
+            }
+        }
+
+        extraction.pointer_vars = Self::collect_pointer_vars(tree.root_node(), source_code);
+        extraction.registrations = Self::collect_registrations(tree.root_node(), source_code);
+        extraction
+            .registrations
+            .extend(Self::collect_assignments(tree.root_node(), source_code));
+
+        Self::type_receivers(tree.root_node(), source_code, &mut extraction.member_sites);
+
+        // A keyword is not a member, so anything named after one came from a
+        // misread, not from the code. Neither is a member reached from
+        // nothing: every dispatch has a receiver, and a site without one came
+        // from the same kind of misread — assembly in a macro body, read as C.
+        extraction.member_sites.retain(|site| {
+            !Self::is_c_keyword(&site.member)
+                && !matches!(
+                    site.kind,
+                    DispatchKind::MemberArrow | DispatchKind::MemberDot
+                ) | site
+                    .receiver_expr
+                    .as_deref()
+                    .is_some_and(|receiver| !receiver.trim().is_empty())
+        });
+        extraction
+            .registrations
+            .retain(|registration| !Self::is_c_keyword(&registration.member));
+
+        Ok(extraction)
+    }
+
+    /// Give each member dispatch the type of its receiver, where the file
+    /// declares it.
+    ///
+    /// ```text
+    /// static int probe(struct file_operations *ops) { ops->read(...); }
+    /// ```
+    ///
+    /// `ops` is declared here, so the site can say it dispatches through
+    /// `file_operations::read` rather than through some member named `read`.
+    /// Only names a scope declares are used: a receiver whose type comes from
+    /// a header this file does not contain stays untyped, and a receiver that
+    /// is itself a member access (`inode->i_fop->read()`) needs the field's
+    /// type, which is a query-time lookup in the types table.
+    ///
+    /// A name declared twice with different types in one function is left
+    /// untyped as well. Shadowing is rare, and a site filed under the wrong
+    /// type joins with the wrong registrations, which is worse than a site
+    /// that admits it does not know.
+    fn type_receivers(root: tree_sitter::Node, source: &str, sites: &mut [RawDispatchSite]) {
+        if sites.is_empty() {
+            return;
+        }
+
+        // Declarations outside every function, which any function can see.
+        let file_scope = Self::declared_types_in(root, source, true);
+
+        let mut scopes: Vec<(usize, usize, HashMap<String, Option<String>>)> = Vec::new();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+
+            if node.kind() != "function_definition" {
+                continue;
+            }
+            scopes.push((
+                node.start_byte(),
+                node.end_byte(),
+                Self::declared_types_in(node, source, false),
+            ));
+        }
+
+        for site in sites.iter_mut() {
+            let Some(receiver) = site.receiver_expr.as_deref() else {
+                continue;
+            };
+
+            let scope = scopes
+                .iter()
+                .find(|(start, end, _)| site.byte_start >= *start && site.byte_start < *end)
+                .map(|(_, _, declared)| declared);
+            let declared_type = |name: &str| -> Option<String> {
+                match scope
+                    .and_then(|declared| declared.get(name))
+                    .or_else(|| file_scope.get(name))
+                {
+                    Some(Some(type_name)) => Some(type_name.clone()),
+                    _ => None,
+                }
+            };
+
+            if is_plain_name(receiver) {
+                site.receiver_type = declared_type(receiver);
+                continue;
+            }
+
+            // `inode->i_fop->read()`: the file proves what `inode` is, and
+            // the fields say what is read from it. What `i_fop` is declared
+            // as belongs to whichever file declares struct inode, so the path
+            // is stored and resolution walks it.
+            if let Some((base, fields)) = field_path(receiver) {
+                if let Some(base_type) = declared_type(base) {
+                    site.receiver_base_type = Some(base_type);
+                    site.receiver_field = Some(fields);
+                }
+            }
+        }
+    }
+
+    /// Names declared in this subtree with the aggregate type each was
+    /// declared as. A name declared twice with conflicting types maps to
+    /// `None`: the scope does not say which one a use refers to.
+    ///
+    /// `outer_only` keeps the walk out of functions entirely, which is how
+    /// file scope is collected without picking up another function's
+    /// parameters and locals.
+    fn declared_types_in(
+        node: tree_sitter::Node,
+        source: &str,
+        outer_only: bool,
+    ) -> HashMap<String, Option<String>> {
+        let mut declared: HashMap<String, Option<String>> = HashMap::new();
+        let mut stack = vec![node];
+
+        while let Some(node) = stack.pop() {
+            // File scope is what a function did not declare: parameters and
+            // locals belong to one function, and reading them as file scope
+            // types a receiver in a function that never declared it.
+            if outer_only && node.kind() == "function_definition" {
+                continue;
+            }
+
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+
+            if !matches!(node.kind(), "declaration" | "parameter_declaration") {
+                continue;
+            }
+
+            let type_name = node
+                .child_by_field_name("type")
+                .and_then(|type_node| Self::aggregate_type_name(type_node, source));
+
+            let mut cursor = node.walk();
+            for declarator in node.children_by_field_name("declarator", &mut cursor) {
+                let declarator = if declarator.kind() == "init_declarator" {
+                    match declarator.child_by_field_name("declarator") {
+                        Some(inner) => inner,
+                        None => continue,
+                    }
+                } else {
+                    declarator
+                };
+
+                let Some(name) = Self::innermost_declarator_name(declarator) else {
+                    continue;
+                };
+                let name = source[name.byte_range()].to_string();
+                if name.is_empty() {
+                    continue;
+                }
+
+                declared
+                    .entry(name)
+                    .and_modify(|known| {
+                        if *known != type_name {
+                            *known = None;
+                        }
+                    })
+                    .or_insert_with(|| type_name.clone());
+            }
+        }
+
+        declared
+    }
+
+    /// A struct has no member named `long`, because C will not allow one.
+    /// Assembly written in a macro body reads as C that says otherwise:
+    ///
+    /// ```text
+    /// #define __ASM_EXTABLE_RAW(insn, fixup, type, data)  \
+    ///         .pushsection __ex_table, "a";               \
+    ///         .long ((insn) - .);
+    /// ```
+    ///
+    /// `.long ((insn) - .)` parses as a call through a member named `long`,
+    /// and `.short (type)` as one named `short`. Rejecting a member that is a
+    /// keyword drops those without needing to know which bodies are assembly
+    /// — the same reading is wrong wherever it happens.
+    fn is_c_keyword(name: &str) -> bool {
+        const KEYWORDS: [&str; 55] = [
+            // C89 and C99
+            "auto",
+            "break",
+            "case",
+            "char",
+            "const",
+            "continue",
+            "default",
+            "do",
+            "double",
+            "else",
+            "enum",
+            "extern",
+            "float",
+            "for",
+            "goto",
+            "if",
+            "inline",
+            "int",
+            "long",
+            "register",
+            "restrict",
+            "return",
+            "short",
+            "signed",
+            "sizeof",
+            "static",
+            "struct",
+            "switch",
+            "typedef",
+            "union",
+            "unsigned",
+            "void",
+            "volatile",
+            "while",
+            // C11
+            "_Alignas",
+            "_Alignof",
+            "_Atomic",
+            "_Bool",
+            "_Complex",
+            "_Generic",
+            "_Imaginary",
+            "_Noreturn",
+            "_Static_assert",
+            "_Thread_local",
+            // C23, and the spellings the older headers get from <stdbool.h>
+            // and friends, which a member cannot use either
+            "alignas",
+            "alignof",
+            "bool",
+            "constexpr",
+            "false",
+            "nullptr",
+            "static_assert",
+            "thread_local",
+            "true",
+            "typeof",
+            "typeof_unqual",
+        ];
+
+        KEYWORDS.contains(&name)
+    }
+
+    /// Every `.member = target` in the file whose container type the file
+    /// itself states. An initializer whose type is not stated is skipped: a
+    /// registration filed under the wrong type joins with the wrong dispatch
+    /// sites, which is worse than not having it.
+    fn collect_registrations(root: tree_sitter::Node, source: &str) -> Vec<RawRegistration> {
+        let mut found = Vec::new();
+        let mut stack = vec![root];
+
+        while let Some(node) = stack.pop() {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+
+            if node.kind() != "initializer_list" {
+                continue;
+            }
+
+            let Some(container_type) = Self::initializer_container_type(node, source) else {
+                continue;
+            };
+
+            let mut cursor = node.walk();
+            for pair in node.named_children(&mut cursor) {
+                if pair.kind() != "initializer_pair" {
+                    continue;
+                }
+
+                // `.member = ...`; an array designator is a slot, not a member.
+                let Some(designator) = pair.child_by_field_name("designator") else {
+                    continue;
+                };
+                if designator.kind() != "field_designator" {
+                    continue;
+                }
+                let member = designator
+                    .named_child(0)
+                    .map(|n| source[n.byte_range()].to_string())
+                    .unwrap_or_default();
+
+                let Some(value) = pair.child_by_field_name("value") else {
+                    continue;
+                };
+                // `.read = my_read` and `.read = &my_read` say the same thing.
+                let target_node = match value.kind() {
+                    "identifier" => Some(value),
+                    "pointer_expression" => value
+                        .child_by_field_name("argument")
+                        .filter(|a| a.kind() == "identifier"),
+                    _ => None,
+                };
+                let Some(target_node) = target_node else {
+                    continue;
+                };
+
+                let target = source[target_node.byte_range()].to_string();
+                if member.is_empty() || target.is_empty() {
+                    continue;
+                }
+
+                found.push(RawRegistration {
+                    container_type: container_type.clone(),
+                    member,
+                    target,
+                    byte_start: pair.start_byte(),
+                    line: pair.start_position().row as u32 + 1,
+                    kind: RegistrationKind::DesignatedInit,
+                });
+            }
+        }
+
+        found
+    }
+
+    /// `x->handler = my_handler;` installs a function just as an initializer
+    /// does. The type of `x` has to come from a declaration in this file:
+    /// the struct is usually declared in a header the file does not contain,
+    /// and a registration filed under a guessed type is worse than none.
+    fn collect_assignments(root: tree_sitter::Node, source: &str) -> Vec<RawRegistration> {
+        let locals = Self::collect_local_struct_types(root, source);
+        let mut found = Vec::new();
+        let mut stack = vec![root];
+
+        while let Some(node) = stack.pop() {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+
+            if node.kind() != "assignment_expression" {
+                continue;
+            }
+
+            let (Some(left), Some(right)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+            ) else {
+                continue;
+            };
+            if left.kind() != "field_expression" {
+                continue;
+            }
+
+            let target = match right.kind() {
+                "identifier" => source[right.byte_range()].to_string(),
+                "pointer_expression" => match right
+                    .child_by_field_name("argument")
+                    .filter(|a| a.kind() == "identifier")
+                {
+                    Some(a) => source[a.byte_range()].to_string(),
+                    None => continue,
+                },
+                _ => continue,
+            };
+
+            let Some(member) = left
+                .child_by_field_name("field")
+                .map(|f| source[f.byte_range()].to_string())
+            else {
+                continue;
+            };
+
+            // Only a receiver that is a plain variable declared here can be
+            // typed without leaving the file.
+            let Some(receiver) = left.child_by_field_name("argument") else {
+                continue;
+            };
+            if receiver.kind() != "identifier" {
+                continue;
+            }
+            let Some(container_type) = locals.get(&source[receiver.byte_range()]).cloned() else {
+                continue;
+            };
+
+            found.push(RawRegistration {
+                container_type,
+                member,
+                target,
+                byte_start: node.start_byte(),
+                line: node.start_position().row as u32 + 1,
+                kind: RegistrationKind::Assignment,
+            });
+        }
+
+        found
+    }
+
+    /// Variables in this file declared as a struct, union or typedef, by name.
+    /// Shadowing is ignored: two locals of the same name in one file with
+    /// different types are rare, and the cost is a registration filed under
+    /// the wrong one of the two.
+    fn collect_local_struct_types(
+        root: tree_sitter::Node,
+        source: &str,
+    ) -> std::collections::HashMap<String, String> {
+        let mut types = std::collections::HashMap::new();
+        let mut stack = vec![root];
+
+        while let Some(node) = stack.pop() {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+
+            if !matches!(node.kind(), "declaration" | "parameter_declaration") {
+                continue;
+            }
+
+            let Some(type_node) = node.child_by_field_name("type") else {
+                continue;
+            };
+            let Some(type_name) = Self::aggregate_type_name(type_node, source) else {
+                continue;
+            };
+
+            let mut cursor = node.walk();
+            for declarator in node.children_by_field_name("declarator", &mut cursor) {
+                let declarator = if declarator.kind() == "init_declarator" {
+                    match declarator.child_by_field_name("declarator") {
+                        Some(inner) => inner,
+                        None => continue,
+                    }
+                } else {
+                    declarator
+                };
+
+                if let Some(name) = Self::innermost_declarator_name(declarator) {
+                    let name = source[name.byte_range()].to_string();
+                    if !name.is_empty() {
+                        types.insert(name, type_name.clone());
                     }
                 }
             }
         }
 
-        Ok(calls)
+        types
+    }
+
+    /// The type an initializer fills in, taken from the declaration or the
+    /// compound literal that holds it. A nested initializer states no type of
+    /// its own, and inferring one would need the member's declared type,
+    /// which usually lives in another file.
+    fn initializer_container_type(list: tree_sitter::Node, source: &str) -> Option<String> {
+        let mut node = list;
+
+        while let Some(parent) = node.parent() {
+            match parent.kind() {
+                // `(struct net_protocol) { .handler = tcp_v4_rcv }`
+                "compound_literal_expression" => {
+                    return parent
+                        .child_by_field_name("type")
+                        .and_then(|t| Self::aggregate_type_name(t, source));
+                }
+                // `static const struct file_operations fops = { ... };`
+                "init_declarator" | "declaration" => {
+                    let declaration = if parent.kind() == "declaration" {
+                        parent
+                    } else {
+                        parent.parent()?
+                    };
+                    return declaration
+                        .child_by_field_name("type")
+                        .and_then(|t| Self::aggregate_type_name(t, source));
+                }
+                // A nested initializer: the inner type is not stated here.
+                "initializer_pair" | "initializer_list" => return None,
+                _ => node = parent,
+            }
+        }
+
+        None
+    }
+
+    /// `struct file_operations` and a typedef name both identify a container.
+    fn aggregate_type_name(type_node: tree_sitter::Node, source: &str) -> Option<String> {
+        match type_node.kind() {
+            "struct_specifier" | "union_specifier" => type_node
+                .child_by_field_name("name")
+                .map(|n| source[n.byte_range()].to_string()),
+            "type_identifier" => Some(source[type_node.byte_range()].to_string()),
+            "type_descriptor" => type_node
+                .child_by_field_name("type")
+                .and_then(|t| Self::aggregate_type_name(t, source)),
+            _ => None,
+        }
+    }
+
+    /// Every function-pointer variable and parameter declared in the file.
+    /// A call naming one of these dispatches through a value; it is not a
+    /// call to a function of that name.
+    fn collect_pointer_vars(root: tree_sitter::Node, source: &str) -> Vec<PointerVar> {
+        let mut vars = Vec::new();
+        let mut stack = vec![root];
+
+        while let Some(node) = stack.pop() {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+
+            let is_parameter = match node.kind() {
+                "parameter_declaration" => true,
+                "declaration" => false,
+                _ => continue,
+            };
+
+            let mut cursor = node.walk();
+            for declarator in node.children_by_field_name("declarator", &mut cursor) {
+                // `int (*fp)(void) = handler;` wraps the declarator in an
+                // init_declarator that also carries the initial value.
+                let (declarator, target) = if declarator.kind() == "init_declarator" {
+                    let value = declarator.child_by_field_name("value").and_then(|value| {
+                        (value.kind() == "identifier")
+                            .then(|| source[value.byte_range()].to_string())
+                    });
+                    match declarator.child_by_field_name("declarator") {
+                        Some(inner) => (inner, value),
+                        None => continue,
+                    }
+                } else {
+                    (declarator, None)
+                };
+
+                if !Self::declares_function_pointer(declarator) {
+                    continue;
+                }
+
+                if let Some(name_node) = Self::innermost_declarator_name(declarator) {
+                    let name = source[name_node.byte_range()].to_string();
+                    if !name.is_empty() {
+                        vars.push(PointerVar {
+                            name,
+                            byte_start: node.start_byte(),
+                            target,
+                            is_parameter,
+                        });
+                    }
+                }
+            }
+        }
+
+        vars
+    }
+
+    /// True for `int (*fp)(void)`: a function declarator whose own declarator
+    /// is a parenthesised pointer, as opposed to a plain function declaration.
+    fn declares_function_pointer(declarator: tree_sitter::Node) -> bool {
+        let mut node = declarator;
+
+        loop {
+            if node.kind() == "function_declarator" {
+                let inner = node.child_by_field_name("declarator");
+                return matches!(inner.map(|i| i.kind()), Some("parenthesized_declarator"));
+            }
+
+            match node.child_by_field_name("declarator") {
+                Some(inner) => node = inner,
+                None => return false,
+            }
+        }
+    }
+
+    /// How many candidates an indirect-call macro names before the call's own
+    /// arguments begin. `INDIRECT_CALL_2(f, f2, f1, ...)` names two;
+    /// `INDIRECT_CALL_INET(f, f2, f1, ...)` is a two-candidate alias
+    /// (include/linux/indirect_call_wrapper.h). The count has to come from the
+    /// macro, not from the shape of the arguments: a call's own arguments are
+    /// identifiers just as often as the candidates are.
+    fn indirect_call_candidate_count(name: &str) -> Option<usize> {
+        match name {
+            "INDIRECT_CALL_INET" => Some(2),
+            "INDIRECT_CALL_INET_1" => Some(1),
+            _ => name
+                .strip_prefix("INDIRECT_CALL_")
+                .and_then(|suffix| suffix.parse::<usize>().ok())
+                .filter(|count| *count > 0),
+        }
+    }
+
+    /// One site per candidate the macro names, all pointing at the same
+    /// dispatch: `INDIRECT_CALL_2(ipprot->handler, tcp_v4_rcv, udp_rcv, skb)`
+    /// dispatches through `handler` and names two candidates.
+    fn indirect_call_sites(
+        args: tree_sitter::Node,
+        source: &str,
+        candidates: usize,
+    ) -> Vec<RawDispatchSite> {
+        let mut cursor = args.walk();
+        let arguments: Vec<tree_sitter::Node> = args.named_children(&mut cursor).collect();
+
+        let Some(dispatch) = arguments.first() else {
+            return Vec::new();
+        };
+
+        // The dispatch expression is usually a member: keep the member name
+        // so the site joins with everything installed in that slot.
+        let member = if dispatch.kind() == "field_expression" {
+            dispatch
+                .child_by_field_name("field")
+                .map(|field| source[field.byte_range()].to_string())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let mut sites = Vec::new();
+        for candidate in arguments.iter().skip(1).take(candidates) {
+            if candidate.kind() != "identifier" {
+                continue;
+            }
+
+            sites.push(RawDispatchSite {
+                member: member.clone(),
+                receiver_expr: Some(collapse_whitespace(&source[dispatch.byte_range()])),
+                receiver_type: None,
+                receiver_base_type: None,
+                receiver_field: None,
+                kind: DispatchKind::MacroDeclared,
+                byte_start: candidate.start_byte(),
+                line: candidate.start_position().row as u32 + 1,
+                target: Some(source[candidate.byte_range()].to_string()),
+            });
+        }
+
+        sites
+    }
+
+    /// `a->m()` and `a.m()` differ only in the operator between receiver and
+    /// member, which the grammar leaves as an anonymous node.
+    fn member_kind(member: tree_sitter::Node, source_code: &str) -> DispatchKind {
+        let field = member
+            .parent()
+            .and_then(|field_expression| field_expression.child_by_field_name("operator"));
+
+        match field.map(|op| &source_code[op.byte_range()]) {
+            Some(".") => DispatchKind::MemberDot,
+            _ => DispatchKind::MemberArrow,
+        }
+    }
+
+    /// Turn one `function_name` capture into a call site: the called name and
+    /// the byte range it occupies, which is what maps a call to its caller.
+    fn call_site_from_capture(
+        node: tree_sitter::Node,
+        source_code: &str,
+    ) -> Option<(String, usize, usize)> {
+        let name = node.utf8_text(source_code.as_bytes()).unwrap_or("");
+
+        // Skip empty names and obvious non-functions.
+        if name.is_empty() || name.chars().all(|c| c.is_numeric()) {
+            return None;
+        }
+
+        Some((name.to_string(), node.start_byte(), node.end_byte()))
     }
 
     /// Extract functions with pre-computed call data (avoids per-function tree traversals)
     fn extract_functions_with_calls(
         &self,
         ctx: &ExtractionContext,
-        all_calls: &[(String, usize, usize)],
-    ) -> Result<Vec<FunctionInfo>> {
+        extraction: &CallExtraction,
+    ) -> Result<(Vec<FunctionInfo>, Vec<DispatchSite>, Vec<Registration>)> {
+        let mut dispatch_sites: Vec<DispatchSite> = Vec::new();
+        let mut registrations: Vec<Registration> = Vec::new();
+        let mut covered_sites: std::collections::HashSet<usize> = Default::default();
+        let mut covered_registrations: std::collections::HashSet<usize> = Default::default();
+        let mut pointer_call_sites: Vec<RawDispatchSite> = Vec::new();
         let queries = self.get_queries(ctx.language);
         let mut cursor = QueryCursor::new();
         let mut captures = cursor.captures(
@@ -778,13 +1701,43 @@ impl TreeSitterAnalyzer {
                 // Only extract calls and types for functions with bodies (not just declarations)
                 let (unique_calls, function_types) = if has_body {
                     // Extract calls within this function from pre-computed list (O(m) instead of O(n))
-                    let function_calls: Vec<String> = all_calls
+                    // Function pointers declared by this function: a call
+                    // naming one of them dispatches through a value.
+                    let pointers: std::collections::HashMap<&str, &PointerVar> = extraction
+                        .pointer_vars
                         .iter()
-                        .filter(|(_, call_start, call_end)| {
-                            *call_start >= function_start_byte && *call_end <= function_end_byte
+                        .filter(|var| {
+                            var.byte_start >= function_start_byte
+                                && var.byte_start < function_end_byte
                         })
-                        .map(|(call_name, _, _)| call_name.clone())
+                        .map(|var| (var.name.as_str(), var))
                         .collect();
+
+                    let mut function_calls: Vec<String> = Vec::new();
+                    for (call_name, call_start, call_end) in &extraction.calls {
+                        if *call_start < function_start_byte || *call_end > function_end_byte {
+                            continue;
+                        }
+
+                        match pointers.get(call_name.as_str()) {
+                            Some(var) => pointer_call_sites.push(RawDispatchSite {
+                                member: String::new(),
+                                receiver_expr: Some(var.name.clone()),
+                                receiver_type: None,
+                                receiver_base_type: None,
+                                receiver_field: None,
+                                kind: if var.is_parameter {
+                                    DispatchKind::PointerParam
+                                } else {
+                                    DispatchKind::PointerLocal
+                                },
+                                byte_start: *call_start,
+                                line: ctx.source[..*call_start].lines().count() as u32,
+                                target: var.target.clone(),
+                            }),
+                            None => function_calls.push(call_name.clone()),
+                        }
+                    }
 
                     // Remove duplicates and sort
                     let mut unique_calls = function_calls;
@@ -801,6 +1754,41 @@ impl TreeSitterAnalyzer {
                     // For declarations only, don't extract calls or types from body
                     (Vec::new(), Vec::new())
                 };
+
+                for raw in extraction
+                    .member_sites
+                    .iter()
+                    .chain(pointer_call_sites.iter())
+                    .filter(|site| {
+                        site.byte_start >= function_start_byte
+                            && site.byte_start < function_end_byte
+                    })
+                {
+                    // The function query yields several captures per function,
+                    // so a site can be reached more than once; a site is one
+                    // row regardless.
+                    if !covered_sites.insert(raw.byte_start) {
+                        continue;
+                    }
+                    dispatch_sites.push(raw.attribute(
+                        &name,
+                        &self.make_relative_path(ctx.file_path, ctx.source_root),
+                        ctx.git_hash,
+                    ));
+                }
+
+                for raw in extraction.registrations.iter().filter(|reg| {
+                    reg.byte_start >= function_start_byte && reg.byte_start < function_end_byte
+                }) {
+                    if !covered_registrations.insert(raw.byte_start) {
+                        continue;
+                    }
+                    registrations.push(raw.attribute(
+                        &name,
+                        &self.make_relative_path(ctx.file_path, ctx.source_root),
+                        ctx.git_hash,
+                    ));
+                }
 
                 let func = FunctionInfo {
                     name: name.clone(),
@@ -835,7 +1823,34 @@ impl TreeSitterAnalyzer {
             }
         }
 
-        Ok(functions)
+        // Most ops tables sit at file scope and belong to no function.
+        for raw in extraction
+            .registrations
+            .iter()
+            .filter(|reg| !covered_registrations.contains(&reg.byte_start))
+        {
+            registrations.push(raw.attribute(
+                "",
+                &self.make_relative_path(ctx.file_path, ctx.source_root),
+                ctx.git_hash,
+            ));
+        }
+
+        // Python module level and class bodies, C++ and Rust static
+        // initializers: a dispatch that belongs to no function still happened.
+        for raw in extraction
+            .member_sites
+            .iter()
+            .filter(|site| !covered_sites.contains(&site.byte_start))
+        {
+            dispatch_sites.push(raw.attribute(
+                "",
+                &self.make_relative_path(ctx.file_path, ctx.source_root),
+                ctx.git_hash,
+            ));
+        }
+
+        Ok((functions, dispatch_sites, registrations))
     }
 
     /// Extract macros with embedded call/type data (optimized)
@@ -847,7 +1862,7 @@ impl TreeSitterAnalyzer {
         git_hash: &str,
         source_root: Option<&Path>,
         language: Language,
-    ) -> Result<Vec<FunctionInfo>> {
+    ) -> Result<(Vec<FunctionInfo>, Vec<DispatchSite>, Vec<Registration>)> {
         // This is the same as extract_macros but named differently for clarity
         // Macros are not as performance-critical as functions since they're fewer in number
         self.extract_macros(tree, source, file_path, git_hash, source_root, language)
@@ -864,7 +1879,8 @@ impl TreeSitterAnalyzer {
         language: Language,
     ) -> Result<Vec<FunctionInfo>> {
         // Use the optimized approach but without pre-computed calls (for compatibility)
-        let all_calls = self.extract_all_calls_optimized(tree, source, language)?;
+        let extraction =
+            Self::extract_all_calls_optimized(self.get_queries(language), tree, source)?;
         let ctx = ExtractionContext {
             tree,
             source,
@@ -873,7 +1889,10 @@ impl TreeSitterAnalyzer {
             source_root,
             language,
         };
-        self.extract_functions_with_calls(&ctx, &all_calls)
+        let (functions, _dispatch_sites, _registrations) =
+            self.extract_functions_with_calls(&ctx, &extraction)?;
+
+        Ok(functions)
     }
 
     fn extract_comments(
@@ -1249,14 +2268,22 @@ impl TreeSitterAnalyzer {
         git_hash: &str,
         source_root: Option<&Path>,
         language: Language,
-    ) -> Result<Vec<FunctionInfo>> {
+    ) -> Result<(Vec<FunctionInfo>, Vec<DispatchSite>, Vec<Registration>)> {
+        // Macro bodies are re-parsed as C; one parser serves the whole file.
+        let mut body_parser = tree_sitter::Parser::new();
+        body_parser.set_language(&tree_sitter_c::LANGUAGE.into())?;
+        let mut dispatch_sites: Vec<DispatchSite> = Vec::new();
+        let mut registrations: Vec<Registration> = Vec::new();
         let queries = self.get_queries(language);
         let mut cursor = QueryCursor::new();
-        let mut captures =
-            cursor.captures(&queries.macro_query, tree.root_node(), source.as_bytes());
+        // matches(), not captures(): a match arrives once with every capture
+        // present. captures() yields the same match repeatedly as each
+        // capture is found, and the early yields have no body yet.
+        let mut matches = cursor.matches(&queries.macro_query, tree.root_node(), source.as_bytes());
         let mut macros = Vec::new();
 
-        while let Some((m, _)) = captures.next() {
+        while let Some(m) = matches.next() {
+            let mut body: Option<tree_sitter::Node> = None;
             let mut macro_name = None;
             let mut parameters = None;
             let mut definition = String::new();
@@ -1277,9 +2304,7 @@ impl TreeSitterAnalyzer {
                         parameters = Some(self.parse_macro_parameters(text));
                         is_function_like = true;
                     }
-                    "value" => {
-                        // Skip the value capture since we don't use expansion anymore
-                    }
+                    "value" => body = Some(node),
                     "macro" | "function_macro" => {
                         definition = text.to_string();
                         if capture_name == "function_macro" {
@@ -1292,7 +2317,46 @@ impl TreeSitterAnalyzer {
 
             if let Some(name) = macro_name {
                 // Extract calls and types from macro definition
-                let (macro_calls, macro_types) = self.extract_macro_calls_and_types(&definition);
+                let facts = match body {
+                    Some(body) => {
+                        let mut facts = Self::macro_body_calls_and_types(
+                            &mut body_parser,
+                            queries,
+                            &source[body.byte_range()],
+                        );
+
+                        // Positions come back relative to the body; place them
+                        // in the file so a fact is where the macro is.
+                        let body_start = body.start_byte();
+                        let body_line = body.start_position().row as u32 + 1;
+                        for site in &mut facts.sites {
+                            site.byte_start += body_start;
+                            site.line = body_line + site.line.saturating_sub(1);
+                        }
+                        for registration in &mut facts.registrations {
+                            registration.byte_start += body_start;
+                            registration.line = body_line + registration.line.saturating_sub(1);
+                        }
+
+                        facts
+                    }
+                    None => MacroBodyFacts::default(),
+                };
+                let (macro_calls, macro_types) = (facts.calls, facts.types);
+
+                let relative_path = self.make_relative_path(file_path, source_root);
+                dispatch_sites.extend(
+                    facts
+                        .sites
+                        .iter()
+                        .map(|raw| raw.attribute(&name, &relative_path, git_hash)),
+                );
+                registrations.extend(
+                    facts
+                        .registrations
+                        .iter()
+                        .map(|raw| raw.attribute(&name, &relative_path, git_hash)),
+                );
 
                 let macro_info = FunctionInfo::from_macro(MacroParams {
                     name,
@@ -1322,7 +2386,7 @@ impl TreeSitterAnalyzer {
             }
         }
 
-        Ok(macros)
+        Ok((macros, dispatch_sites, registrations))
     }
 
     fn parse_parameters_from_node(
@@ -1479,199 +2543,36 @@ impl TreeSitterAnalyzer {
         node: tree_sitter::Node,
         source: &str,
     ) -> Option<ParameterInfo> {
-        let mut type_parts = Vec::new();
-        let mut param_name = String::new();
+        let type_node = node.child_by_field_name("type")?;
+        let base_type = Self::render_declaration_type(node, type_node, source);
 
-        // Walk through the parameter_declaration to extract type and name
-        let mut cursor = node.walk();
-        cursor.goto_first_child();
+        let (name, shape) = match node.child_by_field_name("declarator") {
+            Some(declarator) => match Self::innermost_declarator_name(declarator) {
+                Some(name_node) => (
+                    source[name_node.byte_range()].to_string(),
+                    Self::abstract_declarator(declarator, name_node, source),
+                ),
+                // An abstract declarator names nothing: `int (*)(void)`, `char *`.
+                None => (
+                    String::new(),
+                    collapse_whitespace(&source[declarator.byte_range()]),
+                ),
+            },
+            None => (String::new(), String::new()),
+        };
 
-        loop {
-            let current_node = cursor.node();
-            let node_kind = current_node.kind();
-            let text = &source[current_node.byte_range()];
-
-            match node_kind {
-                // Type specifiers
-                "primitive_type" | "type_identifier" | "sized_type_specifier" => {
-                    type_parts.push(text.to_string());
-                }
-                // Storage class specifiers
-                "storage_class_specifier" => {
-                    type_parts.push(text.to_string());
-                }
-                // Type qualifiers (const, volatile, etc.)
-                "type_qualifier" => {
-                    type_parts.push(text.to_string());
-                }
-                // Struct/union/enum specifiers
-                "struct_specifier" | "union_specifier" | "enum_specifier" => {
-                    type_parts.push(text.to_string());
-                }
-                // Declarators (contain the parameter name)
-                "identifier" => {
-                    // This is likely the parameter name
-                    if param_name.is_empty() {
-                        param_name = text.to_string();
-                    }
-                }
-                "pointer_declarator" => {
-                    // Parse pointer declarator to extract both pointer info and name
-                    self.parse_pointer_declarator(
-                        current_node,
-                        source,
-                        &mut type_parts,
-                        &mut param_name,
-                    );
-                }
-                "array_declarator" => {
-                    // Parse array declarator
-                    self.parse_array_declarator(
-                        current_node,
-                        source,
-                        &mut type_parts,
-                        &mut param_name,
-                    );
-                }
-                "function_declarator" => {
-                    // Function pointer parameter
-                    self.parse_function_declarator(
-                        current_node,
-                        source,
-                        &mut type_parts,
-                        &mut param_name,
-                    );
-                }
-                // Skip punctuation and whitespace
-                "," | "(" | ")" => {}
-                _ => {
-                    // For any other node types, include the text as part of the type
-                    if !text.trim().is_empty() && text != "," && text != "(" && text != ")" {
-                        type_parts.push(text.to_string());
-                    }
-                }
-            }
-
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-
-        // If we have type information, create a ParameterInfo
-        if !type_parts.is_empty() || !param_name.is_empty() {
-            let type_name = if type_parts.is_empty() {
-                "int".to_string() // Default type in C
-            } else {
-                type_parts.join(" ")
-            };
-
-            Some(ParameterInfo {
-                name: param_name,
-                type_name,
-                type_file_path: None, // Will be resolved later in type resolution phase
-                type_git_file_hash: None, // Will be resolved later in type resolution phase
-            })
+        let type_name = if shape.is_empty() {
+            base_type
         } else {
-            None
-        }
-    }
+            format!("{base_type} {shape}")
+        };
 
-    #[allow(clippy::only_used_in_recursion)]
-    fn parse_pointer_declarator(
-        &self,
-        node: tree_sitter::Node,
-        source: &str,
-        type_parts: &mut Vec<String>,
-        param_name: &mut String,
-    ) {
-        let mut cursor = node.walk();
-        cursor.goto_first_child();
-
-        // Count asterisks and find the identifier
-        loop {
-            let current_node = cursor.node();
-            let text = &source[current_node.byte_range()];
-
-            match current_node.kind() {
-                "*" => {
-                    type_parts.push("*".to_string());
-                }
-                "identifier" if param_name.is_empty() => {
-                    *param_name = text.to_string();
-                }
-                "pointer_declarator" => {
-                    // Nested pointer, recurse
-                    self.parse_pointer_declarator(current_node, source, type_parts, param_name);
-                }
-                _ => {}
-            }
-
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-    }
-
-    fn parse_array_declarator(
-        &self,
-        node: tree_sitter::Node,
-        source: &str,
-        type_parts: &mut Vec<String>,
-        param_name: &mut String,
-    ) {
-        let mut cursor = node.walk();
-        cursor.goto_first_child();
-
-        loop {
-            let current_node = cursor.node();
-            let text = &source[current_node.byte_range()];
-
-            match current_node.kind() {
-                "identifier" if param_name.is_empty() => {
-                    *param_name = text.to_string();
-                }
-                "[" | "]" => {
-                    type_parts.push(text.to_string());
-                }
-                "number_literal" => {
-                    type_parts.push(text.to_string());
-                }
-                _ => {}
-            }
-
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-    }
-
-    fn parse_function_declarator(
-        &self,
-        node: tree_sitter::Node,
-        source: &str,
-        type_parts: &mut Vec<String>,
-        param_name: &mut String,
-    ) {
-        // For function pointer parameters, we'll capture the basic structure
-
-        // Extract the identifier if present
-        let mut cursor = node.walk();
-        cursor.goto_first_child();
-
-        loop {
-            let current_node = cursor.node();
-            if current_node.kind() == "identifier" && param_name.is_empty() {
-                *param_name = source[current_node.byte_range()].to_string();
-                break;
-            }
-
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-
-        // For now, just add the function pointer syntax to type
-        type_parts.push("(*)".to_string());
+        Some(ParameterInfo {
+            name,
+            type_name,
+            type_file_path: None, // resolved later in the type resolution phase
+            type_git_file_hash: None, // resolved later in the type resolution phase
+        })
     }
 
     fn parse_struct_members_from_node(
@@ -1685,7 +2586,7 @@ impl TreeSitterAnalyzer {
         let mut cursor = body_node.walk();
         for child in body_node.children(&mut cursor) {
             if child.kind() == "field_declaration" {
-                if let Some(field_info) = self.parse_field_declaration_node(child, source) {
+                if let Some(field_info) = self.parse_field_declaration_node(child, source, "") {
                     members.extend(field_info);
                 }
             }
@@ -1703,106 +2604,164 @@ impl TreeSitterAnalyzer {
         &self,
         field_decl_node: tree_sitter::Node,
         source: &str,
+        prefix: &str,
     ) -> Option<Vec<FieldInfo>> {
+        let type_node = field_decl_node.child_by_field_name("type")?;
+        let base_type = Self::render_declaration_type(field_decl_node, type_node, source);
+        let inline_body = Self::inline_aggregate_body(type_node);
+
         let mut fields = Vec::new();
+        let mut cursor = field_decl_node.walk();
+        let declarators: Vec<tree_sitter::Node> = field_decl_node
+            .children_by_field_name("declarator", &mut cursor)
+            .collect();
 
-        // Simple approach: just parse the entire field declaration as text
-        // This ensures we don't miss any types due to overly restrictive filtering
-        let decl_text = source[field_decl_node.byte_range()].trim();
-
-        // Use the string-based parsing which is more reliable
-        fields.extend(self.parse_single_field_declaration(decl_text));
-
-        if !fields.is_empty() {
-            Some(fields)
-        } else {
-            None
+        // An anonymous member declares no name of its own: C makes its members
+        // members of the enclosing struct, reachable as `parent->inner`.
+        if declarators.is_empty() {
+            let body = inline_body?;
+            return Some(self.parse_struct_members_from_node_prefixed(body, source, prefix));
         }
-    }
 
-    fn parse_single_field_declaration(&self, decl_text: &str) -> Vec<FieldInfo> {
-        let mut fields = Vec::new();
-
-        // Handle a single field declaration like "int x, y, z;" or "struct foo *ptr;"
-        for line in decl_text.lines() {
-            let line = line.trim();
-            if line.ends_with(';')
-                && !line.is_empty()
-                && !line.starts_with("//")
-                && !line.starts_with("/*")
-            {
-                let line = line.trim_end_matches(';').trim();
-
-                // Skip empty lines and comments
-                if line.is_empty() {
-                    continue;
-                }
-
-                // Handle comma-separated fields like "int x, y, z;"
-                if line.contains(',') {
-                    fields.extend(self.parse_comma_separated_fields(line));
-                } else {
-                    // Single field declaration
-                    fields.extend(self.parse_single_field_declaration_line(line));
-                }
+        for declarator in declarators {
+            let Some(name_node) = Self::innermost_declarator_name(declarator) else {
+                continue;
+            };
+            let name = source[name_node.byte_range()].to_string();
+            // Error recovery can leave a zero-width identifier behind.
+            if name.is_empty() {
+                continue;
             }
-        }
+            let shape = Self::abstract_declarator(declarator, name_node, source);
 
-        fields
-    }
-
-    fn parse_comma_separated_fields(&self, line: &str) -> Vec<FieldInfo> {
-        let mut fields = Vec::new();
-
-        // Split by comma and parse each field
-        let field_parts: Vec<&str> = line.split(',').collect();
-
-        for (i, field_part) in field_parts.iter().enumerate() {
-            let field_part = field_part.trim();
-
-            if i == 0 {
-                // First field has the complete type
-                fields.extend(self.parse_single_field_declaration_line(field_part));
+            let type_name = if shape.is_empty() {
+                base_type.clone()
             } else {
-                // Subsequent fields share the same base type as the first field
-                if let Some(first_field) = fields.first() {
-                    let (field_name, field_modifiers) =
-                        self.extract_field_name_and_modifiers(field_part);
-                    if !field_name.is_empty() {
-                        // Extract base type from first field (remove any modifiers)
-                        let base_type = self.extract_base_type(&first_field.type_name);
-                        let complete_type = if field_modifiers.is_empty() {
-                            base_type
-                        } else {
-                            format!("{base_type} {field_modifiers}")
-                        };
+                format!("{base_type} {shape}")
+            };
 
-                        fields.push(FieldInfo {
-                            name: field_name,
-                            type_name: complete_type,
-                            offset: None,
-                        });
-                    }
+            fields.push(FieldInfo {
+                name: format!("{prefix}{name}"),
+                type_name,
+                offset: None,
+            });
+
+            // An inline aggregate has no name to look its members up by, so
+            // report them here, qualified by the member that holds them.
+            if let Some(body) = inline_body {
+                let nested_prefix = format!("{prefix}{name}.");
+                fields.extend(self.parse_struct_members_from_node_prefixed(
+                    body,
+                    source,
+                    &nested_prefix,
+                ));
+            }
+        }
+
+        if fields.is_empty() {
+            None
+        } else {
+            Some(fields)
+        }
+    }
+
+    /// The body of an inline `struct`/`union`/`enum` definition, if the type is
+    /// spelled out here rather than referred to by name.
+    fn inline_aggregate_body(type_node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+        match type_node.kind() {
+            "struct_specifier" | "union_specifier" => type_node.child_by_field_name("body"),
+            _ => None,
+        }
+    }
+
+    fn parse_struct_members_from_node_prefixed(
+        &self,
+        body_node: tree_sitter::Node,
+        source: &str,
+        prefix: &str,
+    ) -> Vec<FieldInfo> {
+        let mut members = Vec::new();
+        let mut cursor = body_node.walk();
+        for child in body_node.children(&mut cursor) {
+            if child.kind() == "field_declaration" {
+                if let Some(fields) = self.parse_field_declaration_node(child, source, prefix) {
+                    members.extend(fields);
                 }
             }
         }
 
-        fields
+        members
     }
 
-    fn extract_base_type(&self, full_type: &str) -> String {
-        // Extract base type by removing pointer/array modifiers from the end
-        let parts: Vec<&str> = full_type.split_whitespace().collect();
+    /// Render a declaration's type, including qualifiers that sit beside the
+    /// type node rather than inside it (`const char *x` keeps its `const`).
+    fn render_declaration_type(
+        decl_node: tree_sitter::Node,
+        type_node: tree_sitter::Node,
+        source: &str,
+    ) -> String {
+        let mut parts = Vec::new();
+        let mut cursor = decl_node.walk();
+        for child in decl_node.children(&mut cursor) {
+            if child.start_byte() >= type_node.start_byte() {
+                break;
+            }
+            if matches!(child.kind(), "type_qualifier" | "storage_class_specifier") {
+                parts.push(collapse_whitespace(&source[child.byte_range()]));
+            }
+        }
+        parts.push(Self::render_type_node(type_node, source));
 
-        // Find where modifiers start (*, [, :)
-        for (i, part) in parts.iter().enumerate() {
-            if part.contains('*') || part.contains('[') || part.contains(':') {
-                return parts[..i].join(" ");
+        parts.join(" ")
+    }
+
+    /// Render the type of a declaration, keeping an inline aggregate short.
+    fn render_type_node(type_node: tree_sitter::Node, source: &str) -> String {
+        let keyword = match type_node.kind() {
+            "struct_specifier" => Some("struct"),
+            "union_specifier" => Some("union"),
+            "enum_specifier" => Some("enum"),
+            _ => None,
+        };
+
+        if let Some(keyword) = keyword {
+            if type_node.child_by_field_name("body").is_some() {
+                return match type_node.child_by_field_name("name") {
+                    Some(name) => format!("{keyword} {} {{...}}", &source[name.byte_range()]),
+                    None => format!("{keyword} {{...}}"),
+                };
             }
         }
 
-        // If no modifiers found, return the whole type
-        full_type.to_string()
+        collapse_whitespace(&source[type_node.byte_range()])
+    }
+
+    /// Follow a declarator down to the identifier it declares, without
+    /// descending into a function declarator's parameters.
+    fn innermost_declarator_name(declarator: tree_sitter::Node) -> Option<tree_sitter::Node> {
+        let mut node = declarator;
+
+        loop {
+            match node.kind() {
+                "field_identifier" | "identifier" | "type_identifier" => return Some(node),
+                "parenthesized_declarator" => node = node.named_child(0)?,
+                _ => node = node.child_by_field_name("declarator")?,
+            }
+        }
+    }
+
+    /// The declarator with its identifier removed: `(*read)(struct file *f)`
+    /// becomes `(*)(struct file *f)`, `*next` becomes `*`, `x[4]` becomes `[4]`.
+    fn abstract_declarator(
+        declarator: tree_sitter::Node,
+        name_node: tree_sitter::Node,
+        source: &str,
+    ) -> String {
+        let text = &source[declarator.byte_range()];
+        let start = name_node.start_byte() - declarator.start_byte();
+        let end = name_node.end_byte() - declarator.start_byte();
+
+        collapse_whitespace(&format!("{}{}", &text[..start], &text[end..]))
     }
 
     fn parse_single_field_declaration_line(&self, line: &str) -> Vec<FieldInfo> {
@@ -2280,49 +3239,238 @@ impl TreeSitterAnalyzer {
         )
     }
 
-    /// Extract calls and types from macro definition (simple text-based analysis)
-    fn extract_macro_calls_and_types(&self, definition: &str) -> (Vec<String>, Vec<String>) {
+    /// Parse a macro body as C and report what it calls and which types it
+    /// names.
+    ///
+    /// A `#define` body is not a translation unit — it can be an expression,
+    /// a statement, a declaration or an initializer — so it is tried in each
+    /// of those contexts and the cleanest parse wins.
+    fn macro_body_calls_and_types(
+        parser: &mut tree_sitter::Parser,
+        queries: &LanguageQueries,
+        body: &str,
+    ) -> MacroBodyFacts {
+        let body = body.trim();
+        if body.is_empty() {
+            return MacroBodyFacts::default();
+        }
+
+        let Some((tree, wrapped, prefix_len)) = Self::parse_macro_body(parser, body) else {
+            return MacroBodyFacts {
+                calls: Self::scan_macro_body_calls(body),
+                ..Default::default()
+            };
+        };
+
         let mut calls = Vec::new();
-        let mut types = Vec::new();
-
-        // Simple regex-like patterns for function calls: word followed by '('
-        let definition_text = definition.trim();
-        let words: Vec<&str> = definition_text.split_whitespace().collect();
-
-        for (i, word) in words.iter().enumerate() {
-            // Look for function call pattern: identifier followed by (
-            if word.ends_with('(') || (i + 1 < words.len() && words[i + 1] == "(") {
-                let potential_call = word.trim_end_matches('(');
-                if self.is_valid_identifier(potential_call) {
-                    calls.push(potential_call.to_string());
-                }
-            }
-
-            // Look for type usage patterns (struct/union/enum keywords)
-            if (*word == "struct" || *word == "union" || *word == "enum") && i + 1 < words.len() {
-                let type_name = words[i + 1].trim_end_matches(&['*', '&', ';', ',', ')', '}'][..]);
-                if self.is_valid_identifier(type_name) {
-                    types.push(type_name.to_string());
+        let mut any_call = false;
+        let mut cursor = QueryCursor::new();
+        let mut captures =
+            cursor.captures(&queries.call_query, tree.root_node(), wrapped.as_bytes());
+        while let Some((call_match, _)) = captures.next() {
+            for capture in call_match.captures {
+                match queries.call_query.capture_names()[capture.index as usize] {
+                    "function_name" => {
+                        let name = &wrapped[capture.node.byte_range()];
+                        if !name.is_empty() {
+                            calls.push(name.to_string());
+                        }
+                    }
+                    // A call that names no function is still a call, and
+                    // knowing one is there is what keeps the scan below off.
+                    "call" | "method_call" | "deref_call" | "macro_call" => any_call = true,
+                    _ => {}
                 }
             }
         }
 
-        // Remove duplicates and sort
+        let mut types = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            let mut walker = node.walk();
+            for child in node.children(&mut walker) {
+                stack.push(child);
+            }
+
+            match node.kind() {
+                "struct_specifier" | "union_specifier" | "enum_specifier" => {
+                    if let Some(name) = node.child_by_field_name("name") {
+                        types.push(wrapped[name.byte_range()].to_string());
+                    }
+                }
+                "type_identifier" => types.push(wrapped[node.byte_range()].to_string()),
+                _ => {}
+            }
+        }
+
+        // Plenty of bodies are fragments that are not valid C on their own —
+        // `"prefix: " fmt` and friends — and parse into something with no call
+        // in it. Scanning finds the call there; the parse is what keeps the
+        // scan from reading grouping parens as calls in the ordinary case.
+        //
+        // A body whose only call goes through a member has no function to
+        // name, and scanning it reads the member as one: `(p)->func->target(p)`
+        // is not a call to `target`. The dispatch is recorded as a site.
+        if calls.is_empty() && !any_call {
+            calls = Self::scan_macro_body_calls(body);
+        }
+
+        // The wrapper introduces names of its own; they are not the macro's.
+        calls.retain(|name| !name.starts_with("__semcode_"));
+        types.retain(|name| !name.starts_with("__semcode_"));
+
         calls.sort();
         calls.dedup();
         types.sort();
         types.dedup();
 
-        (calls, types)
+        // A macro body dispatches like any other code: `((o)->run())` is a
+        // call through a member wherever it is written. Positions are in the
+        // wrapped text, and the caller maps them back to the file.
+        let mut sites = match Self::extract_all_calls_optimized(queries, &tree, &wrapped) {
+            Ok(extraction) => extraction.member_sites,
+            Err(_) => Vec::new(),
+        };
+
+        // A macro body can install a function as well as call one, when it
+        // declares the thing it initialises:
+        //
+        //     #define DEFINE_OPS(name, fn) struct ops name = { .run = fn }
+        //
+        // A bare `{ .run = fn }` states no type — the wrapper's type is the
+        // wrapper's, not the macro's — so it registers nothing, as elsewhere.
+        let mut registrations = Self::collect_registrations(tree.root_node(), &wrapped);
+        registrations.extend(Self::collect_assignments(tree.root_node(), &wrapped));
+        registrations.retain(|r| !r.container_type.starts_with("__semcode_"));
+
+        // The wrapper sits on one line before the body, so a position maps
+        // back by subtracting its length; a body spanning several lines keeps
+        // its own line offsets.
+        sites.retain(|site| site.byte_start >= prefix_len);
+        for site in &mut sites {
+            site.byte_start -= prefix_len;
+        }
+        registrations.retain(|r| r.byte_start >= prefix_len);
+        for registration in &mut registrations {
+            registration.byte_start -= prefix_len;
+        }
+
+        MacroBodyFacts {
+            calls,
+            types,
+            sites,
+            registrations,
+        }
     }
 
-    /// Check if a string is a valid C identifier
-    fn is_valid_identifier(&self, s: &str) -> bool {
-        !s.is_empty()
-            && s.chars().all(|c| c.is_alphanumeric() || c == '_')
-            && s.chars()
-                .next()
-                .is_some_and(|c| c.is_alphabetic() || c == '_')
+    /// Parse a macro body in whichever context it fits: the tree, the text it
+    /// was parsed in, and how far the wrapper pushed the body along, so node
+    /// ranges can be read back into the file.
+    ///
+    /// A body that does not parse cleanly is used anyway, structure included.
+    /// That is deliberate and measured: harvesting sites and registrations
+    /// only from an error-free parse costs 819 registrations and 134 dispatch
+    /// sites on a Linux tree, to remove 29 wrong rows. A body full of token
+    /// pasting never parses cleanly, and its `.read = seq_read` says what it
+    /// installs regardless.
+    ///
+    /// What error recovery does invent is filtered where it can be recognised
+    /// rather than by refusing the tree: a member named after a keyword and a
+    /// member call with no receiver are both impossible in C, and both are
+    /// dropped. Between them they cover the assembler bodies, which is where
+    /// invented structure was actually coming from.
+    fn parse_macro_body(
+        parser: &mut tree_sitter::Parser,
+        body: &str,
+    ) -> Option<(Tree, String, usize)> {
+        const CONTEXTS: [(&str, &str); 3] = [
+            ("void __semcode_body(void) { ", "; }"),
+            ("", ""),
+            ("struct __semcode_s __semcode_v = ", ";"),
+        ];
+
+        let mut best: Option<(Tree, String, usize, usize)> = None;
+
+        for (prefix, suffix) in CONTEXTS {
+            let wrapped = format!("{prefix}{body}{suffix}");
+            let Some(tree) = parser.parse(&wrapped, None) else {
+                continue;
+            };
+
+            let errors = Self::count_parse_errors(tree.root_node());
+            if errors == 0 {
+                return Some((tree, wrapped, prefix.len()));
+            }
+
+            match &best {
+                Some((_, _, _, fewest)) if *fewest <= errors => {}
+                _ => best = Some((tree, wrapped, prefix.len(), errors)),
+            }
+        }
+
+        best.map(|(tree, wrapped, prefix_len, _)| (tree, wrapped, prefix_len))
+    }
+
+    fn count_parse_errors(node: tree_sitter::Node) -> usize {
+        if !node.has_error() {
+            return 0;
+        }
+
+        let mut errors = 0;
+        let mut stack = vec![node];
+        while let Some(node) = stack.pop() {
+            if node.is_error() || node.is_missing() {
+                errors += 1;
+            }
+            let mut walker = node.walk();
+            for child in node.children(&mut walker) {
+                stack.push(child);
+            }
+        }
+
+        errors
+    }
+
+    /// Identifiers immediately before a '(' in a macro body, less the
+    /// keywords that take a parenthesised operand without being a call.
+    fn scan_macro_body_calls(body: &str) -> Vec<String> {
+        const NOT_CALLS: [&str; 12] = [
+            "if",
+            "for",
+            "while",
+            "switch",
+            "return",
+            "sizeof",
+            "typeof",
+            "__typeof__",
+            "defined",
+            "case",
+            "do",
+            "else",
+        ];
+
+        let mut calls = Vec::new();
+        for (offset, _) in body.match_indices('(') {
+            let before = body[..offset].trim_end();
+            // Step back over the delimiter by its own width: a body can hold
+            // any UTF-8, and slicing at delimiter + 1 splits a character.
+            let start = before
+                .char_indices()
+                .rev()
+                .find(|(_, c)| !(c.is_alphanumeric() || *c == '_'))
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0);
+            let name = &before[start..];
+
+            let is_identifier = !name.is_empty()
+                && !name.starts_with(|c: char| c.is_numeric())
+                && name.chars().all(|c| c.is_alphanumeric() || c == '_');
+            if is_identifier && !NOT_CALLS.contains(&name) {
+                calls.push(name.to_string());
+            }
+        }
+
+        calls
     }
 
     /// Deduplicate functions within a single file (no threading issues)
@@ -2464,5 +3612,896 @@ impl TreeSitterAnalyzer {
         }
 
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fields_of(source: &str, type_name: &str) -> Vec<(String, String)> {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(source, Path::new("test.c"), "testhash", None)
+            .unwrap();
+        let types = analysis.types;
+
+        let ty = types
+            .iter()
+            .find(|t| t.name.ends_with(type_name))
+            .unwrap_or_else(|| panic!("type {type_name} not extracted"));
+
+        ty.members
+            .iter()
+            .map(|m| (m.name.clone(), m.type_name.clone()))
+            .collect()
+    }
+
+    fn analyze(source: &str, path: &str) -> (Vec<FunctionInfo>, Vec<DispatchSite>) {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(source, Path::new(path), "testhash", None)
+            .unwrap();
+        (analysis.functions, analysis.dispatch_sites)
+    }
+
+    #[test]
+    fn indirect_call_macro_names_its_candidates() {
+        // The shape of ip_protocol_deliver_rcu: the macro states the targets
+        // it expects, and the dispatch goes through a member.
+        let (_functions, sites) = analyze(
+            "struct net_protocol { int (*handler)(struct sk_buff *); };\n\
+             int deliver(const struct net_protocol *ipprot, struct sk_buff *skb) {\n\
+             \treturn INDIRECT_CALL_2(ipprot->handler, tcp_v4_rcv, udp_rcv, skb);\n\
+             }\n",
+            "test.c",
+        );
+
+        let declared: Vec<&DispatchSite> = sites
+            .iter()
+            .filter(|s| s.kind == DispatchKind::MacroDeclared)
+            .collect();
+
+        let targets: Vec<&str> = declared
+            .iter()
+            .filter_map(|s| s.target.as_deref())
+            .collect();
+        assert_eq!(targets, vec!["tcp_v4_rcv", "udp_rcv"], "sites: {sites:?}");
+
+        // Both candidates describe the same dispatch, through the same member.
+        assert!(declared.iter().all(|s| s.member == "handler"));
+        assert!(declared
+            .iter()
+            .all(|s| s.receiver_expr.as_deref() == Some("ipprot->handler")));
+        assert!(declared.iter().all(|s| s.caller_name == "deliver"));
+    }
+
+    #[test]
+    fn an_ordinary_call_declares_no_candidates() {
+        let (_functions, sites) = analyze(
+            "int helper(int x);\n\
+             int go(int x) { return helper(x); }\n",
+            "test.c",
+        );
+
+        assert!(
+            !sites.iter().any(|s| s.kind == DispatchKind::MacroDeclared),
+            "ordinary call treated as an indirect-call macro: {sites:?}"
+        );
+    }
+
+    #[test]
+    fn call_through_a_dereferenced_pointer_is_recorded() {
+        // `(*fp)(...)` matched no call pattern at all, so the call site was
+        // simply absent from the index.
+        let (_functions, sites) = analyze(
+            "struct file;\n\
+             int deref(int (*fp)(struct file *), struct file *f) { return (*fp)(f); }\n",
+            "test.c",
+        );
+
+        let deref: Vec<&DispatchSite> = sites
+            .iter()
+            .filter(|s| s.kind == DispatchKind::PointerDeref)
+            .collect();
+        assert_eq!(deref.len(), 1, "expected the deref call: {sites:?}");
+        assert_eq!(deref[0].receiver_expr.as_deref(), Some("fp"));
+        assert_eq!(deref[0].caller_name, "deref");
+    }
+
+    #[test]
+    fn call_through_a_pointer_variable_is_not_a_call_to_that_name() {
+        let (functions, sites) = analyze(
+            "struct file;\n\
+             int my_read(struct file *f) { return 1; }\n\
+             int fp(struct file *f) { return 2; }\n\
+             int go(struct file *f) {\n\
+             \tint (*fp)(struct file *) = my_read;\n\
+             \treturn fp(f);\n\
+             }\n",
+            "test.c",
+        );
+
+        let go = functions.iter().find(|f| f.name == "go").unwrap();
+        // A function named `fp` exists here, which is what made the variable
+        // name resolve to a real, unrelated function.
+        assert!(
+            !go.calls
+                .clone()
+                .unwrap_or_default()
+                .contains(&"fp".to_string()),
+            "pointer variable recorded as a called function: {:?}",
+            go.calls
+        );
+
+        let local: Vec<&DispatchSite> = sites
+            .iter()
+            .filter(|s| s.kind == DispatchKind::PointerLocal)
+            .collect();
+        assert_eq!(local.len(), 1, "expected the pointer call: {sites:?}");
+        // The declaration says what it was initialised with.
+        assert_eq!(local[0].target.as_deref(), Some("my_read"));
+    }
+
+    #[test]
+    fn call_through_a_pointer_parameter_is_marked_as_one() {
+        let (_functions, sites) = analyze(
+            "int go(int (*cb)(int), int x) { return cb(x); }\n",
+            "test.c",
+        );
+
+        let param: Vec<&DispatchSite> = sites
+            .iter()
+            .filter(|s| s.kind == DispatchKind::PointerParam)
+            .collect();
+        assert_eq!(param.len(), 1, "expected the parameter call: {sites:?}");
+        assert_eq!(param[0].receiver_expr.as_deref(), Some("cb"));
+        // Nothing in this function says what cb points at.
+        assert_eq!(param[0].target, None);
+    }
+
+    fn macro_calls(source: &str, macro_name: &str) -> Vec<String> {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        // Macros come back separately; the indexer merges them into the
+        // functions table.
+        let macros = analyzer
+            .analyze_source_with_metadata(source, Path::new("test.c"), "testhash", None)
+            .unwrap()
+            .macros;
+
+        macros
+            .iter()
+            .find(|f| f.name == macro_name)
+            .unwrap_or_else(|| panic!("macro {macro_name} not extracted"))
+            .calls
+            .clone()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_receiver_declared_here_carries_its_type() {
+        let (_functions, sites) = analyze(
+            "struct file_operations { int (*read)(void); };\n\
+             int probe(struct file_operations *ops) { return ops->read(); }\n",
+            "test.c",
+        );
+
+        assert_eq!(sites.len(), 1, "{sites:?}");
+        assert_eq!(sites[0].member, "read");
+        assert_eq!(sites[0].receiver_type.as_deref(), Some("file_operations"));
+    }
+
+    #[test]
+    fn a_local_declaration_types_the_receiver_too() {
+        let (_functions, sites) = analyze(
+            "struct ops { int (*run)(void); };\n\
+             int probe(void) { struct ops *o = get(); return o->run(); }\n",
+            "test.c",
+        );
+
+        assert_eq!(sites[0].receiver_type.as_deref(), Some("ops"));
+    }
+
+    #[test]
+    fn an_undeclared_receiver_stays_untyped() {
+        // `ops` comes from somewhere this file does not show. Guessing a type
+        // here files the site against registrations it has nothing to do with.
+        let (_functions, sites) = analyze("int probe(void) { return ops->read(); }\n", "test.c");
+
+        assert_eq!(sites.len(), 1, "{sites:?}");
+        assert_eq!(sites[0].receiver_type, None);
+    }
+
+    #[test]
+    fn a_name_declared_as_two_types_in_one_function_stays_untyped() {
+        let (_functions, sites) = analyze(
+            "struct a { int (*run)(void); };\n\
+             struct b { int (*run)(void); };\n\
+             int probe(void) {\n\
+                 { struct a *o = first(); o->run(); }\n\
+                 { struct b *o = second(); return o->run(); }\n\
+             }\n",
+            "test.c",
+        );
+
+        assert_eq!(sites.len(), 2, "{sites:?}");
+        assert!(
+            sites.iter().all(|site| site.receiver_type.is_none()),
+            "picked a type for a shadowed name: {sites:?}"
+        );
+    }
+
+    #[test]
+    fn a_receiver_declared_in_another_function_does_not_leak() {
+        let (_functions, sites) = analyze(
+            "struct ops { int (*run)(void); };\n\
+             int typed(struct ops *o) { return o->run(); }\n\
+             int untyped(void) { return o->run(); }\n",
+            "test.c",
+        );
+
+        let typed = sites.iter().find(|s| s.caller_name == "typed").unwrap();
+        let untyped = sites.iter().find(|s| s.caller_name == "untyped").unwrap();
+        assert_eq!(typed.receiver_type.as_deref(), Some("ops"));
+        assert_eq!(untyped.receiver_type, None);
+    }
+
+    #[test]
+    fn a_field_chain_receiver_records_the_base_and_the_field() {
+        // `inode->i_fop` is typed by what `i_fop` is declared as, which is in
+        // whichever file declares struct inode. What this file proves is the
+        // type of `inode` and the name of the field.
+        let (_functions, sites) = analyze(
+            "struct inode { struct file_operations *i_fop; };\n\
+             int probe(struct inode *inode) { return inode->i_fop->read(); }\n",
+            "test.c",
+        );
+
+        let read = sites.iter().find(|s| s.member == "read").unwrap();
+        assert_eq!(read.receiver_expr.as_deref(), Some("inode->i_fop"));
+        assert_eq!(read.receiver_type, None);
+        assert_eq!(read.receiver_base_type.as_deref(), Some("inode"));
+        assert_eq!(read.receiver_field.as_deref(), Some("i_fop"));
+    }
+
+    #[test]
+    fn a_field_chain_on_an_undeclared_base_records_nothing() {
+        let (_functions, sites) = analyze(
+            "int probe(void) { return global->ops->read(); }\n",
+            "test.c",
+        );
+
+        let read = sites.iter().find(|s| s.member == "read").unwrap();
+        assert_eq!(read.receiver_base_type, None);
+        assert_eq!(read.receiver_field, None);
+    }
+
+    #[test]
+    fn a_longer_chain_records_every_step() {
+        // `a->b->c` needs the type of `b` before the type of `c`. Both hops
+        // are lookups in the types table, so record the path and let
+        // resolution walk it.
+        let (_functions, sites) = analyze(
+            "struct outer { struct middle *b; };\n\
+             int probe(struct outer *a) { return a->b->c->run(); }\n",
+            "test.c",
+        );
+
+        let run = sites.iter().find(|s| s.member == "run").unwrap();
+        assert_eq!(run.receiver_expr.as_deref(), Some("a->b->c"));
+        assert_eq!(run.receiver_base_type.as_deref(), Some("outer"));
+        assert_eq!(run.receiver_field.as_deref(), Some("b.c"));
+    }
+
+    #[test]
+    fn a_chain_through_a_call_records_nothing() {
+        // `ath9k_hw_common(_ah)->ops` needs the return type of a function,
+        // which is a different lookup; reading half the chain would file the
+        // site under the wrong type.
+        let (_functions, sites) = analyze(
+            "struct ops { int (*run)(void); };\n\
+             int probe(void *ah) { return common(ah)->ops->run(); }\n",
+            "test.c",
+        );
+
+        let run = sites.iter().find(|s| s.member == "run").unwrap();
+        assert_eq!(run.receiver_base_type, None);
+    }
+
+    #[test]
+    fn assembly_in_a_macro_body_is_not_a_dispatch() {
+        // arch/arm64/include/asm/asm-extable.h, under __ASSEMBLER__.
+        let (_functions, sites) = analyze(
+            "#define __ASM_EXTABLE_RAW(insn, fixup) \\\n\
+             \t.pushsection __ex_table, \"a\";\\\n\
+             \t.long ((insn) - .);\\\n\
+             \t.short (fixup);\n",
+            "test.c",
+        );
+
+        assert!(
+            sites.is_empty(),
+            "read assembler directives as members: {sites:?}"
+        );
+    }
+
+    #[test]
+    fn a_macro_that_declares_an_ops_table_registers_it() {
+        // ACPI and the error-injection macros build tables this way: the
+        // macro declares the thing it initialises, so its type is stated.
+        let found = registrations_of(
+            "struct ops { int (*run)(void); };\n\
+             #define DEFINE_OPS(name, fn) struct ops name = { .run = fn }\n",
+            "test.c",
+        );
+
+        assert_eq!(
+            found,
+            vec![(
+                "ops".to_string(),
+                "run".to_string(),
+                "fn".to_string(),
+                "DEFINE_OPS".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_bare_initializer_macro_registers_nothing() {
+        // `{ .run = impl }` states no type. Reading one off the context the
+        // body was parsed in would file the registration under a type that
+        // exists nowhere in the source.
+        let found = registrations_of(
+            "int impl(void);\n\
+             #define OPS_BODY { .run = impl }\n\
+             #define OPS_BODY_FN(f) { .run = f }\n",
+            "test.c",
+        );
+
+        assert!(
+            found.is_empty(),
+            "registered against the wrapper: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_macro_that_only_dispatches_calls_no_function() {
+        // drivers/gpu/drm/nouveau writes its accessors this way. The member
+        // is not a function, and recording it as one is the defect the
+        // dispatch sites exist to avoid.
+        let source = "struct ops { int (*target)(void); };\n\
+                      #define nvkm_memory_target(p) (p)->func->target(p)\n";
+        let (_functions, sites) = analyze(source, "test.c");
+
+        assert_eq!(
+            macro_calls(source, "nvkm_memory_target"),
+            Vec::<String>::new(),
+            "member read as a call"
+        );
+        assert_eq!(sites.len(), 1, "dispatch not recorded: {sites:?}");
+        assert_eq!(sites[0].member, "target");
+    }
+
+    #[test]
+    fn a_macro_body_that_dispatches_records_a_site() {
+        // Whole subsystems put their indirection in a macro:
+        // include/linux/efi.h writes `((p)->f(args))`.
+        let (_functions, sites) = analyze(
+            "struct ops { int (*run)(void); };\n\
+             #define CALL_RUN(o) ((o)->run())\n",
+            "test.c",
+        );
+
+        assert_eq!(sites.len(), 1, "expected the site in the body: {sites:?}");
+        assert_eq!(sites[0].member, "run");
+        assert_eq!(sites[0].kind, DispatchKind::MemberArrow);
+        // The site belongs to the macro, since that is where it is written.
+        assert_eq!(sites[0].caller_name, "CALL_RUN");
+        assert_eq!(sites[0].line, 2);
+    }
+
+    #[test]
+    fn a_dispatching_macro_and_its_user_are_separate_sites() {
+        let (_functions, sites) = analyze(
+            "struct ops { int (*run)(void); };\n\
+             #define CALL_RUN(o) ((o)->run())\n\
+             int user(struct ops *o) { return CALL_RUN(o); }\n\
+             int direct(struct ops *o) { return o->run(); }\n",
+            "test.c",
+        );
+
+        let callers: Vec<&str> = sites.iter().map(|s| s.caller_name.as_str()).collect();
+        assert!(
+            callers.contains(&"CALL_RUN"),
+            "macro site missing: {sites:?}"
+        );
+        assert!(callers.contains(&"direct"), "plain site missing: {sites:?}");
+        // The expansion is not visible here, so the user of the macro has no
+        // site of its own; it reaches the dispatch through the macro.
+        assert!(!callers.contains(&"user"), "invented a site: {sites:?}");
+    }
+
+    #[test]
+    fn macro_body_calls_come_from_a_real_parse() {
+        // A scan can only match an identifier before a paren. A parse sees
+        // the structure, so a call nested in an expression, a cast or a
+        // statement expression is found, and a keyword taking a parenthesised
+        // operand is not read as a call.
+        let source = "int helper(int x) { return x; }\n\
+                      int other(int x) { return x; }\n\
+                      #define NESTED(x) helper(other(x) + 1)\n\
+                      #define CAST(x) ((unsigned long)helper(x))\n\
+                      #define STMT(x) ({ int __v = helper(x); __v; })\n\
+                      #define GUARD(x) if (x) helper(x)\n";
+
+        assert_eq!(
+            macro_calls(source, "NESTED"),
+            vec!["helper".to_string(), "other".to_string()]
+        );
+        assert_eq!(macro_calls(source, "CAST"), vec!["helper".to_string()]);
+        assert_eq!(macro_calls(source, "STMT"), vec!["helper".to_string()]);
+        assert_eq!(macro_calls(source, "GUARD"), vec!["helper".to_string()]);
+    }
+
+    #[test]
+    fn an_initializer_macro_body_parses_as_one() {
+        // `{ .read = wrap(f) }` is neither a statement nor an expression; it
+        // parses only as an initializer, which is one of the contexts tried.
+        let source = "int wrap(int (*f)(void));\n\
+                      #define OPS_INIT(f) { .read = wrap(f), .write = 0 }\n";
+
+        assert_eq!(macro_calls(source, "OPS_INIT"), vec!["wrap".to_string()]);
+    }
+
+    #[test]
+    fn a_fragment_body_still_reports_its_call() {
+        // `"prefix: " fmt` is not valid C alone, and the kernel is full of
+        // it. The parse finds nothing, so the scan answers instead.
+        let source = "int printk(const char *fmt, int x);\n\
+                      #define pr_thing(x) printk(\"thing: \" \"%d\", x)\n";
+
+        assert_eq!(macro_calls(source, "pr_thing"), vec!["printk".to_string()]);
+    }
+
+    #[test]
+    fn macro_body_calls_are_found_without_a_space_before_the_paren() {
+        // The kernel spelling. Before, only `helper ( x )` was recognised, so
+        // a wrapper macro contributed no edges at all.
+        let source = "int helper(int x) { return x; }\n\
+                      void spin_lock_irq(int *lock) { }\n\
+                      #define TIGHT(x) helper(x)\n\
+                      #define SPACED(x) helper( x )\n\
+                      #define xa_lock_irq(xa) spin_lock_irq(&(xa)->xa_lock)\n";
+
+        assert_eq!(macro_calls(source, "TIGHT"), vec!["helper".to_string()]);
+        assert_eq!(macro_calls(source, "SPACED"), vec!["helper".to_string()]);
+        assert_eq!(
+            macro_calls(source, "xa_lock_irq"),
+            vec!["spin_lock_irq".to_string()]
+        );
+    }
+
+    #[test]
+    fn macro_body_with_multibyte_text_does_not_panic() {
+        // Kernel headers carry UTF-8 in comments and strings; slicing the
+        // body at a byte offset inside one of those characters panics, and a
+        // panicking worker takes every file it had left with it.
+        let source = "int helper(int x) { return x; }\n\
+                      #define DEGREES(x) /* 45° turn */ helper(x)\n\
+                      #define NAMED(x) \"café\" helper(x)\n";
+
+        assert_eq!(macro_calls(source, "DEGREES"), vec!["helper".to_string()]);
+        assert_eq!(macro_calls(source, "NAMED"), vec!["helper".to_string()]);
+    }
+
+    #[test]
+    fn macro_body_parentheses_that_are_not_calls_record_nothing() {
+        let source = "#define GROUPED(x) ((x) + 1)\n\
+                      #define CASTED(x) ((unsigned long)(x))\n";
+
+        assert!(
+            macro_calls(source, "GROUPED").is_empty(),
+            "grouping parens read as a call: {:?}",
+            macro_calls(source, "GROUPED")
+        );
+        // A cast names a type, not a function; `(x)` has no identifier before it.
+        assert!(
+            !macro_calls(source, "CASTED").contains(&"x".to_string()),
+            "cast operand read as a call: {:?}",
+            macro_calls(source, "CASTED")
+        );
+    }
+
+    fn registrations_of(source: &str, path: &str) -> Vec<(String, String, String, String)> {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        analyzer
+            .analyze_source_with_metadata(source, Path::new(path), "testhash", None)
+            .unwrap()
+            .registrations
+            .into_iter()
+            .map(|r| (r.container_type, r.member, r.target, r.enclosing_function))
+            .collect()
+    }
+
+    #[test]
+    fn file_scope_ops_table_registers_its_functions() {
+        let found = registrations_of(
+            "struct file;\n\
+             struct file_operations { int (*read)(struct file *); };\n\
+             static int my_read(struct file *f) { return 0; }\n\
+             static int my_write(struct file *f) { return 0; }\n\
+             static const struct file_operations fops = {\n\
+             \t.read = my_read,\n\
+             \t.write = &my_write,\n\
+             \t.owner = 0,\n\
+             };\n",
+            "test.c",
+        );
+
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "file_operations".to_string(),
+                    "read".to_string(),
+                    "my_read".to_string(),
+                    String::new()
+                ),
+                // `&f` and `f` install the same thing.
+                (
+                    "file_operations".to_string(),
+                    "write".to_string(),
+                    "my_write".to_string(),
+                    String::new()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn compound_literal_inside_a_function_registers_with_its_cast_type() {
+        // net/ipv4/af_inet.c: the registration issue #9 asks about is written
+        // inside inet_init, as a compound literal assigned to a member.
+        let found = registrations_of(
+            "struct sk_buff;\n\
+             struct net_protocol { int (*handler)(struct sk_buff *); int no_policy; };\n\
+             struct hotdata { struct net_protocol tcp_protocol; };\n\
+             static struct hotdata net_hotdata;\n\
+             int tcp_v4_rcv(struct sk_buff *skb);\n\
+             static int inet_init(void)\n\
+             {\n\
+             \tnet_hotdata.tcp_protocol = (struct net_protocol) {\n\
+             \t\t.handler = tcp_v4_rcv,\n\
+             \t\t.no_policy = 1,\n\
+             \t};\n\
+             \treturn 0;\n\
+             }\n",
+            "af_inet.c",
+        );
+
+        assert_eq!(
+            found,
+            vec![(
+                "net_protocol".to_string(),
+                "handler".to_string(),
+                "tcp_v4_rcv".to_string(),
+                "inet_init".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn assignment_to_a_member_registers_when_the_receiver_is_typed_here() {
+        let found = registrations_of(
+            "struct ops { int (*run)(void); };\n\
+             int impl(void);\n\
+             void setup(struct ops *o) { o->run = impl; }\n",
+            "test.c",
+        );
+
+        assert_eq!(
+            found,
+            vec![(
+                "ops".to_string(),
+                "run".to_string(),
+                "impl".to_string(),
+                "setup".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn assignment_through_an_untyped_receiver_registers_nothing() {
+        // `container_of(...)` returns something this file cannot type, and
+        // guessing the type would file the registration against the wrong
+        // dispatch sites.
+        let found = registrations_of(
+            "int impl(void);\n\
+             void setup(void *p) { GET_OPS(p)->run = impl; }\n",
+            "test.c",
+        );
+
+        assert!(
+            found.is_empty(),
+            "registered under a guessed type: {found:?}"
+        );
+    }
+
+    #[test]
+    fn an_initializer_whose_type_is_not_stated_registers_nothing() {
+        // A nested initializer names no type here: the member's type is
+        // declared with the struct, usually in another file. Filing the
+        // registration under a guessed type would join it to the wrong
+        // dispatch sites.
+        let found = registrations_of(
+            "struct outer { struct inner { int (*run)(void); } in; };\n\
+             int impl(void);\n\
+             static struct outer o = { .in = { .run = impl } };\n",
+            "test.c",
+        );
+
+        let members: Vec<&str> = found.iter().map(|(_, m, _, _)| m.as_str()).collect();
+        assert!(
+            !members.contains(&"run"),
+            "nested initializer registered under a guessed type: {found:?}"
+        );
+    }
+
+    #[test]
+    fn typedef_container_is_recorded_by_its_name() {
+        let found = registrations_of(
+            "typedef struct { int (*run)(void); } Ops;\n\
+             int impl(void);\n\
+             static Ops ops = { .run = impl };\n",
+            "test.c",
+        );
+
+        assert_eq!(
+            found,
+            vec![(
+                "Ops".to_string(),
+                "run".to_string(),
+                "impl".to_string(),
+                String::new()
+            )]
+        );
+    }
+
+    #[test]
+    fn member_call_is_a_dispatch_site_not_a_call_to_the_member() {
+        let (functions, sites) = analyze(
+            "struct file;\n\
+             struct ops { int (*read)(struct file *); };\n\
+             int read(struct file *f) { return 0; }\n\
+             int go(struct ops *o, struct file *f) { return o->read(f); }\n",
+            "test.c",
+        );
+
+        let go = functions.iter().find(|f| f.name == "go").unwrap();
+        // A real function named `read` exists, which is exactly how a member
+        // name became a confident wrong answer before.
+        assert!(
+            !go.calls
+                .clone()
+                .unwrap_or_default()
+                .contains(&"read".to_string()),
+            "member name recorded as a called function: {:?}",
+            go.calls
+        );
+
+        assert_eq!(sites.len(), 1, "expected one dispatch site: {sites:?}");
+        let site = &sites[0];
+        assert_eq!(site.caller_name, "go");
+        assert_eq!(site.member, "read");
+        assert_eq!(site.receiver_expr.as_deref(), Some("o"));
+        assert_eq!(site.kind, DispatchKind::MemberArrow);
+        assert_eq!(site.line, 4);
+    }
+
+    #[test]
+    fn dot_and_arrow_are_distinguished() {
+        let (_functions, sites) = analyze(
+            "struct ops { int (*run)(void); };\n\
+             int go(struct ops *p, struct ops v) { return p->run() + v.run(); }\n",
+            "test.c",
+        );
+
+        let kinds: Vec<DispatchKind> = sites.iter().map(|s| s.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![DispatchKind::MemberArrow, DispatchKind::MemberDot]
+        );
+    }
+
+    #[test]
+    fn dispatch_outside_any_function_is_still_recorded() {
+        // Python module level and class bodies run code; a site there belongs
+        // to no function, and dropping it is how it stays invisible today.
+        let (_functions, sites) = analyze(
+            "class Handler:\n\
+             \tdef handle(self):\n\
+             \t\treturn 1\n\
+             \n\
+             h = Handler()\n\
+             h.handle()\n",
+            "test.py",
+        );
+
+        let module_level: Vec<&DispatchSite> =
+            sites.iter().filter(|s| s.caller_name.is_empty()).collect();
+        assert_eq!(
+            module_level.len(),
+            1,
+            "expected the module-level dispatch: {sites:?}"
+        );
+        assert_eq!(module_level[0].member, "handle");
+        assert_eq!(module_level[0].line, 6);
+    }
+
+    #[test]
+    fn function_pointer_field_keeps_its_own_name() {
+        let fields = fields_of(
+            "struct file;\n\
+             struct file_operations {\n\
+             \tint (*read)(struct file *f, char *buf);\n\
+             \tint (*write)(struct file *f, const char *buf);\n\
+             };\n",
+            "file_operations",
+        );
+
+        assert_eq!(
+            fields,
+            vec![
+                (
+                    "read".to_string(),
+                    "int (*)(struct file *f, char *buf)".to_string()
+                ),
+                (
+                    "write".to_string(),
+                    "int (*)(struct file *f, const char *buf)".to_string()
+                ),
+            ]
+        );
+    }
+
+    fn params_of(source: &str, func_name: &str) -> Vec<(String, String)> {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let functions = analyzer
+            .analyze_source_with_metadata(source, Path::new("test.c"), "testhash", None)
+            .unwrap()
+            .functions;
+
+        let func = functions
+            .iter()
+            .find(|f| f.name == func_name)
+            .unwrap_or_else(|| panic!("function {func_name} not extracted"));
+
+        func.parameters
+            .iter()
+            .map(|p| (p.name.clone(), p.type_name.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn function_pointer_parameter_keeps_its_name() {
+        let params = params_of(
+            "struct file;\n\
+             int deref(int (*fp)(struct file *, char *), struct file *f) { return 0; }\n",
+            "deref",
+        );
+
+        assert_eq!(
+            params,
+            vec![
+                (
+                    "fp".to_string(),
+                    "int (*)(struct file *, char *)".to_string()
+                ),
+                ("f".to_string(), "struct file *".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parameter_shapes_round_trip() {
+        let params = params_of(
+            "struct file;\n\
+             int shapes(int plain, const char *name, char buf[16], struct file *f,\n\
+             \t   void (**pp)(int), int) { return 0; }\n",
+            "shapes",
+        );
+
+        let actual: Vec<(&str, &str)> = params
+            .iter()
+            .map(|(n, t)| (n.as_str(), t.as_str()))
+            .collect();
+
+        assert_eq!(
+            actual,
+            vec![
+                ("plain", "int"),
+                ("name", "const char *"),
+                ("buf", "char [16]"),
+                ("f", "struct file *"),
+                ("pp", "void (**)(int)"),
+                ("", "int"),
+            ]
+        );
+    }
+
+    #[test]
+    fn anonymous_members_belong_to_the_enclosing_struct() {
+        // C makes the members of an anonymous union members of the parent.
+        let fields = fields_of(
+            "struct wrapper {\n\
+             \tint tag;\n\
+             \tunion { int u1; long u2; };\n\
+             \tunion { int v1; long v2; } named;\n\
+             };\n",
+            "wrapper",
+        );
+
+        let actual: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(n, t)| (n.as_str(), t.as_str()))
+            .collect();
+
+        assert_eq!(
+            actual,
+            vec![
+                ("tag", "int"),
+                // anonymous: reachable as wrapper.u1
+                ("u1", "int"),
+                ("u2", "long"),
+                // named inline aggregate: the member, then what it holds
+                ("named", "union {...}"),
+                ("named.v1", "int"),
+                ("named.v2", "long"),
+            ]
+        );
+    }
+
+    #[test]
+    fn declarator_shapes_round_trip() {
+        let fields = fields_of(
+            "struct file;\n\
+             struct tricky {\n\
+             \tint plain;\n\
+             \tint a, b;\n\
+             \tchar *ptr;\n\
+             \tconst char * const cptr;\n\
+             \tint arr[4];\n\
+             \tint matrix[2][3];\n\
+             \tunsigned int bits : 3;\n\
+             \tvoid (**pptr)(int);\n\
+             \tint (*table[8])(void);\n\
+             \tstruct file *next;\n\
+             \tstruct { int inner; } nested;\n\
+             };\n",
+            "tricky",
+        );
+
+        let expected = vec![
+            ("plain", "int"),
+            ("a", "int"),
+            ("b", "int"),
+            ("ptr", "char *"),
+            ("cptr", "const char * const"),
+            ("arr", "int [4]"),
+            ("matrix", "int [2][3]"),
+            ("bits", "unsigned int"),
+            ("pptr", "void (**)(int)"),
+            ("table", "int (*[8])(void)"),
+            ("next", "struct file *"),
+            ("nested", "struct {...}"),
+            ("nested.inner", "int"),
+        ];
+
+        let actual: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(n, t)| (n.as_str(), t.as_str()))
+            .collect();
+
+        assert_eq!(actual, expected);
     }
 }

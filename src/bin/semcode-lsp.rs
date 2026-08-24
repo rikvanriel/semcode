@@ -126,7 +126,36 @@ impl SemcodeLspBackend {
         }
     }
 
+    /// Returns true if the index was written by an older semcode.
+    ///
+    /// Refuse queries when the index might not contain what we need to
+    /// provide the user with a good answer.
+    async fn index_is_stale(&self) -> bool {
+        let db_guard = self.database.lock().await;
+        let Some(db) = db_guard.as_ref() else {
+            return false;
+        };
+
+        match db.index_predates_reader().await {
+            Ok(stale) => {
+                if stale {
+                    tracing::error!(
+                        "semcode index was written by an older semcode; answering nothing \
+                         until it is rebuilt with semcode-index"
+                    );
+                }
+                stale
+            }
+            // Unreadable is not the same as old; let the request through and
+            // let whatever is wrong surface on its own.
+            Err(_) => false,
+        }
+    }
+
     async fn find_function_definition(&self, identifier_name: &str) -> Option<Location> {
+        if self.index_is_stale().await {
+            return None;
+        }
         self.refresh_workdir_index().await;
 
         let db_guard = self.database.lock().await;
@@ -401,6 +430,10 @@ impl LanguageServer for SemcodeLspBackend {
     }
 
     async fn references(&self, params: ReferenceParams) -> LspResult<Option<Vec<Location>>> {
+        if self.index_is_stale().await {
+            return Ok(None);
+        }
+
         let uri = &params.text_document_position.text_document.uri;
         let position = &params.text_document_position.position;
 

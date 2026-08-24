@@ -346,7 +346,90 @@ async fn mcp_show_callers(
         }
     }
 
+    write_indirect_callers(db, function_name, git_sha, &mut buffer).await?;
+
     Ok(String::from_utf8_lossy(&buffer).to_string())
+}
+
+/// Callers that reach the function through a function pointer, with the
+/// evidence for each. A consumer that only reads the text still sees them;
+/// one that parses it can tell them from direct callers by the section.
+async fn write_indirect_callers(
+    db: &DatabaseManager,
+    function_name: &str,
+    git_sha: &str,
+    buffer: &mut Vec<u8>,
+) -> Result<()> {
+    use semcode::Evidence;
+
+    let indirect = db.find_indirect_callers(function_name, git_sha).await?;
+    if indirect.is_empty() {
+        return Ok(());
+    }
+
+    let (confident, by_name_only): (Vec<_>, Vec<_>) = indirect
+        .iter()
+        .partition(|caller| caller.evidence.is_type_matched());
+
+    if !confident.is_empty() {
+        writeln!(buffer, "\n=== Indirect Callers ===")?;
+        writeln!(
+            buffer,
+            "{} call sites can reach it through a function pointer:",
+            confident.len()
+        )?;
+
+        for (i, caller) in confident.iter().enumerate() {
+            let where_from = if caller.caller_name.is_empty() {
+                "(file scope)"
+            } else {
+                caller.caller_name.as_str()
+            };
+            writeln!(
+                buffer,
+                "  {}. {} at {}:{} [{}]",
+                i + 1,
+                where_from,
+                caller.site_file,
+                caller.site_line,
+                caller.site_kind
+            )?;
+
+            match &caller.evidence {
+                Evidence::StatedAtSite => {
+                    writeln!(buffer, "     names it at the call site")?;
+                }
+                Evidence::Registered {
+                    container_type,
+                    registration_file,
+                    registration_line,
+                    registration_count,
+                    ..
+                } => {
+                    writeln!(
+                        buffer,
+                        "     installed in {}::{} at {}:{} ({} place{})",
+                        container_type,
+                        caller.member,
+                        registration_file,
+                        registration_line,
+                        registration_count,
+                        if *registration_count == 1 { "" } else { "s" }
+                    )?;
+                }
+            }
+        }
+    }
+
+    if !by_name_only.is_empty() {
+        writeln!(
+            buffer,
+            "\nNote: {} further call sites go through a member of the same name, but nothing says their receiver has the type the function was installed in.",
+            by_name_only.len()
+        )?;
+    }
+
+    Ok(())
 }
 
 async fn mcp_show_calls(
@@ -1797,6 +1880,42 @@ async fn mcp_show_callchain_with_limits(
             }
         }
 
+        // Where the chain leaves by a member rather than by name, the same as
+        // the callchain command prints. A chain that stops at a dispatch and
+        // says nothing reads as a chain that ended.
+        let mut reachable: Vec<String> = vec![function_name.to_string()];
+        reachable.extend(callees.iter().cloned());
+        if let Ok(dispatched) = db.resolve_dispatches_in(&reachable, git_sha).await {
+            if !dispatched.is_empty() {
+                writeln!(buffer, "\n=== Dispatches ===")?;
+                for from in &reachable {
+                    let Some(sites) = dispatched.get(from) else {
+                        continue;
+                    };
+                    for site in sites {
+                        writeln!(
+                            buffer,
+                            "{} {}->{} ({}:{})",
+                            from, site.receiver_expr, site.member, site.file_path, site.line
+                        )?;
+                        for target in site.targets.iter().take(3) {
+                            writeln!(buffer, "   └─ {target}")?;
+                        }
+                        if site.targets.len() > 3 {
+                            writeln!(
+                                buffer,
+                                "   └─ {} more of {} installed in {}::{}, see find_implementors",
+                                site.targets.len() - 3,
+                                site.targets.len(),
+                                site.container_type,
+                                site.member
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+
         // Summary
         writeln!(buffer, "\n=== Summary ===")?;
         writeln!(buffer, "Total direct callers: {}", callers.len())?;
@@ -1953,6 +2072,8 @@ const TOOL_CATEGORIES: &[ToolCategory] = &[
             "find_callers",
             "find_calls",
             "find_callchain",
+            "find_implementors",
+            "find_registrations",
         ],
     },
     ToolCategory {
@@ -2066,6 +2187,54 @@ fn get_tool_schema(name: &str) -> Option<Value> {
                     "branch": {
                         "type": "string",
                         "description": "Optional branch name to search at (e.g., 'main', 'develop'). Takes precedence over git_sha if both are provided."
+                    }
+                },
+                "required": ["name"]
+            }
+        })),
+        "find_implementors" => Some(json!({
+            "name": "find_implementors",
+            "description": "Find the functions installed in a struct member, which is what a call through that member can reach",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "container_type": {
+                        "type": "string",
+                        "description": "The struct or typedef name, for example 'file_operations'"
+                    },
+                    "member": {
+                        "type": "string",
+                        "description": "The member name, for example 'read'"
+                    },
+                    "git_sha": {
+                        "type": "string",
+                        "description": "Optional git commit SHA to search at (defaults to current HEAD)"
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Optional branch name to search at. Takes precedence over git_sha if both are provided."
+                    }
+                },
+                "required": ["container_type", "member"]
+            }
+        })),
+        "find_registrations" => Some(json!({
+            "name": "find_registrations",
+            "description": "Find where a function is installed in a struct member, which is how it can be called without being named",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The name of the function to look for"
+                    },
+                    "git_sha": {
+                        "type": "string",
+                        "description": "Optional git commit SHA to search at (defaults to current HEAD)"
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Optional branch name to search at. Takes precedence over git_sha if both are provided."
                     }
                 },
                 "required": ["name"]
@@ -2562,6 +2731,8 @@ fn get_all_tool_schemas() -> Vec<Value> {
         "find_callers",
         "find_calls",
         "find_callchain",
+        "find_implementors",
+        "find_registrations",
         "diff_functions",
         "grep_functions",
         "vgrep_functions",
@@ -2585,6 +2756,7 @@ struct McpServer {
     default_git_sha: Option<String>,
     model_path: Option<String>,
     git_repo_path: String,
+    database_path: String,
     page_cache: PageCache,
     indexing_state: Arc<tokio::sync::Mutex<IndexingState>>,
     notification_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
@@ -2623,6 +2795,7 @@ impl McpServer {
             default_git_sha,
             model_path,
             git_repo_path: git_repo_path.to_string(),
+            database_path: database_path.to_string(),
             page_cache: PageCache::new(),
             indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
             notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
@@ -2691,6 +2864,52 @@ impl McpServer {
     }
 
     /// Check if the database appears to be empty and return a helpful message if so
+    /// A refusal to answer, when answering would mislead.
+    ///
+    /// An index written by an older semcode holds what that version
+    /// extracted, so a query against it returns fewer callers and no
+    /// registrations while looking exactly like a complete answer. A caller
+    /// that is a language model cannot tell, and will act on it, so the
+    /// refusal carries the facts as fields rather than only as prose: what
+    /// wrote the index, what this build expects, and the command that fixes
+    /// it.
+    async fn refuse_stale_index(&self) -> Option<Value> {
+        if !self.db.index_predates_reader().await.ok()? {
+            return None;
+        }
+
+        let written_by = self.db.stored_schema_version().await.ok()?.unwrap_or(0);
+        let tree = std::fs::canonicalize(&self.git_repo_path)
+            .unwrap_or_else(|_| std::path::PathBuf::from(&self.git_repo_path))
+            .display()
+            .to_string();
+        let database = std::path::Path::new(&self.database_path)
+            .parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok())
+            .map(|parent| parent.display().to_string())
+            .unwrap_or_else(|| tree.clone());
+        let command = format!("semcode-index -s {tree} -d {database}");
+
+        Some(json!({
+            "content": [{
+                "type": "text",
+                "text": format!(
+                    "This index was written by an older semcode (version {written_by}; this \
+                     build writes {expected}), so it does not hold everything this build \
+                     extracts: dispatch sites, registrations and receiver types are missing \
+                     or incomplete. Answers would look complete and be wrong. Rebuild the \
+                     index by running: {command}",
+                    expected = semcode::SCHEMA_VERSION,
+                )
+            }],
+            "isError": true,
+            "index_stale": true,
+            "written_by": written_by,
+            "expected": semcode::SCHEMA_VERSION,
+            "command": command,
+        }))
+    }
+
     async fn check_database_status(&self) -> Option<String> {
         let state = self.indexing_state.lock().await;
 
@@ -2843,6 +3062,8 @@ impl McpServer {
             "find_type" => self.handle_find_type(arguments).await,
             "find_callers" => self.handle_find_callers(arguments).await,
             "find_calls" => self.handle_find_calls(arguments).await,
+            "find_implementors" => self.handle_find_implementors(arguments).await,
+            "find_registrations" => self.handle_find_registrations(arguments).await,
             "find_callchain" => self.handle_find_callchain(arguments).await,
             "diff_functions" => self.handle_diff_functions(arguments).await,
             "grep_functions" => self.handle_grep_functions(arguments).await,
@@ -2939,6 +3160,8 @@ impl McpServer {
             "find_type" => self.handle_find_type(tool_args).await,
             "find_callers" => self.handle_find_callers(tool_args).await,
             "find_calls" => self.handle_find_calls(tool_args).await,
+            "find_implementors" => self.handle_find_implementors(tool_args).await,
+            "find_registrations" => self.handle_find_registrations(tool_args).await,
             "find_callchain" => self.handle_find_callchain(tool_args).await,
             "diff_functions" => self.handle_diff_functions(tool_args).await,
             "grep_functions" => self.handle_grep_functions(tool_args).await,
@@ -3014,6 +3237,9 @@ impl McpServer {
 
     async fn handle_find_function(&self, args: &Value) -> Value {
         // Check if database is empty and return helpful message
+        if let Some(refusal) = self.refuse_stale_index().await {
+            return refusal;
+        }
         if let Some(status_msg) = self.check_database_status().await {
             return json!({
                 "content": [{"type": "text", "text": status_msg}]
@@ -3038,6 +3264,9 @@ impl McpServer {
 
     async fn handle_find_type(&self, args: &Value) -> Value {
         // Check if database is empty and return helpful message
+        if let Some(refusal) = self.refuse_stale_index().await {
+            return refusal;
+        }
         if let Some(status_msg) = self.check_database_status().await {
             return json!({
                 "content": [{"type": "text", "text": status_msg}]
@@ -3062,6 +3291,9 @@ impl McpServer {
 
     async fn handle_find_callers(&self, args: &Value) -> Value {
         // Check if database is empty and return helpful message
+        if let Some(refusal) = self.refuse_stale_index().await {
+            return refusal;
+        }
         if let Some(status_msg) = self.check_database_status().await {
             return json!({
                 "content": [{"type": "text", "text": status_msg}]
@@ -3084,8 +3316,102 @@ impl McpServer {
         }
     }
 
+    async fn handle_find_implementors(&self, args: &Value) -> Value {
+        if let Some(refusal) = self.refuse_stale_index().await {
+            return refusal;
+        }
+        if let Some(status_msg) = self.check_database_status().await {
+            return json!({
+                "content": [{"type": "text", "text": status_msg}]
+            });
+        }
+
+        let container_type = args["container_type"].as_str().unwrap_or("");
+        let container_type = container_type
+            .strip_prefix("struct ")
+            .unwrap_or(container_type);
+        let member = args["member"].as_str().unwrap_or("");
+        let git_sha =
+            self.resolve_git_sha_or_branch(args["git_sha"].as_str(), args["branch"].as_str());
+
+        match self
+            .db
+            .find_registrations_for_slot_git_aware(container_type, member, &git_sha)
+            .await
+        {
+            Ok(found) => {
+                let mut text = format!("Functions installed in {container_type}::{member}\n");
+                if found.is_empty() {
+                    text.push_str("Info: nothing is installed in that member\n");
+                }
+                for (i, registration) in found.iter().enumerate() {
+                    text.push_str(&format!(
+                        "  {}. {} at {}:{} [{}]\n",
+                        i + 1,
+                        registration.target,
+                        registration.file_path,
+                        registration.line,
+                        registration.kind.as_str()
+                    ));
+                }
+                json!({"content": [{"type": "text", "text": truncate_output(text)}]})
+            }
+            Err(e) => json!({
+                "error": format!("Failed to find implementors: {}", e),
+                "isError": true
+            }),
+        }
+    }
+
+    async fn handle_find_registrations(&self, args: &Value) -> Value {
+        if let Some(refusal) = self.refuse_stale_index().await {
+            return refusal;
+        }
+        if let Some(status_msg) = self.check_database_status().await {
+            return json!({
+                "content": [{"type": "text", "text": status_msg}]
+            });
+        }
+
+        let name = args["name"].as_str().unwrap_or("");
+        let git_sha =
+            self.resolve_git_sha_or_branch(args["git_sha"].as_str(), args["branch"].as_str());
+
+        match self
+            .db
+            .find_registrations_of_git_aware(name, &git_sha)
+            .await
+        {
+            Ok(found) => {
+                let mut text = format!("Where {name} is installed\n");
+                if found.is_empty() {
+                    text.push_str("Info: it is not installed in any struct member\n");
+                }
+                for (i, registration) in found.iter().enumerate() {
+                    text.push_str(&format!(
+                        "  {}. {}::{} at {}:{} [{}]\n",
+                        i + 1,
+                        registration.container_type,
+                        registration.member,
+                        registration.file_path,
+                        registration.line,
+                        registration.kind.as_str()
+                    ));
+                }
+                json!({"content": [{"type": "text", "text": truncate_output(text)}]})
+            }
+            Err(e) => json!({
+                "error": format!("Failed to find registrations: {}", e),
+                "isError": true
+            }),
+        }
+    }
+
     async fn handle_find_calls(&self, args: &Value) -> Value {
         // Check if database is empty and return helpful message
+        if let Some(refusal) = self.refuse_stale_index().await {
+            return refusal;
+        }
         if let Some(status_msg) = self.check_database_status().await {
             return json!({
                 "content": [{"type": "text", "text": status_msg}]
@@ -3110,6 +3436,9 @@ impl McpServer {
 
     async fn handle_find_callchain(&self, args: &Value) -> Value {
         // Check if database is empty and return helpful message
+        if let Some(refusal) = self.refuse_stale_index().await {
+            return refusal;
+        }
         if let Some(status_msg) = self.check_database_status().await {
             return json!({
                 "content": [{"type": "text", "text": status_msg}]
@@ -3166,6 +3495,9 @@ impl McpServer {
 
     async fn handle_grep_functions(&self, args: &Value) -> Value {
         // Check if database is empty and return helpful message
+        if let Some(refusal) = self.refuse_stale_index().await {
+            return refusal;
+        }
         if let Some(status_msg) = self.check_database_status().await {
             return json!({
                 "content": [{"type": "text", "text": status_msg}]
@@ -3196,6 +3528,9 @@ impl McpServer {
 
     async fn handle_vgrep_functions(&self, args: &Value) -> Value {
         // Check if database is empty and return helpful message
+        if let Some(refusal) = self.refuse_stale_index().await {
+            return refusal;
+        }
         if let Some(status_msg) = self.check_database_status().await {
             return json!({
                 "content": [{"type": "text", "text": status_msg}]
@@ -5847,6 +6182,7 @@ mod tests {
         );
         let server = McpServer {
             db,
+            database_path: String::new(),
             default_git_sha: None,
             model_path: None,
             git_repo_path: ".".to_string(),
@@ -5882,6 +6218,7 @@ mod tests {
 
         let server = McpServer {
             db,
+            database_path: String::new(),
             default_git_sha: None,
             model_path: None,
             git_repo_path: ".".to_string(),
@@ -5919,6 +6256,7 @@ mod tests {
 
         let server = McpServer {
             db,
+            database_path: String::new(),
             default_git_sha: None,
             model_path: None,
             git_repo_path: ".".to_string(),
@@ -5932,6 +6270,54 @@ mod tests {
         let content = result["content"][0]["text"].as_str().unwrap();
         assert!(content.contains("Completed (100 files processed)"));
         assert!(content.contains("5.00s"));
+    }
+
+    #[tokio::test]
+    async fn a_stale_index_is_refused_with_the_command_that_fixes_it() {
+        // A model cannot see that an answer is short. Hand it the facts as
+        // fields, not as a sentence to interpret.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DatabaseManager::new(
+                temp_dir.path().join("db").to_str().unwrap(),
+                ".".to_string(),
+            )
+            .await
+            .unwrap(),
+        );
+        db.create_tables().await.unwrap();
+
+        let server = McpServer {
+            db: db.clone(),
+            database_path: temp_dir.path().join("db").to_string_lossy().into_owned(),
+            default_git_sha: None,
+            model_path: None,
+            git_repo_path: ".".to_string(),
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            lazy_mode: false,
+        };
+
+        // A fresh index is current, so nothing is refused.
+        assert!(server.refuse_stale_index().await.is_none());
+
+        // What an older semcode leaves: rows, and no idea what wrote them.
+        std::fs::remove_dir_all(temp_dir.path().join("db").join("schema_meta.lance")).unwrap();
+        db.create_tables().await.unwrap();
+
+        let refusal = server
+            .refuse_stale_index()
+            .await
+            .expect("a stale index must be refused");
+        assert_eq!(refusal["index_stale"], json!(true));
+        assert_eq!(refusal["isError"], json!(true));
+        assert_eq!(refusal["written_by"], json!(0));
+        assert_eq!(refusal["expected"], json!(semcode::SCHEMA_VERSION));
+        assert!(refusal["command"]
+            .as_str()
+            .unwrap()
+            .starts_with("semcode-index -s "));
     }
 
     #[tokio::test]
@@ -5953,6 +6339,7 @@ mod tests {
 
         let server = McpServer {
             db,
+            database_path: String::new(),
             default_git_sha: None,
             model_path: None,
             git_repo_path: ".".to_string(),
@@ -5978,6 +6365,8 @@ mod tests {
             "find_callers",
             "find_calls",
             "find_callchain",
+            "find_implementors",
+            "find_registrations",
             "diff_functions",
             "grep_functions",
             "vgrep_functions",
@@ -6024,9 +6413,9 @@ mod tests {
     }
 
     #[test]
-    fn test_get_all_tool_schemas_returns_17_tools() {
+    fn test_get_all_tool_schemas_returns_19_tools() {
         let schemas = get_all_tool_schemas();
-        assert_eq!(schemas.len(), 17, "Should return all 17 tool schemas");
+        assert_eq!(schemas.len(), 19, "Should return all 19 tool schemas");
     }
 
     #[test]
@@ -6062,6 +6451,7 @@ mod tests {
         );
         let server = McpServer {
             db,
+            database_path: String::new(),
             default_git_sha: None,
             model_path: None,
             git_repo_path: ".".to_string(),
@@ -6092,6 +6482,7 @@ mod tests {
         );
         let server = McpServer {
             db,
+            database_path: String::new(),
             default_git_sha: None,
             model_path: None,
             git_repo_path: ".".to_string(),
@@ -6124,6 +6515,7 @@ mod tests {
         );
         let server = McpServer {
             db,
+            database_path: String::new(),
             default_git_sha: None,
             model_path: None,
             git_repo_path: ".".to_string(),
@@ -6152,6 +6544,7 @@ mod tests {
         );
         let server = McpServer {
             db,
+            database_path: String::new(),
             default_git_sha: None,
             model_path: None,
             git_repo_path: ".".to_string(),
@@ -6180,6 +6573,7 @@ mod tests {
         );
         let server = McpServer {
             db,
+            database_path: String::new(),
             default_git_sha: None,
             model_path: None,
             git_repo_path: ".".to_string(),
@@ -6222,6 +6616,7 @@ mod tests {
         );
         let server = McpServer {
             db,
+            database_path: String::new(),
             default_git_sha: None,
             model_path: None,
             git_repo_path: temp_dir.path().to_string_lossy().into_owned(),
@@ -6251,6 +6646,7 @@ mod tests {
         );
         let server = McpServer {
             db,
+            database_path: String::new(),
             default_git_sha: None,
             model_path: None,
             git_repo_path: ".".to_string(),
@@ -6282,6 +6678,7 @@ mod tests {
         );
         let server = McpServer {
             db,
+            database_path: String::new(),
             default_git_sha: None,
             model_path: None,
             git_repo_path: ".".to_string(),
@@ -6294,7 +6691,7 @@ mod tests {
         let result = server.handle_list_tools().await;
         let tools = result["tools"].as_array().unwrap();
 
-        // Should return all 17 tools
-        assert_eq!(tools.len(), 17, "Non-lazy mode should return all 17 tools");
+        // Should return all 19 tools
+        assert_eq!(tools.len(), 19, "Non-lazy mode should return all 19 tools");
     }
 }
