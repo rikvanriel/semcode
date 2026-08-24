@@ -975,9 +975,12 @@ impl DatabaseManager {
 
         // Asking the store for the slot would miss every registration made
         // through a field, because those rows do not know their container
-        // until it is resolved. Ask by member, resolve, then filter.
+        // until it is resolved. Ask for this container's rows and the ones
+        // that have yet to name theirs, resolve, then filter.
         let mut registrations = crate::database::resolution::at_revision(
-            self.registration_store.find_by_member(member).await?,
+            self.registration_store
+                .find_by_member_for_container(container_type, member)
+                .await?,
             &manifest,
             |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
         );

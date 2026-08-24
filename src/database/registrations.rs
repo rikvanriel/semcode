@@ -124,6 +124,26 @@ impl RegistrationStore {
 
     /// Everything installed in a member of this name, whatever the type.
     /// Weaker than find_by_slot, and the caller has to say it means that.
+    /// Rows for a member that could still turn out to be this container's.
+    ///
+    /// A row made through a field does not know its container until it is
+    /// resolved, so it has to be read; every other container's rows do not.
+    /// Asking by member alone reads them all — `read` and `owner` match
+    /// thousands across a kernel — and resolves each one before discarding it.
+    pub async fn find_by_member_for_container(
+        &self,
+        container_type: &str,
+        member: &str,
+    ) -> Result<Vec<Registration>> {
+        let quote = |v: &str| v.replace('\'', "''");
+        self.query(&format!(
+            "member = '{}' AND (container_type = '{}' OR container_type = '')",
+            quote(member),
+            quote(container_type)
+        ))
+        .await
+    }
+
     pub async fn find_by_member(&self, member: &str) -> Result<Vec<Registration>> {
         self.query(&format!("member = '{}'", member.replace('\'', "''")))
             .await
