@@ -203,9 +203,9 @@ pub struct TreeSitterAnalyzer {
     c_parser: Parser,
     rust_parser: Parser,
     python_parser: Parser,
-    c_queries: LanguageQueries,
-    rust_queries: LanguageQueries,
-    python_queries: LanguageQueries,
+    c_queries: &'static LanguageQueries,
+    rust_queries: &'static LanguageQueries,
+    python_queries: &'static LanguageQueries,
 }
 
 impl TreeSitterAnalyzer {
@@ -225,14 +225,11 @@ impl TreeSitterAnalyzer {
         let mut python_parser = Parser::new();
         python_parser.set_language(&python_language)?;
 
-        // Create C queries
-        let c_queries = Self::create_c_queries(&c_language)?;
-
-        // Create Rust queries
-        let rust_queries = Self::create_rust_queries(&rust_language)?;
-
-        // Create Python queries
-        let python_queries = Self::create_python_queries(&python_language)?;
+        // Compiled once for the process, not once per analyzer: see
+        // c_queries() below.
+        let c_queries = Self::c_queries()?;
+        let rust_queries = Self::rust_queries()?;
+        let python_queries = Self::python_queries()?;
 
         Ok(TreeSitterAnalyzer {
             c_parser,
@@ -242,6 +239,51 @@ impl TreeSitterAnalyzer {
             rust_queries,
             python_queries,
         })
+    }
+
+    /// Compiled queries for one language, built on first use and shared by
+    /// every analyzer after that.
+    ///
+    /// Every file is analyzed with the same queries, and compiling them is
+    /// what building an analyzer costs, so they are built once rather than
+    /// once per file. A `Query` is immutable and `Send + Sync`, so one copy
+    /// serves every thread; a `Parser` is neither, and stays per-analyzer.
+    ///
+    /// `OnceLock` takes no fallible initialiser, so a compile failure is kept
+    /// as its message and returned to each caller.
+    fn c_queries() -> Result<&'static LanguageQueries> {
+        static QUERIES: std::sync::OnceLock<std::result::Result<LanguageQueries, String>> =
+            std::sync::OnceLock::new();
+        QUERIES
+            .get_or_init(|| {
+                Self::create_c_queries(&tree_sitter_c::LANGUAGE.into()).map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("C queries: {e}"))
+    }
+
+    fn rust_queries() -> Result<&'static LanguageQueries> {
+        static QUERIES: std::sync::OnceLock<std::result::Result<LanguageQueries, String>> =
+            std::sync::OnceLock::new();
+        QUERIES
+            .get_or_init(|| {
+                Self::create_rust_queries(&tree_sitter_rust::LANGUAGE.into())
+                    .map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("Rust queries: {e}"))
+    }
+
+    fn python_queries() -> Result<&'static LanguageQueries> {
+        static QUERIES: std::sync::OnceLock<std::result::Result<LanguageQueries, String>> =
+            std::sync::OnceLock::new();
+        QUERIES
+            .get_or_init(|| {
+                Self::create_python_queries(&tree_sitter_python::LANGUAGE.into())
+                    .map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("Python queries: {e}"))
     }
 
     fn create_c_queries(language: &tree_sitter::Language) -> Result<LanguageQueries> {
@@ -562,9 +604,9 @@ impl TreeSitterAnalyzer {
     /// Get the appropriate queries for a language
     fn get_queries(&self, language: Language) -> &LanguageQueries {
         match language {
-            Language::C => &self.c_queries,
-            Language::Rust => &self.rust_queries,
-            Language::Python => &self.python_queries,
+            Language::C => self.c_queries,
+            Language::Rust => self.rust_queries,
+            Language::Python => self.python_queries,
         }
     }
 
@@ -3776,6 +3818,19 @@ mod tests {
             .calls
             .clone()
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn every_analyzer_shares_one_set_of_queries() {
+        // Compiling them is the whole cost of an analyzer, and one is built
+        // per file. Two analyzers must point at the same queries, not hold
+        // two copies of them.
+        let first = TreeSitterAnalyzer::new().unwrap();
+        let second = TreeSitterAnalyzer::new().unwrap();
+
+        assert!(std::ptr::eq(first.c_queries, second.c_queries));
+        assert!(std::ptr::eq(first.rust_queries, second.rust_queries));
+        assert!(std::ptr::eq(first.python_queries, second.python_queries));
     }
 
     #[test]
