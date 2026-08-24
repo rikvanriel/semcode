@@ -40,6 +40,44 @@ fn write_fixture(repo: &Path) {
     )
     .unwrap();
 
+    // A callback installed through a field of a declared object, which is
+    // how every per-superblock, per-mount and per-pool shrinker is
+    // registered. The container type is not in this file: `s_shrink` is
+    // declared with struct super_block, in the header.
+    std::fs::write(
+        repo.join("shrinker.h"),
+        "struct shrink_control;\n\
+         struct shrinker {\n\
+         \tunsigned long (*scan_objects)(struct shrinker *, struct shrink_control *);\n\
+         };\n\
+         struct super_block { struct shrinker *s_shrink; };\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        repo.join("super.c"),
+        "#include \"shrinker.h\"\n\
+         unsigned long super_cache_scan(struct shrinker *shrink,\n\
+         \t\t\t       struct shrink_control *sc);\n\
+         int alloc_super(struct super_block *s)\n\
+         {\n\
+         \ts->s_shrink->scan_objects = super_cache_scan;\n\
+         \treturn 0;\n\
+         }\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        repo.join("shrinker.c"),
+        "#include \"shrinker.h\"\n\
+         unsigned long do_shrink_slab(struct shrinker *shrinker,\n\
+         \t\t\t     struct shrink_control *sc)\n\
+         {\n\
+         \treturn shrinker->scan_objects(shrinker, sc);\n\
+         }\n",
+    )
+    .unwrap();
+
     std::fs::write(
         repo.join("tcp.c"),
         "#include \"proto.h\"\n\
@@ -257,5 +295,46 @@ async fn the_member_call_is_not_recorded_as_a_call_to_a_function() {
     assert!(
         !callees.contains(&"handler".to_string()),
         "member name recorded as a callee: {callees:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_callback_installed_through_a_field_has_callers() {
+    // `s->s_shrink->scan_objects = super_cache_scan` names no container: what
+    // `s_shrink` points at is declared with struct super_block, elsewhere. The
+    // registration is recorded with the path and resolved at query time, or
+    // the function appears to have no callers at all.
+    let dir = tempfile::tempdir().unwrap();
+    let (db, git_sha) = index_fixture(dir.path()).await;
+
+    let registrations = db
+        .find_registrations_of_git_aware("super_cache_scan", &git_sha)
+        .await
+        .unwrap();
+    assert_eq!(registrations.len(), 1, "{registrations:?}");
+    assert_eq!(registrations[0].container_type, "shrinker");
+    assert_eq!(registrations[0].member, "scan_objects");
+
+    let indirect = db
+        .find_indirect_callers("super_cache_scan", &git_sha)
+        .await
+        .unwrap();
+    let typed: Vec<&str> = indirect
+        .iter()
+        .filter(|c| c.evidence.is_type_matched())
+        .map(|c| c.caller_name.as_str())
+        .collect();
+    assert!(
+        typed.contains(&"do_shrink_slab"),
+        "the dispatch that reaches it is missing: {indirect:?}"
+    );
+
+    let installed = db
+        .find_registrations_for_slot_git_aware("shrinker", "scan_objects", &git_sha)
+        .await
+        .unwrap();
+    assert!(
+        installed.iter().any(|r| r.target == "super_cache_scan"),
+        "implementors misses a registration made through a field: {installed:?}"
     );
 }
