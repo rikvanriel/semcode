@@ -3922,6 +3922,36 @@ mod tests {
     }
 
     #[test]
+    fn a_path_keeps_every_field_however_long() {
+        // Four fields, mixed arrow and dot, which is what a chain through an
+        // embedded struct looks like.
+        let (_functions, sites) = analyze(
+            "struct l1 { int x; };\n\
+             int probe(struct l1 *a) { return a->b.c->d->run(); }\n",
+            "test.c",
+        );
+
+        let run = sites.iter().find(|s| s.member == "run").unwrap();
+        assert_eq!(run.receiver_base_type.as_deref(), Some("l1"));
+        assert_eq!(run.receiver_field.as_deref(), Some("b.c.d"));
+    }
+
+    #[test]
+    fn a_registration_keeps_every_field_however_long() {
+        let source = "struct l1 { int x; };\n\
+                      int setup(struct l1 *a) {\n\
+                      \ta->b->c->d->handler = my_handler;\n\
+                      \treturn 0;\n\
+                      }\n";
+        let registrations = registration_rows(source, "test.c");
+
+        assert_eq!(registrations.len(), 1, "{registrations:?}");
+        assert_eq!(registrations[0].container_base_type.as_deref(), Some("l1"));
+        assert_eq!(registrations[0].container_field.as_deref(), Some("b.c.d"));
+        assert_eq!(registrations[0].member, "handler");
+    }
+
+    #[test]
     fn a_chain_through_a_call_records_nothing() {
         // `ath9k_hw_common(_ah)->ops` needs the return type of a function,
         // which is a different lookup; reading half the chain would file the

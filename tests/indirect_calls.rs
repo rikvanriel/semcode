@@ -78,6 +78,40 @@ fn write_fixture(repo: &Path) {
     )
     .unwrap();
 
+    // Four links: the container of the member is three field lookups from
+    // the only name the calling file declares. Both the registration and the
+    // dispatch have to walk the same path.
+    std::fs::write(
+        repo.join("deep.h"),
+        "struct leaf_ops { int (*run)(void); };\n\
+         struct level3 { struct leaf_ops *ops; };\n\
+         struct level2 { struct level3 *l3; };\n\
+         struct level1 { struct level2 *l2; };\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        repo.join("deep_install.c"),
+        "#include \"deep.h\"\n\
+         int deep_impl(void);\n\
+         int install_deep(struct level1 *top)\n\
+         {\n\
+         \ttop->l2->l3->ops->run = deep_impl;\n\
+         \treturn 0;\n\
+         }\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        repo.join("deep_call.c"),
+        "#include \"deep.h\"\n\
+         int call_deep(struct level1 *top)\n\
+         {\n\
+         \treturn top->l2->l3->ops->run();\n\
+         }\n",
+    )
+    .unwrap();
+
     std::fs::write(
         repo.join("tcp.c"),
         "#include \"proto.h\"\n\
@@ -336,5 +370,38 @@ async fn a_callback_installed_through_a_field_has_callers() {
     assert!(
         installed.iter().any(|r| r.target == "super_cache_scan"),
         "implementors misses a registration made through a field: {installed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_path_of_three_fields_resolves_on_both_sides() {
+    // `top->l2->l3->ops->run` is three lookups from the only declared name,
+    // on the registration and on the dispatch. One hop was covered; the walk
+    // itself was not.
+    let dir = tempfile::tempdir().unwrap();
+    let (db, git_sha) = index_fixture(dir.path()).await;
+
+    let registrations = db
+        .find_registrations_of_git_aware("deep_impl", &git_sha)
+        .await
+        .unwrap();
+    assert_eq!(registrations.len(), 1, "{registrations:?}");
+    assert_eq!(
+        registrations[0].container_type, "leaf_ops",
+        "the walk stopped short: {registrations:?}"
+    );
+
+    let indirect = db
+        .find_indirect_callers("deep_impl", &git_sha)
+        .await
+        .unwrap();
+    let typed: Vec<&str> = indirect
+        .iter()
+        .filter(|c| c.evidence.is_type_matched())
+        .map(|c| c.caller_name.as_str())
+        .collect();
+    assert!(
+        typed.contains(&"call_deep"),
+        "a dispatch three fields deep was not matched: {indirect:?}"
     );
 }
