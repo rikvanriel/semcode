@@ -1179,27 +1179,8 @@ impl TreeSitterAnalyzer {
                 (String::new(), Some(outer_type), Some(path.join(".")))
             };
 
-            let mut cursor = node.walk();
-            for pair in node.named_children(&mut cursor) {
-                if pair.kind() != "initializer_pair" {
-                    continue;
-                }
-
-                // `.member = ...`; an array designator is a slot, not a member.
-                let Some(designator) = pair.child_by_field_name("designator") else {
-                    continue;
-                };
-                if designator.kind() != "field_designator" {
-                    continue;
-                }
-                let member = designator
-                    .named_child(0)
-                    .map(|n| source[n.byte_range()].to_string())
-                    .unwrap_or_default();
-
-                let Some(value) = pair.child_by_field_name("value") else {
-                    continue;
-                };
+            for (member_node, value) in Self::initializer_members(node) {
+                let member = source[member_node.byte_range()].to_string();
                 // `.read = my_read` and `.read = &my_read` say the same thing.
                 let target_node = match value.kind() {
                     "identifier" => Some(value),
@@ -1223,8 +1204,8 @@ impl TreeSitterAnalyzer {
                     container_field: container_field.clone(),
                     member,
                     target,
-                    byte_start: pair.start_byte(),
-                    line: pair.start_position().row as u32 + 1,
+                    byte_start: member_node.start_byte(),
+                    line: member_node.start_position().row as u32 + 1,
                     kind: RegistrationKind::DesignatedInit,
                 });
             }
@@ -1380,6 +1361,55 @@ impl TreeSitterAnalyzer {
     /// compound literal that holds it. A nested initializer states no type of
     /// its own, and inferring one would need the member's declared type,
     /// which usually lives in another file.
+    /// The members one initializer list installs, as (member, value).
+    ///
+    /// A preprocessor line inside the list defeats the grammar:
+    ///
+    /// ```text
+    /// static const struct tcp_sock_af_ops tcp_sock_ipv4_specific = {
+    /// #ifdef CONFIG_TCP_AO
+    ///         .ao_lookup = tcp_v4_ao_lookup,
+    /// ```
+    ///
+    /// parses as an error, and `.ao_lookup = tcp_v4_ao_lookup` then recovers
+    /// as an *assignment* whose object is the previous pair's value. Reading
+    /// only `initializer_pair` children loses every member the first arm of a
+    /// conditional installs while keeping the ones after `#else`, which is how
+    /// half a struct goes missing with nothing looking wrong.
+    ///
+    /// An assignment cannot appear in an initializer list in C, so one here is
+    /// always that recovery, and the field it assigns to is the member. The
+    /// object it appears to assign through is an artefact and is ignored.
+    ///
+    /// A nested list is skipped: it is its own list with its own container,
+    /// and the walk reaches it separately.
+    fn initializer_members(list: tree_sitter::Node) -> Vec<(tree_sitter::Node, tree_sitter::Node)> {
+        let mut members = Vec::new();
+        let mut cursor = list.walk();
+
+        for child in list.named_children(&mut cursor) {
+            let named = match child.kind() {
+                "initializer_pair" => child
+                    .child_by_field_name("designator")
+                    .filter(|d| d.kind() == "field_designator")
+                    .and_then(|d| d.named_child(0))
+                    .zip(child.child_by_field_name("value")),
+                "assignment_expression" => child
+                    .child_by_field_name("left")
+                    .filter(|l| l.kind() == "field_expression")
+                    .and_then(|l| l.child_by_field_name("field"))
+                    .zip(child.child_by_field_name("right")),
+                _ => None,
+            };
+
+            if let Some(pair) = named {
+                members.push(pair);
+            }
+        }
+
+        members
+    }
+
     /// The type an initializer list fills in, and the path of fields to reach
     /// it from the type the file states.
     ///
@@ -4438,6 +4468,39 @@ mod tests {
         let run = found.iter().find(|r| r.member == "run").unwrap();
         assert_eq!(run.container_base_type.as_deref(), Some("holder"));
         assert_eq!(run.container_field.as_deref(), Some("table"));
+    }
+
+    #[test]
+    fn a_member_behind_a_config_option_is_recorded() {
+        // net/ipv4/tcp_ipv4.c guards half of tcp_sock_ipv4_specific this way.
+        // Which arm a build takes is not knowable here, and a function
+        // installed by either is one something can dispatch to.
+        let found = registration_rows(
+            "struct ops { int (*plain)(void); int (*guarded)(void); int (*other)(void); };\n\
+             int plain_impl(void);\n\
+             int guarded_impl(void);\n\
+             int other_impl(void);\n\
+             static struct ops o = {\n\
+             \t.plain = plain_impl,\n\
+             #ifdef CONFIG_SOMETHING\n\
+             \t.guarded = guarded_impl,\n\
+             #else\n\
+             \t.other = other_impl,\n\
+             #endif\n\
+             };\n",
+            "test.c",
+        );
+
+        let members: Vec<&str> = found.iter().map(|r| r.member.as_str()).collect();
+        assert!(members.contains(&"plain"), "{found:?}");
+        assert!(
+            members.contains(&"guarded"),
+            "the arm before #else was lost: {found:?}"
+        );
+        assert!(members.contains(&"other"), "{found:?}");
+        assert!(found.iter().all(|r| r.container_type == "ops"), "{found:?}");
+        let guarded = found.iter().find(|r| r.member == "guarded").unwrap();
+        assert_eq!(guarded.target, "guarded_impl");
     }
 
     #[test]
