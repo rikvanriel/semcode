@@ -3,6 +3,7 @@
 // Storage for registrations: functions installed in struct members. These are
 // the targets a dispatch site resolves to, joined on (container_type, member).
 use anyhow::Result;
+use arrow::array::Array;
 use arrow::array::{ArrayRef, Int64Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow::array::{Int64Builder, StringBuilder};
 use futures::TryStreamExt;
@@ -37,6 +38,8 @@ impl RegistrationStore {
             .await?;
 
         let mut container = StringBuilder::new();
+        let mut container_base = StringBuilder::new();
+        let mut container_field = StringBuilder::new();
         let mut member = StringBuilder::new();
         let mut target = StringBuilder::new();
         let mut file_path = StringBuilder::new();
@@ -48,6 +51,8 @@ impl RegistrationStore {
 
         for r in &registrations {
             container.append_value(&r.container_type);
+            container_base.append_option(r.container_base_type.as_deref());
+            container_field.append_option(r.container_field.as_deref());
             member.append_value(&r.member);
             target.append_value(&r.target);
             file_path.append_value(&r.file_path);
@@ -60,6 +65,14 @@ impl RegistrationStore {
 
         let batch = RecordBatch::try_from_iter(vec![
             ("container_type", Arc::new(container.finish()) as ArrayRef),
+            (
+                "container_base_type",
+                Arc::new(container_base.finish()) as ArrayRef,
+            ),
+            (
+                "container_field",
+                Arc::new(container_field.finish()) as ArrayRef,
+            ),
             ("member", Arc::new(member.finish()) as ArrayRef),
             ("target", Arc::new(target.finish()) as ArrayRef),
             ("file_path", Arc::new(file_path.finish()) as ArrayRef),
@@ -147,6 +160,16 @@ impl RegistrationStore {
                 .to_string())
         };
 
+        // Absent on a row whose container the file stated outright, and on
+        // every row written before the columns existed.
+        let optional = |name: &str| -> Option<String> {
+            batch
+                .column_by_name(name)
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .filter(|values| values.is_valid(row) && !values.value(row).is_empty())
+                .map(|values| values.value(row).to_string())
+        };
+
         let kind_text = text("kind")?;
         let kind = RegistrationKind::from_column_value(&kind_text)
             .ok_or_else(|| anyhow::anyhow!("unknown registration kind '{kind_text}'"))?;
@@ -161,6 +184,8 @@ impl RegistrationStore {
             line: get_column::<Int64Array>(batch, "line")?.value(row) as u32,
             enclosing_function: text("enclosing_function")?,
             kind,
+            container_base_type: optional("container_base_type"),
+            container_field: optional("container_field"),
         })
     }
 }

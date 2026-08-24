@@ -210,7 +210,10 @@ impl DispatchKind {
 /// a constant simply never joins.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Registration {
-    /// Struct or typedef whose member is being initialised.
+    /// Struct or typedef whose member is being initialised. Empty when the
+    /// file did not state it and `container_base_type` did: an assignment
+    /// through a field, `s->s_shrink->scan_objects = f`, knows what `s` is
+    /// but not what `s_shrink` is declared as. Resolution fills it in.
     pub container_type: String,
     pub member: String,
     /// Identifier the member is initialised with.
@@ -222,6 +225,11 @@ pub struct Registration {
     /// Function containing the initializer, empty at file scope.
     pub enclosing_function: String,
     pub kind: RegistrationKind,
+    /// For `base->field->member = f`, the type of the base and the path of
+    /// fields read from it. Set together, and only when the container type
+    /// could not be read from the file directly.
+    pub container_base_type: Option<String>,
+    pub container_field: Option<String>,
 }
 
 /// How a function came to be installed. Stored, so values are append-only.

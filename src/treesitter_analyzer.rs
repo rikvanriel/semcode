@@ -93,6 +93,11 @@ struct MacroBodyFacts {
 #[derive(Debug, Clone)]
 struct RawRegistration {
     container_type: String,
+    /// For `base->field->member = f`: what the file proves about the base,
+    /// and the path of fields read from it. Set only when `container_type`
+    /// could not be read from the file directly.
+    container_base_type: Option<String>,
+    container_field: Option<String>,
     member: String,
     target: String,
     byte_start: usize,
@@ -104,6 +109,8 @@ impl RawRegistration {
     fn attribute(&self, enclosing: &str, file_path: &str, git_hash: &str) -> Registration {
         Registration {
             container_type: self.container_type.clone(),
+            container_base_type: self.container_base_type.clone(),
+            container_field: self.container_field.clone(),
             member: self.member.clone(),
             target: self.target.clone(),
             file_path: file_path.to_string(),
@@ -1205,6 +1212,8 @@ impl TreeSitterAnalyzer {
 
                 found.push(RawRegistration {
                     container_type: container_type.clone(),
+                    container_base_type: None,
+                    container_field: None,
                     member,
                     target,
                     byte_start: pair.start_byte(),
@@ -1270,15 +1279,34 @@ impl TreeSitterAnalyzer {
             let Some(receiver) = left.child_by_field_name("argument") else {
                 continue;
             };
-            if receiver.kind() != "identifier" {
-                continue;
-            }
-            let Some(container_type) = locals.get(&source[receiver.byte_range()]).cloned() else {
-                continue;
-            };
+            let receiver_text = collapse_whitespace(&source[receiver.byte_range()]);
+
+            // `x->member = f` names its container as soon as `x` is declared
+            // here. `s->s_shrink->scan_objects = f` does not: `s_shrink` is
+            // declared with struct super_block, in a header this file
+            // includes rather than contains. Record what is known — the type
+            // of the base and the path read from it — and let resolution
+            // finish it against the types table.
+            let (container_type, container_base_type, container_field) =
+                if receiver.kind() == "identifier" {
+                    match locals.get(&receiver_text) {
+                        Some(container) => (container.clone(), None, None),
+                        None => continue,
+                    }
+                } else {
+                    match field_path(&receiver_text) {
+                        Some((base, path)) => match locals.get(base) {
+                            Some(base_type) => (String::new(), Some(base_type.clone()), Some(path)),
+                            None => continue,
+                        },
+                        None => continue,
+                    }
+                };
 
             found.push(RawRegistration {
                 container_type,
+                container_base_type,
+                container_field,
                 member,
                 target,
                 byte_start: node.start_byte(),
@@ -3926,6 +3954,53 @@ mod tests {
     }
 
     #[test]
+    fn an_assignment_through_a_field_records_the_path() {
+        // fs/super.c installs every superblock's shrinker this way. `s` is
+        // declared here; what `s_shrink` points at is declared with struct
+        // super_block, so the container is resolved later.
+        let source = "struct super_block { struct shrinker *s_shrink; };\n\
+                      int setup(struct super_block *s) {\n\
+                      \ts->s_shrink->scan_objects = super_cache_scan;\n\
+                      \treturn 0;\n\
+                      }\n";
+        let registrations = registration_rows(source, "super.c");
+
+        assert_eq!(registrations.len(), 1, "{registrations:?}");
+        let entry = &registrations[0];
+        assert_eq!(entry.container_type, "");
+        assert_eq!(entry.container_base_type.as_deref(), Some("super_block"));
+        assert_eq!(entry.container_field.as_deref(), Some("s_shrink"));
+        assert_eq!(entry.member, "scan_objects");
+        assert_eq!(entry.target, "super_cache_scan");
+    }
+
+    #[test]
+    fn an_assignment_on_a_declared_name_still_names_its_container() {
+        // mm/workingset.c installs through a file-scope pointer, which the
+        // file types on its own; nothing is deferred.
+        let source = "static struct shrinker *workingset_shadow_shrinker;\n\
+                      int init(void) {\n\
+                      \tworkingset_shadow_shrinker->scan_objects = scan_shadow_nodes;\n\
+                      \treturn 0;\n\
+                      }\n";
+        let registrations = registration_rows(source, "workingset.c");
+
+        assert_eq!(registrations.len(), 1, "{registrations:?}");
+        assert_eq!(registrations[0].container_type, "shrinker");
+        assert_eq!(registrations[0].container_base_type, None);
+    }
+
+    #[test]
+    fn an_assignment_through_an_undeclared_base_records_nothing() {
+        let registrations = registration_rows(
+            "int setup(void) { p->q->handler = my_handler; return 0; }\n",
+            "test.c",
+        );
+
+        assert!(registrations.is_empty(), "{registrations:?}");
+    }
+
+    #[test]
     fn a_macro_that_declares_an_ops_table_registers_it() {
         // ACPI and the error-injection macros build tables this way: the
         // macro declares the thing it initialises, so its type is stated.
@@ -4110,6 +4185,15 @@ mod tests {
             "cast operand read as a call: {:?}",
             macro_calls(source, "CASTED")
         );
+    }
+
+    /// Whole rows, for tests that care about what was deferred.
+    fn registration_rows(source: &str, path: &str) -> Vec<crate::types::Registration> {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        analyzer
+            .analyze_source_with_metadata(source, Path::new(path), "testhash", None)
+            .unwrap()
+            .registrations
     }
 
     fn registrations_of(source: &str, path: &str) -> Vec<(String, String, String, String)> {

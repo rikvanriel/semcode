@@ -6700,6 +6700,8 @@ mod tests {
             line: 1,
             enclosing_function: String::new(),
             kind: RegistrationKind::DesignatedInit,
+            container_base_type: None,
+            container_field: None,
         }])
         .await
         .unwrap();
@@ -6762,6 +6764,8 @@ mod tests {
             line: 10,
             enclosing_function: String::new(),
             kind: RegistrationKind::DesignatedInit,
+            container_base_type: None,
+            container_field: None,
         };
 
         let rows = vec![

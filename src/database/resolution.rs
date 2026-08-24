@@ -330,6 +330,8 @@ mod tests {
             line: 7,
             enclosing_function: String::new(),
             kind: RegistrationKind::DesignatedInit,
+            container_base_type: None,
+            container_field: None,
         }
     }
 

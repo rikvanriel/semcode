@@ -30,7 +30,10 @@ pub enum OptimizeOutcome {
 /// 3: `receiver_field` holds the whole path of fields a receiver reads, not
 ///    only the first, so `a->b->c->m()` resolves. A version 2 row holds one
 ///    field where this reads a path.
-pub const SCHEMA_VERSION: u32 = 3;
+/// 4: a registration can be recorded before its container type is known,
+///    carrying the base and field path instead. A version 3 index has no
+///    such rows at all: it dropped those registrations.
+pub const SCHEMA_VERSION: u32 = 4;
 
 pub struct SchemaManager {
     connection: Connection,
@@ -196,6 +199,12 @@ impl SchemaManager {
     pub async fn create_registrations_table(&self) -> Result<()> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("container_type", DataType::Utf8, false),
+            // For `base->field->member = f`: what the file proves about the
+            // base, and the path read from it. The container itself is
+            // whatever that field is declared as, which lives with the base's
+            // struct, so resolution finishes the job.
+            Field::new("container_base_type", DataType::Utf8, true),
+            Field::new("container_field", DataType::Utf8, true),
             Field::new("member", DataType::Utf8, false),
             Field::new("target", DataType::Utf8, false),
             Field::new("file_path", DataType::Utf8, false),
