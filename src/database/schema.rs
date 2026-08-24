@@ -71,10 +71,22 @@ impl SchemaManager {
 
         if !table_names.iter().any(|n| n == "dispatch_sites") {
             self.create_dispatch_sites_table().await?;
+        } else {
+            self.recreate_without_columns(
+                "dispatch_sites",
+                &["receiver_base_type", "receiver_field"],
+            )
+            .await?;
         }
 
         if !table_names.iter().any(|n| n == "registrations") {
             self.create_registrations_table().await?;
+        } else {
+            self.recreate_without_columns(
+                "registrations",
+                &["container_base_type", "container_field"],
+            )
+            .await?;
         }
 
         if !table_names.iter().any(|n| n == "schema_meta") {
@@ -489,24 +501,41 @@ impl SchemaManager {
     /// index would report itself stale forever, and re-indexing would never
     /// settle it.
     async fn migrate_processed_files_table(&self) -> Result<()> {
-        let table = self
-            .connection
-            .open_table("processed_files")
-            .execute()
-            .await?;
-        let has_column = table
-            .schema()
-            .await?
-            .fields()
+        self.recreate_without_columns("processed_files", &["extractor_version"])
+            .await
+    }
+
+    /// Start a table again when this build writes columns it does not have.
+    ///
+    /// Creating tables only creates the ones that are missing, so a column
+    /// added to a table definition never reaches a database that already has
+    /// that table: every insert then fails with a schema mismatch, and the
+    /// index cannot be repaired by re-indexing, which is the one thing a user
+    /// will try.
+    ///
+    /// Dropping is safe for these tables because every row in them is derived
+    /// from a file, and the schema version that goes with a column change
+    /// makes each file be read again.
+    async fn recreate_without_columns(&self, name: &str, columns: &[&str]) -> Result<()> {
+        let table = self.connection.open_table(name).execute().await?;
+        let schema = table.schema().await?;
+        let missing: Vec<&str> = columns
             .iter()
-            .any(|field| field.name() == "extractor_version");
-        if has_column {
+            .copied()
+            .filter(|column| !schema.fields().iter().any(|f| f.name() == column))
+            .collect();
+        if missing.is_empty() {
             return Ok(());
         }
 
-        tracing::info!("processed_files predates the extractor version column: starting it again");
-        self.connection.drop_table("processed_files", &[]).await?;
-        self.create_processed_files_table().await
+        tracing::info!("{name} predates {missing:?}: starting the table again");
+        self.connection.drop_table(name, &[]).await?;
+        match name {
+            "processed_files" => self.create_processed_files_table().await,
+            "registrations" => self.create_registrations_table().await,
+            "dispatch_sites" => self.create_dispatch_sites_table().await,
+            other => Err(anyhow::anyhow!("no way to recreate {other}")),
+        }
     }
 
     async fn create_symbol_filename_table(&self) -> Result<()> {
