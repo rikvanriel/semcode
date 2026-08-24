@@ -1431,11 +1431,12 @@ impl TreeSitterAnalyzer {
                 // keep looking outward for a type.
                 "initializer_pair" => {
                     let designator = parent.child_by_field_name("designator")?;
-                    if designator.kind() != "field_designator" {
-                        // An array slot names no field, so the path breaks.
-                        return None;
+                    if designator.kind() == "field_designator" {
+                        path.push(source[designator.named_child(0)?.byte_range()].to_string());
                     }
-                    path.push(source[designator.named_child(0)?.byte_range()].to_string());
+                    // A subscript names a slot rather than a field, and every
+                    // slot of an array has the array's element type, so
+                    // passing through one leaves the path unchanged.
                     node = parent;
                 }
                 _ => node = parent,
@@ -4406,9 +4407,9 @@ mod tests {
     }
 
     #[test]
-    fn an_array_slot_breaks_the_path() {
-        // `[0] = { .run = impl }` names no field to look up, so the container
-        // cannot be reached from the type the file states.
+    fn an_array_slot_keeps_the_element_type() {
+        // Every slot of an array holds the array's element type, so passing
+        // through `[0]` changes nothing about which struct owns the member.
         let found = registration_rows(
             "struct entry { int (*run)(void); };\n\
              int impl(void);\n\
@@ -4416,10 +4417,27 @@ mod tests {
             "test.c",
         );
 
-        assert!(
-            found.iter().all(|r| r.member != "run"),
-            "recorded a container it cannot name: {found:?}"
+        let run = found
+            .iter()
+            .find(|r| r.member == "run")
+            .expect("array slot recorded nothing");
+        assert_eq!(run.container_type, "entry");
+        assert_eq!(run.container_base_type, None);
+    }
+
+    #[test]
+    fn an_array_slot_inside_a_field_keeps_the_path() {
+        let found = registration_rows(
+            "struct entry { int (*run)(void); };\n\
+             struct holder { struct entry table[4]; };\n\
+             int impl(void);\n\
+             static struct holder h = { .table = { [0] = { .run = impl } } };\n",
+            "test.c",
         );
+
+        let run = found.iter().find(|r| r.member == "run").unwrap();
+        assert_eq!(run.container_base_type.as_deref(), Some("holder"));
+        assert_eq!(run.container_field.as_deref(), Some("table"));
     }
 
     #[test]
