@@ -60,7 +60,7 @@ pub fn process_database_path(database_arg: Option<&str>, source_dir: Option<&Pat
 fn resolve_path(path: &str) -> String {
     let path_obj = Path::new(path);
 
-    if path.ends_with(".semcode.db") || is_database(path_obj) {
+    if path.ends_with(".db") || is_database(path_obj) {
         path.to_string()
     } else {
         path_obj.join(".semcode.db").to_string_lossy().to_string()
@@ -69,11 +69,14 @@ fn resolve_path(path: &str) -> String {
 
 /// Whether a path is itself a database rather than a directory holding one.
 ///
-/// Asked of what is on disk, so that one argument names one database whatever
-/// order the commands run in. Deciding on whether the directory merely exists
-/// splits it in two: `-d dir` writes the database at `dir` when nothing is
-/// there yet, and every later command reads `dir/.semcode.db`, which is
-/// empty, so a freshly written index answers every query with "not found".
+/// Asked of the name, and of what is on disk — never of whether the directory
+/// merely exists, which splits one argument into two databases: `-d dir`
+/// writes the database at `dir` when nothing is there yet, and every later
+/// command reads `dir/.semcode.db`, which is empty, so a freshly written
+/// index answers every query with "not found".
+///
+/// A name ending in `.db` is a database, as documented, so `-d ./my.db` puts
+/// it where it says and not a level below.
 fn is_database(path: &Path) -> bool {
     path.join("functions.lance").exists()
 }
@@ -200,6 +203,18 @@ mod tests {
 #[cfg(test)]
 mod one_argument_one_database {
     use super::*;
+
+    #[test]
+    fn a_name_ending_in_db_is_the_database_before_it_exists() {
+        // Documented as a direct path, so it must not gain a level the first
+        // time it is written.
+        let dir = tempfile::tempdir().unwrap();
+        let named = dir.path().join("my-custom.db");
+        assert_eq!(
+            resolve_path(named.to_str().unwrap()),
+            named.to_string_lossy()
+        );
+    }
 
     #[test]
     fn a_directory_that_does_not_exist_yet_holds_the_database() {
