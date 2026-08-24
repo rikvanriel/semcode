@@ -137,9 +137,12 @@ impl DatabaseManager {
     /// was built with.
     /// Forget files an older extractor read, after this one has read the tree.
     pub async fn forget_older_processed_files(&self) -> Result<usize> {
-        self.processed_file_store
-            .forget_older_than(crate::SCHEMA_VERSION)
-            .await
+        self.forget_processed_before(crate::SCHEMA_VERSION).await
+    }
+
+    /// The same, against a stated version, so a test can name one.
+    pub async fn forget_processed_before(&self, version: u32) -> Result<usize> {
+        self.processed_file_store.forget_older_than(version).await
     }
 
     pub async fn record_index_build(&self, extensions: &[String], no_macros: bool) -> Result<()> {

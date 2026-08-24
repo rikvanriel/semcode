@@ -106,3 +106,36 @@ async fn a_file_read_by_this_extractor_may_be_skipped() {
         "a file this build read makes the index look stale"
     );
 }
+
+#[tokio::test]
+async fn a_file_read_by_an_older_extractor_is_forgotten() {
+    // After the whole tree has been read, a row still carrying an older
+    // version is content the tree does not have. Left in place, one such row
+    // makes the index answer "older than this build" for ever, and
+    // re-indexing never clears the refusal it is meant to clear.
+    let dir = tempfile::tempdir().unwrap();
+    let db = manager(dir.path()).await;
+
+    db.mark_file_processed(
+        "fs/super.c".to_string(),
+        Some("deadbeef".to_string()),
+        "cafe1234".to_string(),
+    )
+    .await
+    .unwrap();
+
+    // Nothing is older than this build, so nothing is forgotten.
+    assert_eq!(db.forget_older_processed_files().await.unwrap(), 0);
+    assert!(db
+        .processed_by_this_extractor()
+        .await
+        .unwrap()
+        .contains("cafe1234"));
+
+    // A row from an older extractor goes, and the index stops calling itself
+    // stale on the strength of it.
+    db.forget_processed_before(SCHEMA_VERSION + 1)
+        .await
+        .unwrap();
+    assert!(db.processed_by_this_extractor().await.unwrap().is_empty());
+}
