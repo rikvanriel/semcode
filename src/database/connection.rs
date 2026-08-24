@@ -861,6 +861,60 @@ impl DatabaseManager {
         Ok(resolved)
     }
 
+    /// Give a registration recorded through a field the container type it
+    /// was installed into.
+    ///
+    /// `s->s_shrink->scan_objects = f` knows `s` is a `struct super_block`
+    /// and that the receiver reads `s_shrink`; what that field is declared as
+    /// lives with struct super_block, so it is looked up here, where the
+    /// whole tree's types are available. A row whose path cannot be resolved
+    /// keeps an empty container and joins nothing, which is what it did
+    /// before it was recorded at all.
+    async fn resolve_chained_registrations(
+        &self,
+        registrations: &mut [crate::types::Registration],
+        manifest: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        let mut resolved: std::collections::HashMap<(String, String), Option<String>> =
+            std::collections::HashMap::new();
+
+        for registration in registrations.iter_mut() {
+            if !registration.container_type.is_empty() {
+                continue;
+            }
+            let (Some(base), Some(field)) = (
+                registration.container_base_type.as_deref(),
+                registration.container_field.as_deref(),
+            ) else {
+                continue;
+            };
+
+            let key = (base.to_string(), field.to_string());
+            let container = match resolved.get(&key) {
+                Some(known) => known.clone(),
+                None => {
+                    let mut current = Some(base.to_string());
+                    for step in field.split('.') {
+                        let Some(container_name) = current.take() else {
+                            break;
+                        };
+                        current = self
+                            .field_aggregate(&container_name, step, manifest)
+                            .await?;
+                    }
+                    resolved.insert(key, current.clone());
+                    current
+                }
+            };
+
+            if let Some(container) = container {
+                registration.container_type = container;
+            }
+        }
+
+        Ok(())
+    }
+
     /// What a field of a type is declared as, when every definition of that
     /// type at this revision agrees.
     ///
@@ -907,30 +961,39 @@ impl DatabaseManager {
         member: &str,
         git_sha: &str,
     ) -> Result<Vec<crate::types::Registration>> {
-        let manifest = self.generate_git_manifest(git_sha).await?;
+        let manifest = self.git_manifest_cached(git_sha).await?;
 
-        Ok(crate::database::resolution::at_revision(
-            self.registration_store
-                .find_by_slot(container_type, member)
-                .await?,
+        // Asking the store for the slot would miss every registration made
+        // through a field, because those rows do not know their container
+        // until it is resolved. Ask by member, resolve, then filter.
+        let mut registrations = crate::database::resolution::at_revision(
+            self.registration_store.find_by_member(member).await?,
             &manifest,
             |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
-        ))
+        );
+        self.resolve_chained_registrations(&mut registrations, &manifest)
+            .await?;
+        registrations.retain(|r| r.container_type == container_type);
+
+        Ok(registrations)
     }
 
-    /// Every place a function is installed, at a revision.
     pub async fn find_registrations_of_git_aware(
         &self,
         target: &str,
         git_sha: &str,
     ) -> Result<Vec<crate::types::Registration>> {
-        let manifest = self.generate_git_manifest(git_sha).await?;
+        let manifest = self.git_manifest_cached(git_sha).await?;
 
-        Ok(crate::database::resolution::at_revision(
+        let mut registrations = crate::database::resolution::at_revision(
             self.registration_store.find_by_target(target).await?,
             &manifest,
             |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
-        ))
+        );
+        self.resolve_chained_registrations(&mut registrations, &manifest)
+            .await?;
+
+        Ok(registrations)
     }
 
     /// Everything installed in one member of one type.
@@ -976,11 +1039,13 @@ impl DatabaseManager {
 
         let manifest = self.git_manifest_cached(git_sha).await?;
 
-        let registrations = at_revision(
+        let mut registrations = at_revision(
             self.registration_store.find_by_target(target).await?,
             &manifest,
             |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
         );
+        self.resolve_chained_registrations(&mut registrations, &manifest)
+            .await?;
         let stated = at_revision(
             self.dispatch_site_store.find_by_target(target).await?,
             &manifest,
