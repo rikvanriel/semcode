@@ -2645,6 +2645,45 @@ impl TreeSitterAnalyzer {
         })
     }
 
+    /// The field declarations of a struct or union body, including the ones a
+    /// preprocessor conditional holds.
+    ///
+    /// ```text
+    /// struct task_struct {
+    ///         int always;
+    /// #ifdef CONFIG_SMP
+    ///         int on_cpu;
+    /// #endif
+    /// ```
+    ///
+    /// The grammar puts that declaration inside a `preproc_ifdef` node rather
+    /// than directly in the body, so reading only the body's own children
+    /// drops every member a config option guards. task_struct declares 263
+    /// members and 140 were recorded.
+    ///
+    /// Every arm is read. Which one a build takes is not knowable from the
+    /// source, and a member declared in either is one the type can have.
+    fn field_declarations<'tree>(body: tree_sitter::Node<'tree>) -> Vec<tree_sitter::Node<'tree>> {
+        let mut declarations = Vec::new();
+        let mut stack = vec![body];
+
+        while let Some(node) = stack.pop() {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                match child.kind() {
+                    "field_declaration" => declarations.push(child),
+                    kind if kind.starts_with("preproc_") => stack.push(child),
+                    _ => {}
+                }
+            }
+        }
+
+        // A stack reverses each level; the source order is what a reader of
+        // the type expects, and what an offset comparison needs.
+        declarations.sort_by_key(|node| node.start_byte());
+        declarations
+    }
+
     fn parse_struct_members_from_node(
         &self,
         body_node: tree_sitter::Node,
@@ -2652,13 +2691,9 @@ impl TreeSitterAnalyzer {
     ) -> Vec<FieldInfo> {
         let mut members = Vec::new();
 
-        // Walk through all child nodes of the struct/union body
-        let mut cursor = body_node.walk();
-        for child in body_node.children(&mut cursor) {
-            if child.kind() == "field_declaration" {
-                if let Some(field_info) = self.parse_field_declaration_node(child, source, "") {
-                    members.extend(field_info);
-                }
+        for declaration in Self::field_declarations(body_node) {
+            if let Some(field_info) = self.parse_field_declaration_node(declaration, source, "") {
+                members.extend(field_info);
             }
         }
 
@@ -2751,12 +2786,9 @@ impl TreeSitterAnalyzer {
         prefix: &str,
     ) -> Vec<FieldInfo> {
         let mut members = Vec::new();
-        let mut cursor = body_node.walk();
-        for child in body_node.children(&mut cursor) {
-            if child.kind() == "field_declaration" {
-                if let Some(fields) = self.parse_field_declaration_node(child, source, prefix) {
-                    members.extend(fields);
-                }
+        for declaration in Self::field_declarations(body_node) {
+            if let Some(fields) = self.parse_field_declaration_node(declaration, source, prefix) {
+                members.extend(fields);
             }
         }
 
@@ -3955,6 +3987,68 @@ mod tests {
             .iter()
             .map(|m| (m.name.clone(), m.type_name.clone()))
             .collect()
+    }
+
+    #[test]
+    fn a_member_behind_a_config_option_is_extracted() {
+        // task_struct declares 263 members and 140 were recorded: everything
+        // a config option guards was dropped, so a field audit of the type
+        // silently ignored half of it.
+        let fields = fields_of(
+            "struct task_struct {\n\
+             \tint always;\n\
+             #ifdef CONFIG_SMP\n\
+             \tint on_cpu;\n\
+             #endif\n\
+             \tint after;\n\
+             };\n",
+            "task_struct",
+        );
+
+        let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["always", "on_cpu", "after"], "{fields:?}");
+    }
+
+    #[test]
+    fn both_arms_of_a_conditional_member_are_extracted() {
+        // Which arm a build takes is not knowable from the source, and a
+        // member declared in either is one the type can have.
+        // An unguarded member is needed: with every member guarded, nothing
+        // is found by the walk and a string fallback rescues the struct,
+        // which is why a small test does not show the defect.
+        let fields = fields_of(
+            "struct t {\n\
+             \tint plain;\n\
+             #ifdef CONFIG_64BIT\n\
+             \tlong wide;\n\
+             #else\n\
+             \tint narrow;\n\
+             #endif\n\
+             };\n",
+            "t",
+        );
+
+        let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"wide"), "{fields:?}");
+        assert!(names.contains(&"narrow"), "{fields:?}");
+    }
+
+    #[test]
+    fn a_member_behind_nested_conditionals_is_extracted() {
+        let fields = fields_of(
+            "struct t {\n\
+             \tint plain;\n\
+             #ifdef CONFIG_A\n\
+             #ifdef CONFIG_B\n\
+             \tint deep;\n\
+             #endif\n\
+             #endif\n\
+             };\n",
+            "t",
+        );
+
+        let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["plain", "deep"], "{fields:?}");
     }
 
     fn analyze(source: &str, path: &str) -> (Vec<FunctionInfo>, Vec<DispatchSite>) {
