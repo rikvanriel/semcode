@@ -223,6 +223,55 @@ pub fn get_git_file_hash_with_fallback<P: AsRef<Path>>(file_path: P) -> Result<S
 mod tests {
     use super::*;
 
+    /// A repository with one commit on a branch called `main`.
+    ///
+    /// A test that asks the checkout it runs in about branches is asking
+    /// about whoever ran it. A CI checkout has no local branches at all — it
+    /// is detached at the merge commit of the pull request — which is a
+    /// perfectly ordinary repository, and one these tests cannot answer for.
+    fn repo_with_a_branch() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_NAME", "Semcode Test")
+                .env("GIT_AUTHOR_EMAIL", "semcode@example.com")
+                .env("GIT_COMMITTER_NAME", "Semcode Test")
+                .env("GIT_COMMITTER_EMAIL", "semcode@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+
+        std::fs::write(dir.path().join("file.c"), "int main(void) { return 0; }\n").unwrap();
+        run(&["init", "-q"]);
+        run(&["add", "file.c"]);
+        run(&["commit", "-q", "-m", "one"]);
+        // Whatever init.defaultBranch happens to be, the tests name this one.
+        run(&["branch", "-M", "main"]);
+        dir
+    }
+
+    /// A clone of that repository, so `origin/main` exists to be listed.
+    ///
+    /// Whether a checkout has remote-tracking refs is a property of how it
+    /// was made, not of the code under test.
+    fn clone_of(origin: &tempfile::TempDir) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                origin.path().to_str().unwrap(),
+                dir.path().join("clone").to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "git clone failed");
+        dir
+    }
+
     #[test]
     fn test_get_git_sha_current_dir() {
         // This should work if running in a git repository
@@ -262,13 +311,13 @@ mod tests {
 
     #[test]
     fn test_list_branches_local() {
-        // List local branches only
-        let result = list_branches(".", false);
+        let repo = repo_with_a_branch();
+        let result = list_branches(repo.path().to_str().unwrap(), false);
         assert!(result.is_ok());
 
         let branches = result.unwrap();
-        // Should have at least one local branch (main/master)
-        assert!(!branches.is_empty());
+        assert_eq!(branches.len(), 1, "{branches:?}");
+        assert_eq!(branches[0].name, "main");
 
         // All should be local branches
         for branch in &branches {
@@ -282,13 +331,17 @@ mod tests {
 
     #[test]
     fn test_list_branches_with_remote() {
-        // List all branches including remote
-        let result = list_branches(".", true);
+        let origin = repo_with_a_branch();
+        let holder = clone_of(&origin);
+        let clone = holder.path().join("clone");
+        let result = list_branches(clone.to_str().unwrap(), true);
         assert!(result.is_ok());
 
         let branches = result.unwrap();
-        // Should have at least one branch
-        assert!(!branches.is_empty());
+        assert!(
+            branches.iter().any(|b| b.is_remote),
+            "a clone has a remote branch: {branches:?}"
+        );
 
         // Check that remote branches have proper attributes
         for branch in &branches {
@@ -303,13 +356,9 @@ mod tests {
 
     #[test]
     fn test_resolve_branch_main() {
-        // Try to resolve 'main' or 'master' branch
-        let main_result = resolve_branch(".", "main");
-        let master_result = resolve_branch(".", "master");
-
-        // At least one should succeed
-        let resolved = main_result.or(master_result);
-        assert!(resolved.is_ok());
+        let repo = repo_with_a_branch();
+        let resolved = resolve_branch(repo.path().to_str().unwrap(), "main");
+        assert!(resolved.is_ok(), "{resolved:?}");
 
         let sha = resolved.unwrap();
         assert_eq!(sha.len(), 40);
