@@ -2447,16 +2447,42 @@ impl TreeSitterAnalyzer {
                     },
                 });
 
-                // Only add function-like macros (consistent with libclang mode)
-                // Note: from_macro() is only called when is_function_like is true,
-                // so all macros here are function-like by definition
-                if is_function_like {
+                // Function-like macros, and the object-like ones needed to
+                // read a declaration. `} __packed;` and `} lru_gen;` parse
+                // identically — a field_declaration with a field_identifier —
+                // so the only way to tell an attribute from a member name is
+                // to know what the identifier expands to, and that is written
+                // in another file.
+                let body_text = body.map(|b| &source[b.byte_range()]).unwrap_or("");
+                if is_function_like || Self::expands_to_an_attribute(body_text) {
                     macros.push(macro_info);
                 }
             }
         }
 
         Ok((macros, dispatch_sites, registrations))
+    }
+
+    /// Whether an object-like macro body is, or leads to, a compiler attribute.
+    ///
+    /// Kept wide on purpose. `__packed` states it outright, while
+    /// `____cacheline_aligned_in_smp` expands to `____cacheline_aligned`,
+    /// which states it, so an alias has to be kept to be followed later. The
+    /// alias is one identifier; a body of anything else is not on the way to
+    /// an attribute and is left out, which is what keeps this from meaning
+    /// "every #define in the tree" — there are six million of those.
+    fn expands_to_an_attribute(body: &str) -> bool {
+        let body = body.trim();
+
+        let is_identifier = || {
+            let mut chars = body.chars();
+            chars
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        };
+
+        body.contains("__attribute__") || is_identifier()
     }
 
     fn parse_parameters_from_node(
@@ -5113,5 +5139,36 @@ mod tests {
             .collect();
 
         assert_eq!(actual, expected);
+    }
+}
+
+#[cfg(test)]
+mod attribute_macros {
+    use super::TreeSitterAnalyzer;
+
+    #[test]
+    fn a_macro_stating_an_attribute_is_kept() {
+        assert!(TreeSitterAnalyzer::expands_to_an_attribute(
+            "__attribute__((packed))"
+        ));
+    }
+
+    #[test]
+    fn an_alias_is_kept_so_it_can_be_followed() {
+        // ____cacheline_aligned_in_smp expands to ____cacheline_aligned, which
+        // is where the attribute is stated. Dropping the alias loses the
+        // chain.
+        assert!(TreeSitterAnalyzer::expands_to_an_attribute(
+            "____cacheline_aligned"
+        ));
+    }
+
+    #[test]
+    fn a_value_is_not_an_attribute() {
+        // Six million #defines in a kernel; keeping the ones that cannot lead
+        // to an attribute is what makes this affordable.
+        assert!(!TreeSitterAnalyzer::expands_to_an_attribute("(1 << 4)"));
+        assert!(!TreeSitterAnalyzer::expands_to_an_attribute("0x40"));
+        assert!(!TreeSitterAnalyzer::expands_to_an_attribute(""));
     }
 }

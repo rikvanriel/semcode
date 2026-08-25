@@ -25,7 +25,8 @@ use crate::database::vectors::VectorStore;
 use crate::types::{FunctionInfo, TypeInfo, TypedefInfo};
 use crate::vectorizer::CodeVectorizer;
 use crate::workdir::WorkdirIndex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 // Optimal batch size for LanceDB operations
 pub const OPTIMAL_BATCH_SIZE: usize = 65536;
@@ -53,6 +54,8 @@ pub struct DatabaseManager {
     /// The last manifest generated, kept because a single query asks for the
     /// same revision several times. Building one walks the whole tree.
     manifest_cache: std::sync::RwLock<Option<(String, GitManifest)>>,
+    /// Identifiers that are compiler attributes, read once per process.
+    attribute_names: std::sync::OnceLock<Arc<HashSet<String>>>,
 }
 
 impl DatabaseManager {
@@ -86,6 +89,7 @@ impl DatabaseManager {
             branch_store: IndexedBranchStore::new(connection.clone()),
             workdir_index: std::sync::RwLock::new(None),
             manifest_cache: std::sync::RwLock::new(None),
+            attribute_names: std::sync::OnceLock::new(),
         })
     }
 
@@ -1842,6 +1846,70 @@ impl DatabaseManager {
     /// # Behavior
     /// Returns the first matching type found without considering git history.
     /// The returned type may not match the version in your working directory.
+    /// Names that are compiler attributes rather than members.
+    ///
+    /// `struct { ... } __packed;` and `struct { ... } lru_gen;` parse the
+    /// same, so the extractor records both as named members. The first names
+    /// nothing: C flattens an anonymous member into the type that holds it,
+    /// and `mm->mm_mt` is the field, not `mm->__randomize_layout.mm_mt`.
+    ///
+    /// Deciding needs what the identifier expands to, which is written in
+    /// another file, so it is asked here where the whole index is readable.
+    /// An alias is followed: `____cacheline_aligned_in_smp` expands to
+    /// `____cacheline_aligned`, which expands to an attribute.
+    async fn attribute_names(&self) -> Result<Arc<HashSet<String>>> {
+        if let Some(known) = self.attribute_names.get() {
+            return Ok(known.clone());
+        }
+
+        let macros = self.function_store.object_like_macros().await?;
+        let bodies: HashMap<&str, &str> = macros
+            .iter()
+            .map(|(name, body)| (name.as_str(), body.as_str()))
+            .collect();
+
+        let mut attributes = HashSet::new();
+        for (name, body) in &bodies {
+            let mut current = *body;
+            // Alias chains are short; the bound stops a cycle.
+            for _ in 0..8 {
+                if current.contains("__attribute__") {
+                    attributes.insert((*name).to_string());
+                    break;
+                }
+                match bodies.get(current.trim()) {
+                    Some(next) => current = next,
+                    None => break,
+                }
+            }
+        }
+
+        let attributes = Arc::new(attributes);
+        let _ = self.attribute_names.set(attributes.clone());
+        Ok(attributes)
+    }
+
+    /// Drop from a field path what is an attribute rather than a member.
+    fn flatten_anonymous_members(types: &mut Vec<TypeInfo>, attributes: &HashSet<String>) {
+        for ty in types {
+            ty.members.retain_mut(|field| {
+                let kept: Vec<&str> = field
+                    .name
+                    .split('.')
+                    .filter(|part| !attributes.contains(*part))
+                    .collect();
+
+                // Nothing left means the member was the anonymous aggregate
+                // itself, which C gives no name and nothing can refer to.
+                if kept.is_empty() {
+                    return false;
+                }
+                field.name = kept.join(".");
+                true
+            });
+        }
+    }
+
     pub async fn find_type(&self, name: &str) -> Result<Option<TypeInfo>> {
         self.type_store.find_by_name(name).await
     }
@@ -1924,6 +1992,8 @@ impl DatabaseManager {
                 .cmp(&b.file_path)
                 .then(a.line_start.cmp(&b.line_start))
         });
+        let attributes = self.attribute_names().await?;
+        Self::flatten_anonymous_members(&mut merged, &attributes);
         Ok(merged)
     }
 
@@ -7058,5 +7128,68 @@ mod tests {
             .unwrap();
         assert_eq!(function_counts["target"], 2);
         assert_eq!(type_counts["duplicate"], 3);
+    }
+}
+
+#[cfg(test)]
+mod anonymous_members {
+    use super::DatabaseManager;
+    use crate::types::{FieldInfo, TypeInfo};
+    use std::collections::HashSet;
+
+    fn field(name: &str) -> FieldInfo {
+        FieldInfo {
+            name: name.to_string(),
+            type_name: "int".to_string(),
+            offset: None,
+        }
+    }
+
+    fn ty(members: Vec<FieldInfo>) -> TypeInfo {
+        TypeInfo {
+            name: "mm_struct".to_string(),
+            file_path: "include/linux/mm_types.h".to_string(),
+            git_file_hash: "hash".to_string(),
+            line_start: 1,
+            kind: "struct".to_string(),
+            size: None,
+            members,
+            definition: String::new(),
+            types: None,
+        }
+    }
+
+    #[test]
+    fn an_attribute_leaves_the_path_of_a_flattened_member() {
+        // mm->mm_mt is the field. __randomize_layout is what the struct is
+        // marked with, and names nothing.
+        let attributes: HashSet<String> = ["__randomize_layout", "____cacheline_aligned_in_smp"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let mut types = vec![ty(vec![
+            field("__randomize_layout"),
+            field("__randomize_layout.mm_mt"),
+            field("__randomize_layout.____cacheline_aligned_in_smp.mm_count"),
+            field("__randomize_layout.lru_gen"),
+            field("cpu_bitmap"),
+        ])];
+
+        DatabaseManager::flatten_anonymous_members(&mut types, &attributes);
+
+        let names: Vec<&str> = types[0].members.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["mm_mt", "mm_count", "lru_gen", "cpu_bitmap"]);
+    }
+
+    #[test]
+    fn a_named_member_keeps_its_path() {
+        // `union { ... } u;` is a member, and u.flags says where flags lives.
+        let attributes: HashSet<String> = HashSet::new();
+        let mut types = vec![ty(vec![field("u"), field("u.flags")])];
+
+        DatabaseManager::flatten_anonymous_members(&mut types, &attributes);
+
+        let names: Vec<&str> = types[0].members.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["u", "u.flags"]);
     }
 }
