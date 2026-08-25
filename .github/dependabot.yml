@@ -1,0 +1,11 @@
+# Action versions go stale quickly and a stale one is found by a deprecation
+# warning on a run that already cost twenty minutes. Let the bot say so
+# instead.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci: "
