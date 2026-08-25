@@ -1,0 +1,77 @@
+# The checks the git hooks run, run again where they cannot be skipped.
+#
+# hooks/pre-commit and hooks/pre-push only protect a clone that has been told
+# to use them (`git config core.hooksPath hooks`), and neither runs for a pull
+# request opened from a fork or by a bot.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A newer push to the same branch makes an older run pointless; main is left
+# alone so every merged commit keeps a result of its own.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # A backtrace is the difference between a useful failed run and a rerun.
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: fmt, clippy, tests
+    runs-on: ubuntu-latest
+    # A cold build of the arrow and lance dependencies is long; this is a
+    # ceiling on a stuck run, not a target.
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # lancedb builds protobuf definitions through prost-build, which calls
+      # protoc and does not vendor it. The runner image has no protoc.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install the toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+          rustc --version && cargo --version
+
+      # Keyed on the lock file: a dependency change rebuilds, a source change
+      # does not. The restore-key still gives a partial cache when the lock
+      # file moves, which is most of the saving.
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # First, because it needs no build and a formatting failure should not
+      # cost twenty minutes to report.
+      - name: cargo fmt
+        run: cargo fmt --check
+
+      # Stands in for `cargo check --all-targets` from pre-commit, which it
+      # subsumes: clippy fails on the compile errors check would report, and
+      # on the lints pre-push asks for.
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Includes the doctests, which are compiled and run, and which have
+      # broken on their own before now.
+      - name: cargo test
+        run: cargo test
