@@ -31,14 +31,26 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      # lancedb builds protobuf definitions through prost-build, which calls
-      # protoc and does not vendor it. The runner image has no protoc.
+      # protoc, and the .proto files it reads: lance-encoding imports
+      # google/protobuf/empty.proto, one of protobuf's well-known types, which
+      # ships in libprotobuf-dev and not alongside the compiler. Installing
+      # protobuf-compiler alone gets a protoc that runs and then fails with
+      # "google/protobuf/empty.proto: File not found".
+      # openssl and curl: gix reaches the network through curl built against
+      # openssl, and both -sys crates want headers and pkg-config to find them.
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler libprotobuf-dev \
+            pkg-config libssl-dev libcurl4-openssl-dev
+
+      - name: Show what the build will use
+        run: |
+          protoc --version
+          ls /usr/include/google/protobuf/empty.proto
 
       - name: Install the toolchain
         run: |
@@ -50,7 +62,7 @@ jobs:
       # does not. The restore-key still gives a partial cache when the lock
       # file moves, which is most of the saving.
       - name: Cache cargo registry and build output
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
