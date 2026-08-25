@@ -4670,6 +4670,33 @@ mod tests {
     }
 
     #[test]
+    fn a_positional_group_records_the_outer_type() {
+        // A known limitation, pinned rather than fixed.
+        //
+        // `{ { .run = impl } }` initialises outer's first member, whose type
+        // is inner, so filing run under outer is wrong here. It is right when
+        // the member is an anonymous struct or union, which C flattens into
+        // the outer type, and the two are indistinguishable from one file: the
+        // member list lives with the type, elsewhere.
+        //
+        // Refusing every positional group costs far more than it saves. Over a
+        // Linux tree it dropped ~95,000 registrations to remove 4,004 whose
+        // container does not declare the member, because the great majority
+        // are the anonymous case and correct. Deciding it needs the type,
+        // which is why the fix belongs where types are known.
+        let found = registration_rows(
+            "struct inner { int (*run)(void); };\n\
+             struct outer { struct inner in; };\n\
+             int impl(void);\n\
+             static struct outer o = { { .run = impl } };\n",
+            "test.c",
+        );
+
+        let run = found.iter().find(|r| r.member == "run").unwrap();
+        assert_eq!(run.container_type, "outer");
+    }
+
+    #[test]
     fn an_array_slot_keeps_the_element_type() {
         // Every slot of an array holds the array's element type, so passing
         // through `[0]` changes nothing about which struct owns the member.

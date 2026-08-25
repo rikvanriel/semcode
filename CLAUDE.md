@@ -109,8 +109,15 @@ Semcode uses the following search order to locate the `.semcode.db` database dir
 3. **Workspace/Current directory**: Use `./.semcode.db` in the workspace or current working directory
 
 The `-d` flag can specify either:
-- A direct path to the database directory (e.g., `./my-custom.db`)
-- A parent directory containing `.semcode.db` (e.g., `-d /path/to/project` will use `/path/to/project/.semcode.db`)
+- A direct path to the database directory: a name ending in `.db` (e.g.
+  `./my-custom.db`), or an existing directory that is already a database
+- A parent directory to hold one (e.g., `-d /path/to/project` uses
+  `/path/to/project/.semcode.db`), whether or not it exists yet
+
+The same argument names the same database whichever command runs first.
+Resolving on whether a directory happens to exist splits it in two: the
+indexer writes to a path nothing occupies, and every later query looks inside
+the directory that has just been created.
 
 ### Running the Tools
 
