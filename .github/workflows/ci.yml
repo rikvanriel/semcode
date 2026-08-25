@@ -19,8 +19,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # A backtrace is the difference between a useful failed run and a rerun.
   RUST_BACKTRACE: 1
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
 
 jobs:
   check:
@@ -53,24 +54,17 @@ jobs:
           ls /usr/include/google/protobuf/empty.proto
 
       - name: Install the toolchain
-        run: |
-          rustup toolchain install stable --profile minimal --component rustfmt,clippy
-          rustup default stable
-          rustc --version && cargo --version
-
-      # Keyed on the lock file: a dependency change rebuilds, a source change
-      # does not. The restore-key still gives a partial cache when the lock
-      # file moves, which is most of the saving.
-      - name: Cache cargo registry and build output
-        uses: actions/cache@v6
+        uses: dtolnay/rust-toolchain@stable
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          components: rustfmt, clippy
+
+      - name: Rust cache (registry + incremental build)
+        uses: Swatinem/rust-cache@v2
+        # Like sashiko: saves registry + target incrementally; keyed on
+        # Cargo.lock internally, but shares save/restore keys across OS.
+
+      - name: sccache (compiler cache across Cargo.lock bumps)
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       # First, because it needs no build and a formatting failure should not
       # cost twenty minutes to report.
@@ -87,3 +81,7 @@ jobs:
       # broken on their own before now.
       - name: cargo test
         run: cargo test
+
+      - name: sccache stats
+        run: sccache --show-stats
+        if: always()
