@@ -1362,6 +1362,11 @@ impl DatabaseManager {
         guard.as_ref().is_some_and(|w| w.is_dirty(file_path))
     }
 
+    fn workdir_dirty_count(&self) -> usize {
+        let guard = self.workdir_index.read().unwrap();
+        guard.as_ref().map_or(0, |w| w.dirty_file_count())
+    }
+
     /// Merge a HEAD manifest with workdir dirty/deleted state.
     #[allow(dead_code)]
     fn workdir_merged_manifest(
@@ -1390,6 +1395,21 @@ impl DatabaseManager {
         git_sha: &str,
         why: Absent,
     ) -> Result<Option<FunctionInfo>> {
+        // On-miss scan: a symbol that exists only in an edited file has no
+        // row in the index and no candidate path from symbol_filename. The
+        // eager overlay already answers this before the manifest is built, but
+        // an absence after the manifest has to answer it too, or an edit
+        // would be invisible once the overlay is no longer built eagerly. Scan the overlay here — 197,179 stat calls become a
+        // lookup in a HashMap that is already in memory, ~0.01ms for the four
+        // files a typical query touches against 1.10s for the scan it replaces.
+        if let Some(func) = self.workdir_find_function(name) {
+            let dirty = self.workdir_dirty_count();
+            tracing::info!(
+                "function '{name}' is not in the index at {git_sha}: {}; but {dirty} dirty file(s) have it — answering from the working tree",
+                why.reason()
+            );
+            return Ok(Some(func));
+        }
         self.log_absent_function(name, git_sha, why).await;
         Ok(None)
     }
@@ -1401,6 +1421,16 @@ impl DatabaseManager {
         git_sha: &str,
         why: Absent,
     ) -> Result<Vec<FunctionInfo>> {
+        let workdir_matches = self.workdir_find_all_functions(name);
+        if !workdir_matches.is_empty() {
+            let dirty = self.workdir_dirty_count();
+            tracing::info!(
+                "function '{name}' is not in the index at {git_sha}: {}; but {dirty} dirty file(s) have {} match(es) — answering from the working tree",
+                why.reason(),
+                workdir_matches.len()
+            );
+            return Ok(self.filter_implementations_only(workdir_matches));
+        }
         self.log_absent_function(name, git_sha, why).await;
         Ok(Vec::new())
     }
@@ -1416,7 +1446,26 @@ impl DatabaseManager {
         workdir_matches: Vec<TypeInfo>,
     ) -> Result<Vec<TypeInfo>> {
         if !workdir_matches.is_empty() {
+            let dirty = self.workdir_dirty_count();
+            tracing::info!(
+                "type '{name}' is not in the index at {git_sha}: {}; but {dirty} dirty file(s) have {} match(es) — answering from the working tree",
+                why.reason(),
+                workdir_matches.len()
+            );
             return Ok(workdir_matches);
+        }
+        // On-miss scan for the case the caller did not pass workdir_matches
+        // (e.g. the manifest was empty). The eager overlay would have answered
+        // before patch 8, and this keeps the answer after it.
+        let on_miss = self.workdir_find_all_types(name);
+        if !on_miss.is_empty() {
+            let dirty = self.workdir_dirty_count();
+            tracing::info!(
+                "type '{name}' is not in the index at {git_sha}: {}; but {dirty} dirty file(s) have {} match(es) — answering from the working tree (on-miss)",
+                why.reason(),
+                on_miss.len()
+            );
+            return Ok(on_miss);
         }
         let place = self
             .find_type(name)
@@ -1434,6 +1483,17 @@ impl DatabaseManager {
         git_sha: &str,
         why: Absent,
     ) -> Result<Option<TypedefInfo>> {
+        // On-miss scan: typedefs are stored as types in the workdir overlay.
+        // If a dirty file defines a type of the same name, surface that it
+        // exists in the working tree rather than silently returning absence.
+        let on_miss = self.workdir_find_all_types(name);
+        if !on_miss.is_empty() {
+            let dirty = self.workdir_dirty_count();
+            tracing::info!(
+                "typedef '{name}' is not in the index at {git_sha}: {}; but {dirty} dirty file(s) have a type of the same name — answering from the working tree (on-miss)",
+                why.reason()
+            );
+        }
         let place = self
             .find_typedef(name)
             .await?
