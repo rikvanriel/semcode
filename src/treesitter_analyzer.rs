@@ -382,6 +382,16 @@ impl TreeSitterAnalyzer {
                 type: (_) @underlying_type
                 declarator: (type_identifier) @typedef_name
             ) @typedef
+
+            (type_definition
+                type: (_) @underlying_type
+                declarator: (function_declarator
+                    declarator: (parenthesized_declarator
+                        (pointer_declarator declarator: (type_identifier) @typedef_name)
+                    )
+                    parameters: (parameter_list) @pointer_params
+                )
+            ) @typedef
         "#,
         )?;
 
@@ -2385,6 +2395,7 @@ impl TreeSitterAnalyzer {
             let mut line_start = 0;
             let mut typedef_start_byte = 0;
             let mut typedef_end_byte = 0;
+            let mut pointer_params: Option<String> = None;
 
             for capture in m.captures {
                 let node = capture.node;
@@ -2398,6 +2409,12 @@ impl TreeSitterAnalyzer {
                     }
                     "underlying_type" => {
                         underlying_type = Some(text.to_string());
+                    }
+                    // `typedef void (*bfa_isr_func_t)(struct bfa_s *)` aliases
+                    // a function pointer, and the return type alone would read
+                    // as an alias for `void`. Spell what it points at.
+                    "pointer_params" => {
+                        pointer_params = Some(collapse_whitespace(text));
                     }
                     "typedef" => {
                         typedef_start_byte = node.start_byte();
@@ -2413,6 +2430,15 @@ impl TreeSitterAnalyzer {
             if let Some(name) = typedef_name {
                 // Get the complete typedef definition
                 let definition = &source[typedef_start_byte..typedef_end_byte];
+
+                // What a function-pointer typedef aliases is a pointer to a
+                // function, not the return type the grammar puts in `type`.
+                let underlying_type = match pointer_params {
+                    Some(params) => underlying_type
+                        .map(|returns| format!("{returns} (*){params}"))
+                        .or(Some(format!("(*){params}"))),
+                    None => underlying_type,
+                };
 
                 // Create TypeInfo with kind="typedef"
                 // Store underlying type info in the definition field
@@ -4972,6 +4998,43 @@ mod tests {
 
         let run = found.iter().find(|r| r.member == "run").unwrap();
         assert_eq!(run.container_type, "outer");
+    }
+
+    #[test]
+    fn a_typedef_for_a_function_pointer_is_recorded() {
+        // `typedef void (*bfa_isr_func_t)(struct bfa_s *)` puts the name
+        // inside a function declarator, so a query wanting a bare
+        // type_identifier matches nothing and the typedef is not recorded at
+        // all. Every table declared through one is then unrecognisable.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "typedef void (*bfa_isr_func_t)(struct bfa_s *bfa);\n\
+                 typedef unsigned long sector_t;\n",
+                Path::new("bfa.h"),
+                "testhash",
+                None,
+            )
+            .unwrap();
+
+        let typedefs: Vec<&TypeInfo> = analysis
+            .types
+            .iter()
+            .filter(|t| t.kind == "typedef")
+            .collect();
+        let names: Vec<&str> = typedefs.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"bfa_isr_func_t"), "{names:?}");
+        assert!(names.contains(&"sector_t"), "{names:?}");
+
+        let pointer = typedefs
+            .iter()
+            .find(|t| t.name == "bfa_isr_func_t")
+            .unwrap();
+        assert!(
+            pointer.definition.contains("(*)"),
+            "a reader cannot tell it is a function pointer: {:?}",
+            pointer.definition
+        );
     }
 
     #[test]
