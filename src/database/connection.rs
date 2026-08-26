@@ -29,7 +29,7 @@ use crate::workdir::WorkdirIndex;
 use crate::worktree::{WorkingCopy, WorkingCopyHashes};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 // Optimal batch size for LanceDB operations
@@ -171,6 +171,19 @@ pub struct DatabaseManager {
     /// per-candidate stat entirely and trust every row, the way `--git-only`
     /// always has.
     git_only: AtomicBool,
+    /// Bumped by a long-lived caller (the REPL) once per top-level command,
+    /// so `ensure_workdir_index_built` can tell "asked again within the
+    /// command that just built this" (several `_git_aware` calls in one
+    /// `func` — cheap, must stay a no-op) from "asked again in a later
+    /// command" (a REPL user had a chance to edit a file in between — must
+    /// refresh). A caller that never calls `note_repl_command` (MCP, LSP,
+    /// `-q`) leaves this at 0 forever, which builds the overlay once and
+    /// reuses it — right for a caller with no prompt to edit a file at.
+    workdir_command_generation: AtomicU64,
+    /// The command generation the current `workdir_index` was last built or
+    /// refreshed for. `u64::MAX` means "never built", so the first build on
+    /// generation 0 is not mistaken for already-current.
+    workdir_index_generation: AtomicU64,
 }
 
 impl DatabaseManager {
@@ -207,7 +220,23 @@ impl DatabaseManager {
             attribute_names: std::sync::OnceLock::new(),
             working_copy: WorkingCopyHashes::new(),
             git_only: AtomicBool::new(false),
+            workdir_command_generation: AtomicU64::new(0),
+            workdir_index_generation: AtomicU64::new(u64::MAX),
         })
+    }
+
+    /// Mark the start of a new top-level command, so the next lookup that
+    /// needs the working-copy overlay treats it as due for a freshness
+    /// check instead of reusing whatever the previous command already built
+    /// or refreshed — an edit made between two REPL commands becomes visible
+    /// to the first overlay-consuming call in the next one. Call once per
+    /// command read from the prompt, before dispatching it; calling it more
+    /// than once for the same command only costs one extra refresh, calling
+    /// it not at all builds the overlay once and reuses it (see
+    /// `workdir_command_generation`'s doc comment).
+    pub fn note_repl_command(&self) {
+        self.workdir_command_generation
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Say the caller will not be editing: candidate files are trusted
@@ -1348,25 +1377,61 @@ impl DatabaseManager {
     // on-miss fallback (a symbol with no row at all). `ensure_workdir_index_built`
     // is what makes that walk lazy: the first of these helpers actually
     // consulted in a process builds it, once, instead of every command
-    // building it whether asked for or not.
+    // building it whether asked for or not — and keeps it current across
+    // the top-level commands of one REPL session rather than
+    // freezing it at whatever the working tree held on that first build.
 
     /// Build the working-copy overlay for `git_sha` if nothing has this
-    /// process, unless it is unusable for it (see `workdir_overlay_usable`).
-    /// One walk of the tracked files, done at most once — on the first
-    /// regex, grep, caller/callee, or on-miss lookup that needs it, not
-    /// before every query.
+    /// process yet, unless it is unusable for it (see
+    /// `workdir_overlay_usable`); refresh it, at most once per top-level
+    /// command (see `workdir_command_generation`'s doc comment), if it
+    /// already exists.
+    ///
+    /// A naive "refresh whenever asked" is wrong here: a single `func`
+    /// command calls both `get_function_callees_git_aware` and
+    /// `get_function_callers_git_aware`, each of which reaches this through
+    /// its own `workdir_find_*` helper, so an unconditional refresh would
+    /// walk the tracked-file set twice for one command instead of once —
+    /// measured while building this patch: 266,533 statx for `help; func
+    /// alloc_super; help` against ~131,489 for a single build, because the
+    /// second call inside the same `func` command refreshed instead of
+    /// reusing. Gating on the command generation fixes that: every call
+    /// within one command sees the same generation and reuses; the first
+    /// call in the *next* command sees a new one and refreshes through
+    /// `build_incremental`'s own cache (HEAD SHA plus per-file mtime/size,
+    /// the mechanism `test_incremental_reuses_cache` in workdir.rs covers
+    /// directly) — a stat of each tracked file, not a re-read or a re-parse
+    /// of the ones that have not changed. A command that never touches this
+    /// path (`help` on its own) still never pays either cost.
     fn ensure_workdir_index_built(&self, git_sha: &str) {
         if !self.workdir_overlay_usable(git_sha) {
             return;
         }
-        if self.workdir_index.read().unwrap().is_some() {
+        let current_generation = self.workdir_command_generation.load(Ordering::Relaxed);
+        let built_for_generation = self
+            .workdir_index_generation
+            .swap(current_generation, Ordering::Relaxed);
+        if built_for_generation == current_generation && self.has_workdir_index() {
             return;
         }
         let repo_path = Path::new(&self.git_repo_path);
-        match WorkdirIndex::build(repo_path) {
+        let (built, refreshing) = {
+            let guard = self.workdir_index.read().unwrap();
+            let refreshing = guard.is_some();
+            (
+                WorkdirIndex::build_incremental(repo_path, guard.as_ref()),
+                refreshing,
+            )
+        };
+        match built {
             Ok(workdir) => {
                 tracing::info!(
-                    "workdir: built overlay on demand: {} dirty, {} deleted, {} functions, {} types",
+                    "workdir: {} overlay: {} dirty, {} deleted, {} functions, {} types",
+                    if refreshing {
+                        "refreshed"
+                    } else {
+                        "built on demand"
+                    },
                     workdir.dirty_file_count(),
                     workdir.deleted_file_count(),
                     workdir.function_count(),
@@ -1374,7 +1439,14 @@ impl DatabaseManager {
                 );
                 self.set_workdir_index(workdir);
             }
-            Err(e) => tracing::info!("workdir: could not build overlay on demand: {e}"),
+            Err(e) => tracing::info!(
+                "workdir: could not {} overlay: {e}",
+                if refreshing {
+                    "refresh"
+                } else {
+                    "build on demand"
+                }
+            ),
         }
     }
 
@@ -7666,6 +7738,95 @@ mod tests {
             .unwrap();
         assert_eq!(function_counts["target"], 2);
         assert_eq!(type_counts["duplicate"], 3);
+    }
+
+    #[tokio::test]
+    async fn a_later_repl_command_sees_an_edit_the_current_one_did_not() {
+        // The on-miss overlay is built once, lazily, and reused within one
+        // call, so `func alloc_super; help` walks the tree once rather than
+        // twice. What that alone does not do is notice a file
+        // changed *after* that first build: `ensure_workdir_index_built`
+        // used to return immediately whenever an overlay already existed,
+        // for the rest of the process. This test pins both halves of a
+        // trade-off that pulls in opposite directions: refreshing on every
+        // call re-walks the tree
+        // twice for one `func` command (it calls both
+        // `get_function_callees_git_aware` and
+        // `get_function_callers_git_aware`); never refreshing leaves an
+        // edit invisible for the rest of the session. `note_repl_command`
+        // is the line between the two: calls before it share one overlay,
+        // calls after it get a freshness check.
+        //
+        // (workdir.rs's own `test_incremental_reuses_cache` already covers
+        // `build_incremental`'s cache primitive directly; this test is
+        // about `ensure_workdir_index_built` deciding *when* to call it.)
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo_path = repo_dir.path();
+        git(repo_path, &["init", "-q"]);
+        std::fs::write(repo_path.join("a.c"), "/* placeholder */\n").unwrap();
+        git(repo_path, &["add", "a.c"]);
+        git(repo_path, &["commit", "-q", "-m", "initial"]);
+
+        let git_sha = crate::git::get_git_sha(repo_path).unwrap().unwrap();
+
+        let db_path = repo_path.join(".semcode.db");
+        let db = DatabaseManager::new(
+            db_path.to_str().unwrap(),
+            repo_path.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        db.create_tables().await.unwrap();
+
+        // No row anywhere names this function — symbol_filename is empty —
+        // so only the on-miss path (the workdir overlay) can ever answer
+        // it. The first call builds the overlay from a clean tree and finds
+        // nothing.
+        let before = db
+            .find_all_functions_git_aware("brand_new_func", &git_sha)
+            .await
+            .unwrap();
+        assert!(before.is_empty(), "found before it was written: {before:?}");
+        assert!(db.has_workdir_index(), "overlay was not built on first use");
+
+        // Edit the file after the overlay already exists in this process —
+        // what happens between two commands in one REPL session.
+        // (Body has to clear `filter_implementations_only`'s 50-byte
+        // "substantial body" floor, or a real function reads as a bare
+        // declaration and this test would fail for a reason that has
+        // nothing to do with the overlay.)
+        std::fs::write(
+            repo_path.join("a.c"),
+            "int brand_new_func(void)\n{\n    int result = 42;\n    return result;\n}\n",
+        )
+        .unwrap();
+
+        // Still the same command as the first call (nothing told the
+        // database a new one started): the edit must not appear yet, or a
+        // `func` command that checks callees and then callers would walk
+        // the tracked-file set twice instead of once.
+        let still_this_command = db
+            .find_all_functions_git_aware("brand_new_func", &git_sha)
+            .await
+            .unwrap();
+        assert!(
+            still_this_command.is_empty(),
+            "a second lookup in the same command re-walked the tree instead of reusing: {still_this_command:?}"
+        );
+
+        // A new command starts — the REPL calls this once per line read from
+        // the prompt, before dispatching it.
+        db.note_repl_command();
+
+        let next_command = db
+            .find_all_functions_git_aware("brand_new_func", &git_sha)
+            .await
+            .unwrap();
+        assert_eq!(
+            next_command.len(),
+            1,
+            "edit made before the next command is still invisible: {next_command:?}"
+        );
     }
 }
 

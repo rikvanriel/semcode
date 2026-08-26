@@ -592,6 +592,14 @@ async fn main() -> Result<()> {
                 // Convert to Vec<&str> for handle_command
                 let parts: Vec<&str> = parts_owned.iter().map(|s| s.as_str()).collect();
 
+                // A new top-level command: let the working-copy overlay (if
+                // one already exists) know it may be due for a freshness
+                // check, so an edit made since the last command becomes
+                // visible to whichever query in this one first needs it,
+                // without re-checking on every workdir-consuming call this
+                // single command makes internally.
+                db_manager.note_repl_command();
+
                 // Handle command and check if we should exit
                 if handle_command(
                     &parts,
