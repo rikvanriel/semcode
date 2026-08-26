@@ -4,7 +4,9 @@
 // dispatch through. Neither side knows the answer alone: a site names a
 // member, a registration names a target, and the join is what turns them
 // into "this call can reach that function".
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::RwLock;
 
 use crate::types::{DispatchSite, Registration};
 
@@ -292,37 +294,215 @@ pub fn group_by_member(sites: Vec<DispatchSite>) -> HashMap<String, Vec<Dispatch
 /// written without one, and means how the paths are obtained — a whole-tree
 /// walk, a lookup per path, or the index itself — is a property of this value
 /// rather than of every caller.
-#[derive(Debug, Default, Clone)]
+const LAZY_THRESHOLD: usize = 64;
+
+#[derive(Debug, Clone, Default)]
+struct Inner {
+    cache: HashMap<String, Option<String>>,
+    fallback: Option<HashMap<String, String>>,
+    lookups: usize,
+}
+
+#[derive(Debug)]
 pub struct RevisionPaths {
-    paths: HashMap<String, String>,
+    repo_path: PathBuf,
+    git_sha: String,
+    dirty: HashMap<String, String>,
+    deleted: HashSet<String>,
+    inner: RwLock<Inner>,
+    threshold: usize,
+    valid: bool,
+}
+
+impl Default for RevisionPaths {
+    fn default() -> Self {
+        Self {
+            repo_path: PathBuf::new(),
+            git_sha: String::new(),
+            dirty: HashMap::new(),
+            deleted: HashSet::new(),
+            inner: RwLock::new(Inner::default()),
+            threshold: LAZY_THRESHOLD,
+            valid: true,
+        }
+    }
+}
+
+impl Clone for RevisionPaths {
+    fn clone(&self) -> Self {
+        let inner = self.inner.read().unwrap().clone();
+        Self {
+            repo_path: self.repo_path.clone(),
+            git_sha: self.git_sha.clone(),
+            dirty: self.dirty.clone(),
+            deleted: self.deleted.clone(),
+            inner: RwLock::new(inner),
+            threshold: self.threshold,
+            valid: self.valid,
+        }
+    }
 }
 
 impl RevisionPaths {
     /// Paths already resolved, with the working tree's answer preferred.
     pub fn from_map(paths: HashMap<String, String>) -> Self {
-        Self { paths }
+        let valid = true;
+        Self {
+            repo_path: PathBuf::new(),
+            git_sha: String::new(),
+            dirty: HashMap::new(),
+            deleted: HashSet::new(),
+            inner: RwLock::new(Inner {
+                cache: HashMap::new(),
+                fallback: Some(paths),
+                lookups: 0,
+            }),
+            threshold: LAZY_THRESHOLD,
+            valid,
+        }
+    }
+
+    /// Lazily-resolved revision paths: dirty/deleted overlay plus per-path git
+    /// lookups with a fallback to a whole-tree walk past a threshold.
+    pub fn new_lazy(
+        repo_path: PathBuf,
+        git_sha: String,
+        dirty: HashMap<String, String>,
+        deleted: HashSet<String>,
+        valid: bool,
+    ) -> Self {
+        Self {
+            repo_path,
+            git_sha,
+            dirty,
+            deleted,
+            inner: RwLock::new(Inner::default()),
+            threshold: LAZY_THRESHOLD,
+            valid,
+        }
     }
 
     /// The content this path holds, or None when the revision does not have
     /// it. None is an answer: the row that named this path is not in this
     /// tree.
-    pub fn hash_of(&self, path: &str) -> Option<&str> {
-        self.paths.get(path).map(String::as_str)
+    pub fn hash_of(&self, path: &str) -> Option<String> {
+        if self.deleted.contains(path) {
+            return None;
+        }
+        if let Some(h) = self.dirty.get(path) {
+            return Some(h.clone());
+        }
+        if !self.valid {
+            return None;
+        }
+        // Fast path under read lock: fallback or cached.
+        {
+            let inner = self.inner.read().unwrap();
+            if let Some(fb) = &inner.fallback {
+                return fb.get(path).cloned();
+            }
+            if let Some(cached) = inner.cache.get(path) {
+                return cached.clone();
+            }
+            if inner.lookups < self.threshold {
+                // need per-path resolve; drop lock before IO
+            } else {
+                // need fallback walk; drop lock before IO
+            }
+        }
+        // Decide whether to fallback based on lookup count.
+        let needs_fallback = {
+            let inner = self.inner.read().unwrap();
+            inner.fallback.is_none() && inner.lookups >= self.threshold
+        };
+        if needs_fallback {
+            // Build fallback manifest once.
+            let mut manifest = HashMap::new();
+            let walk_ok = crate::git::walk_tree_at_commit(
+                &self.repo_path,
+                &self.git_sha,
+                |relative_path, object_id| {
+                    let normalized_path = relative_path.replace("//", "/");
+                    manifest.insert(normalized_path, object_id.to_string());
+                    Ok(())
+                },
+            )
+            .is_ok();
+            let mut inner = self.inner.write().unwrap();
+            // Another thread may have populated fallback while we walked.
+            if inner.fallback.is_none() {
+                if walk_ok {
+                    inner.fallback = Some(manifest);
+                } else {
+                    // Walk failed: treat as empty fallback rather than caching per-path misses forever.
+                    inner.fallback = Some(HashMap::new());
+                }
+            }
+            if let Some(fb) = &inner.fallback {
+                return fb.get(path).cloned();
+            }
+            return None;
+        }
+        // Per-path resolve.
+        let resolved = crate::git::resolve_files_at_commit(
+            &self.repo_path,
+            &self.git_sha,
+            &[path.to_string()],
+        )
+        .ok()
+        .and_then(|m| m.get(path).cloned());
+        let mut inner = self.inner.write().unwrap();
+        // If fallback was populated concurrently, prefer it.
+        if let Some(fb) = &inner.fallback {
+            return fb.get(path).cloned();
+        }
+        // Deduplicate: if another thread already cached this path, use it.
+        if let Some(cached) = inner.cache.get(path) {
+            return cached.clone();
+        }
+        inner.lookups += 1;
+        inner.cache.insert(path.to_string(), resolved.clone());
+        resolved
     }
 
     /// Whether nothing at all resolved, which says the revision could not be
     /// established rather than that the tree is empty.
     pub fn is_empty(&self) -> bool {
-        self.paths.is_empty()
+        if !self.valid {
+            return true;
+        }
+        let inner = self.inner.read().unwrap();
+        if let Some(fb) = &inner.fallback {
+            return fb.is_empty() && self.dirty.is_empty();
+        }
+        // Lazy without fallback: we have not proven the tree is empty; treat
+        // as non-empty so callers do not take the empty-revision fast path
+        // before any lookup has happened.
+        false
     }
 
     pub fn len(&self) -> usize {
-        self.paths.len()
+        let inner = self.inner.read().unwrap();
+        if let Some(fb) = &inner.fallback {
+            return fb.len();
+        }
+        inner.cache.len()
     }
 
     /// The paths as a map, for the callers that still hand one to git.
-    pub fn as_map(&self) -> &HashMap<String, String> {
-        &self.paths
+    /// Cloned because the lazy variant may need to materialise the fallback.
+    pub fn as_map(&self) -> HashMap<String, String> {
+        let inner = self.inner.read().unwrap();
+        if let Some(fb) = &inner.fallback {
+            return fb.clone();
+        }
+        // Materialise what we have cached (dirty is handled separately, so
+        // this is just the resolved subset).
+        inner
+            .cache
+            .iter()
+            .filter_map(|(k, v)| v.as_ref().map(|h| (k.clone(), h.clone())))
+            .collect()
     }
 }
 
@@ -333,7 +513,7 @@ where
     rows.into_iter()
         .filter(|row| {
             let (file, hash) = key(row);
-            paths.hash_of(file).map(|h| h == hash).unwrap_or(false)
+            paths.hash_of(file).as_deref() == Some(hash)
         })
         .collect()
 }

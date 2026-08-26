@@ -1274,6 +1274,7 @@ impl DatabaseManager {
     }
 
     /// Merge a HEAD manifest with workdir dirty/deleted state.
+    #[allow(dead_code)]
     fn workdir_merged_manifest(
         &self,
         head_manifest: std::collections::HashMap<String, String>,
@@ -1395,7 +1396,7 @@ impl DatabaseManager {
         let mut resolved_hashes = Vec::new();
         for file_path in &unique_file_paths {
             if let Some(hash) = git_manifest.hash_of(file_path) {
-                resolved_hashes.push((file_path.clone(), hash.to_string()));
+                resolved_hashes.push((file_path.clone(), hash));
             }
         }
 
@@ -2420,7 +2421,7 @@ impl DatabaseManager {
                     if self.workdir_is_dirty(path) || self.workdir_is_deleted(path) {
                         continue;
                     }
-                    if git_manifest.hash_of(path) != Some(hashes.value(row)) {
+                    if git_manifest.hash_of(path).as_deref() != Some(hashes.value(row)) {
                         continue;
                     }
                     let identity = format!(
@@ -2484,7 +2485,7 @@ impl DatabaseManager {
                         if self.workdir_is_dirty(path) || self.workdir_is_deleted(path) {
                             continue;
                         }
-                        if git_manifest.hash_of(path) != Some(hashes.value(row)) {
+                        if git_manifest.hash_of(path).as_deref() != Some(hashes.value(row)) {
                             continue;
                         }
                         if types.is_null(row) {
@@ -4261,23 +4262,26 @@ impl DatabaseManager {
         &self,
         git_sha: &str,
     ) -> Result<crate::database::resolution::RevisionPaths> {
-        let mut manifest = std::collections::HashMap::new();
-
-        // Use shared tree traversal utility
-        crate::git::walk_tree_at_commit(
-            &self.git_repo_path,
-            git_sha,
-            |relative_path, object_id| {
-                // Normalize path by removing any double slashes
-                let normalized_path = relative_path.replace("//", "/");
-                manifest.insert(normalized_path, object_id.to_string());
-                Ok(())
-            },
-        )?;
-
-        // Merge with workdir overlay (adds dirty files, removes deleted files)
-        Ok(crate::database::resolution::RevisionPaths::from_map(
-            self.workdir_merged_manifest(manifest),
+        let (dirty, deleted) = {
+            let guard = self.workdir_index.read().unwrap();
+            match guard.as_ref() {
+                Some(w) => (w.dirty_file_paths().clone(), w.deleted_file_paths().clone()),
+                None => (
+                    std::collections::HashMap::new(),
+                    std::collections::HashSet::new(),
+                ),
+            }
+        };
+        let valid = match gix::discover(&self.git_repo_path) {
+            Ok(repo) => crate::git::resolve_to_commit(&repo, git_sha).is_ok(),
+            Err(_) => false,
+        };
+        Ok(crate::database::resolution::RevisionPaths::new_lazy(
+            std::path::PathBuf::from(&self.git_repo_path),
+            git_sha.to_string(),
+            dirty,
+            deleted,
+            valid,
         ))
     }
 
