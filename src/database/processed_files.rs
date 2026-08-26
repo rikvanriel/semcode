@@ -457,6 +457,43 @@ impl ProcessedFileStore {
         Ok(pair_set)
     }
 
+    /// Revisions that contain a given file content (by its blob hash).
+    ///
+    /// Reads `processed_files` where `git_file_sha` matches, so a caller can
+    /// say where a row's content lives without walking git. Returns distinct
+    /// `git_sha` values, sorted for deterministic output.
+    pub async fn get_revisions_for_file_hash(&self, git_file_sha: &str) -> Result<Vec<String>> {
+        let table = self
+            .connection
+            .open_table("processed_files")
+            .execute()
+            .await?;
+        let escaped = git_file_sha.replace('\'', "''");
+        let filter = format!("git_file_sha = '{escaped}'");
+        let results = table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let mut revs = std::collections::HashSet::new();
+        for batch in &results {
+            let git_sha_array = batch
+                .column_by_name("git_sha")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| anyhow::anyhow!("Missing git_sha column"))?;
+            for i in 0..batch.num_rows() {
+                if !git_sha_array.is_null(i) {
+                    revs.insert(git_sha_array.value(i).to_string());
+                }
+            }
+        }
+        let mut out: Vec<String> = revs.into_iter().collect();
+        out.sort();
+        Ok(out)
+    }
+
     /// Extract a ProcessedFileRecord from a batch at the given row index
     fn extract_record_from_batch(
         &self,

@@ -3589,6 +3589,80 @@ impl DatabaseManager {
 
     // ==================== End Branch Management ====================
 
+    // ---- Revision reporting -----------------------------------------------
+
+    /// Revisions that contain a file blob, via `processed_files`.
+    ///
+    /// `git_file_hash` is the blob id stored on each row. Reading
+    /// `processed_files` costs ~0.08s for the whole table versus 0.36s for
+    /// `git ls-tree`; this helper reads only the rows for one hash.
+    pub async fn revisions_for_file_hash(&self, git_file_hash: &str) -> Result<Vec<String>> {
+        self.processed_file_store
+            .get_revisions_for_file_hash(git_file_hash)
+            .await
+    }
+
+    /// Branches that contain a file blob, via `revisions_for_file_hash`
+    /// plus the indexed branch tips. Sorted by branch name for stable output.
+    pub async fn branches_for_file_hash(
+        &self,
+        git_file_hash: &str,
+    ) -> Result<Vec<crate::database::branches::IndexedBranchInfo>> {
+        let revisions = self.revisions_for_file_hash(git_file_hash).await?;
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for rev in revisions {
+            for branch in self.branch_store.get_branches_at_commit(&rev).await? {
+                if seen.insert(branch.branch_name.clone()) {
+                    out.push(branch);
+                }
+            }
+        }
+        out.sort_by(|a, b| a.branch_name.cmp(&b.branch_name));
+        Ok(out)
+    }
+
+    /// Where a symbol of a given name was found: distinct revisions and
+    /// branches that hold at least one row for it. Reads `functions` for the
+    /// name, then `processed_files` for each distinct hash. No caller uses
+    /// this yet; it is the read side of "not at this revision, present on
+    /// ...".
+    pub async fn symbol_revisions(
+        &self,
+        name: &str,
+    ) -> Result<(
+        Vec<String>,
+        Vec<crate::database::branches::IndexedBranchInfo>,
+    )> {
+        let rows = self
+            .function_store
+            .find_all_by_name_unfiltered(name)
+            .await?;
+        let mut hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for row in &rows {
+            hashes.insert(row.git_file_hash.clone());
+        }
+        let mut rev_set = std::collections::HashSet::new();
+        for hash in hashes {
+            for rev in self.revisions_for_file_hash(&hash).await? {
+                rev_set.insert(rev);
+            }
+        }
+        let mut revisions: Vec<String> = rev_set.into_iter().collect();
+        revisions.sort();
+        let mut branches = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for rev in &revisions {
+            for b in self.branch_store.get_branches_at_commit(rev).await? {
+                if seen.insert(b.branch_name.clone()) {
+                    branches.push(b);
+                }
+            }
+        }
+        branches.sort_by(|a, b| a.branch_name.cmp(&b.branch_name));
+        Ok((revisions, branches))
+    }
+
     pub async fn get_existing_function_names(&self) -> Result<std::collections::HashSet<String>> {
         use futures::TryStreamExt;
 
