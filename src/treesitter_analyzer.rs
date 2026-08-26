@@ -1279,6 +1279,11 @@ impl TreeSitterAnalyzer {
                 stack.push(child);
             }
 
+            if let Some(registration) = Self::initcall(node, source) {
+                found.push(registration);
+                continue;
+            }
+
             if node.kind() != "initializer_list" {
                 continue;
             }
@@ -1531,6 +1536,99 @@ impl TreeSitterAnalyzer {
         }
 
         members
+    }
+
+    /// A function the kernel runs at boot, named by the macro that files it.
+    ///
+    /// ```text
+    /// device_initcall(foo_init);
+    /// ```
+    ///
+    /// The macro puts a pointer to `foo_init` in a section that
+    /// `do_initcalls()` walks, so nothing in the source calls it and nothing
+    /// assigns it anywhere: the function reads as dead. What the file does say
+    /// is which level it is filed under, and that is what this records.
+    ///
+    /// No dispatch site is claimed. The call is a walk over a linker section
+    /// in another file, and pretending to know that from here would be a
+    /// guess. `registrations foo_init` answers; `callers foo_init` still says
+    /// nothing calls it, which remains true of the source.
+    fn initcall(node: tree_sitter::Node, source: &str) -> Option<RawRegistration> {
+        // File scope: an initcall inside a function is something else.
+        if node.kind() != "expression_statement" || node.parent()?.kind() != "translation_unit" {
+            return None;
+        }
+
+        let call = node
+            .named_child(0)
+            .filter(|c| c.kind() == "call_expression")?;
+        let level = call.child_by_field_name("function")?;
+        if level.kind() != "identifier" {
+            return None;
+        }
+        let level = &source[level.byte_range()];
+        if !Self::is_initcall_macro(level) {
+            return None;
+        }
+
+        let arguments = call.child_by_field_name("arguments")?;
+        let mut cursor = arguments.walk();
+        let named: Vec<tree_sitter::Node> = arguments.named_children(&mut cursor).collect();
+        let [target] = named[..] else {
+            return None;
+        };
+        if target.kind() != "identifier" {
+            return None;
+        }
+
+        let name = source[target.byte_range()].to_string();
+        if name.is_empty() {
+            return None;
+        }
+
+        Some(RawRegistration {
+            container_type: level.to_string(),
+            container_base_type: None,
+            container_field: None,
+            member: ARRAY_ELEMENT_MEMBER.to_string(),
+            target: name,
+            byte_start: target.start_byte(),
+            line: target.start_position().row as u32 + 1,
+            kind: RegistrationKind::DesignatedInit,
+        })
+    }
+
+    /// Whether a name files a function into an init or exit section.
+    ///
+    /// A closed family, spelled out rather than pattern-matched: `module_init`
+    /// is one and `mutex_init` is not, and a suffix rule cannot tell them
+    /// apart.
+    fn is_initcall_macro(name: &str) -> bool {
+        const LEVELS: &[&str] = &[
+            "early_initcall",
+            "pure_initcall",
+            "core_initcall",
+            "core_initcall_sync",
+            "postcore_initcall",
+            "postcore_initcall_sync",
+            "arch_initcall",
+            "arch_initcall_sync",
+            "subsys_initcall",
+            "subsys_initcall_sync",
+            "fs_initcall",
+            "fs_initcall_sync",
+            "rootfs_initcall",
+            "device_initcall",
+            "device_initcall_sync",
+            "late_initcall",
+            "late_initcall_sync",
+            "console_initcall",
+            "security_initcall",
+            "module_init",
+            "module_exit",
+            "subsys_initcall_entry",
+        ];
+        LEVELS.contains(&name)
     }
 
     /// The name of the array of function pointers this list initialises.
@@ -5073,6 +5171,50 @@ mod tests {
             pointer.definition.contains("(*)"),
             "a reader cannot tell it is a function pointer: {:?}",
             pointer.definition
+        );
+    }
+
+    #[test]
+    fn an_initcall_records_the_level_it_is_filed_under() {
+        // Nothing calls `foo_init` and nothing assigns it: the macro puts a
+        // pointer to it in a section, so without this it reads as dead code.
+        let found = registration_rows(
+            "static int foo_init(void)\n\
+             {\n\
+             \tint rc = 0;\n\
+             \treturn rc;\n\
+             }\n\
+             device_initcall(foo_init);\n",
+            "foo.c",
+        );
+
+        let row = found
+            .iter()
+            .find(|r| r.target == "foo_init")
+            .unwrap_or_else(|| panic!("initcall not recorded: {found:?}"));
+        assert_eq!(row.container_type, "device_initcall");
+        assert_eq!(row.member, "[]");
+    }
+
+    #[test]
+    fn a_call_that_merely_ends_in_init_is_not_an_initcall() {
+        // `module_init` is one of these and `mutex_init` is not; a suffix
+        // rule cannot tell them apart, which is why the family is spelled out.
+        let found = registration_rows(
+            "struct mutex { int x; };\n\
+             static struct mutex lock;\n\
+             int helper(void)\n\
+             {\n\
+             \tint value = 7;\n\
+             \treturn value;\n\
+             }\n\
+             mutex_init(lock);\n",
+            "foo.c",
+        );
+
+        assert!(
+            found.iter().all(|r| r.container_type != "mutex_init"),
+            "{found:?}"
         );
     }
 
