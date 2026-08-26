@@ -306,6 +306,32 @@ impl SchemaManager {
         Ok(())
     }
 
+    /// Record the commit whose tree was read in full. Written last at
+    /// the end of a full tree read, so an interrupted run cannot claim it.
+    /// A new key in `schema_meta`, not a new column, so no migration.
+    pub async fn set_tree_sha(&self, sha: &str) -> Result<()> {
+        let table = self.connection.open_table("schema_meta").execute().await?;
+        table
+            .delete("key = 'index:tree_sha'")
+            .await
+            .context("clearing index:tree_sha")?;
+        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("key", arrow::datatypes::DataType::Utf8, false),
+            arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Utf8, false),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                std::sync::Arc::new(arrow::array::StringArray::from(vec!["index:tree_sha"]))
+                    as arrow::array::ArrayRef,
+                std::sync::Arc::new(arrow::array::StringArray::from(vec![sha]))
+                    as arrow::array::ArrayRef,
+            ],
+        )?;
+        table.add(vec![batch]).execute().await?;
+        Ok(())
+    }
+
     /// The value recorded under a key, absent when the index does not say.
     pub async fn meta_value(&self, key: &str) -> Result<Option<String>> {
         let names = self.connection.table_names().execute().await?;

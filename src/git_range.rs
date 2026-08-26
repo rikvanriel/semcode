@@ -1201,6 +1201,21 @@ pub async fn process_git_tree(
     // in place and is re-read next time.
     db_manager.record_index_build(extensions, no_macros).await?;
 
+    // The whole tree at this commit has been read, so record which commit it
+    // was. Written last, after record_index_build, so an interrupted run
+    // cannot claim coverage it did not finish.
+    let tree_sha = gix::discover(repo_path)
+        .ok()
+        .and_then(|repo| {
+            crate::git::resolve_to_commit(&repo, commit_sha)
+                .ok()
+                .map(|c| c.id().to_string())
+        })
+        .unwrap_or_else(|| commit_sha.to_string());
+    if let Err(e) = db_manager.record_tree_sha(&tree_sha).await {
+        tracing::warn!("Failed to record index:tree_sha {}: {}", tree_sha, e);
+    }
+
     Ok(())
 }
 

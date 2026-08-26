@@ -342,6 +342,14 @@ impl DatabaseManager {
             .await
     }
 
+    pub async fn record_tree_sha(&self, sha: &str) -> Result<()> {
+        self.schema_manager.set_tree_sha(sha).await
+    }
+
+    pub async fn recorded_tree_sha(&self) -> Result<Option<String>> {
+        self.schema_manager.meta_value("index:tree_sha").await
+    }
+
     /// How the index was built: the extensions indexed, and whether macros
     /// were skipped. `None` when the index does not say, which is every index
     /// written before this was recorded.
