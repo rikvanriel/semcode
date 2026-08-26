@@ -8,7 +8,7 @@ use tree_sitter::{Parser, Query, QueryCursor, Tree};
 
 use crate::types::{
     DispatchKind, DispatchSite, FieldInfo, FunctionInfo, GlobalTypeRegistry, MacroParams,
-    ParameterInfo, Registration, RegistrationKind, TypeInfo,
+    ParameterInfo, Registration, RegistrationKind, TypeInfo, ARRAY_ELEMENT_MEMBER,
 };
 // TemporaryCallRelationship import removed - call relationships are now embedded in function JSON columns
 use crate::hash::compute_file_hash;
@@ -428,6 +428,13 @@ impl TreeSitterAnalyzer {
                 function: (identifier) @macro_name
                 arguments: (argument_list) @macro_args
             ) @macro_call
+
+            (call_expression
+                function: (subscript_expression
+                    argument: (_) @array_name
+                    index: (_) @array_index
+                )
+            ) @array_call
         "#,
         )?;
 
@@ -855,6 +862,7 @@ impl TreeSitterAnalyzer {
             let mut receiver: Option<tree_sitter::Node> = None;
             let mut macro_name: Option<tree_sitter::Node> = None;
             let mut macro_args: Option<tree_sitter::Node> = None;
+            let mut array_name: Option<tree_sitter::Node> = None;
 
             for capture in call_match.captures {
                 match queries.call_query.capture_names()[capture.index as usize] {
@@ -868,6 +876,7 @@ impl TreeSitterAnalyzer {
                     "receiver" => receiver = Some(capture.node),
                     "macro_name" => macro_name = Some(capture.node),
                     "macro_args" => macro_args = Some(capture.node),
+                    "array_name" => array_name = Some(capture.node),
                     "pointer_expr" => {
                         // `(*fp)(...)`: a call through a pointer value, which
                         // the plain call pattern does not match at all.
@@ -887,6 +896,43 @@ impl TreeSitterAnalyzer {
                         }
                     }
                     _ => {}
+                }
+            }
+
+            // `table[i](...)`: the call names no function and no member, and
+            // the table it indexes is the only thing that says what it can
+            // reach. Record the table as the container, with every element a
+            // candidate — which is what a runtime index leaves open, and what
+            // the kernel's exit-handler and syscall tables are.
+            if let Some(array) = array_name {
+                // The thing indexed has to be nameable, or there is nothing
+                // to join a table against. A bare name is the table itself;
+                // a field is a table held in a struct, which receiver typing
+                // can still say something about. Anything else names no
+                // container — a macro body can parse as a subscripted call —
+                // and recording one would invent a table out of whatever text
+                // sat between the brackets.
+                let container = match array.kind() {
+                    "identifier" => Some(collapse_whitespace(&source_code[array.byte_range()])),
+                    "field_expression" => None,
+                    _ => continue,
+                };
+                let name = collapse_whitespace(&source_code[array.byte_range()]);
+                if !name.is_empty() {
+                    extraction.member_sites.push(RawDispatchSite {
+                        member: ARRAY_ELEMENT_MEMBER.to_string(),
+                        receiver_expr: Some(name),
+                        // A table is named, not typed: the array variable is
+                        // the container, and no struct declares a member of
+                        // this name, so the two cannot collide.
+                        receiver_type: container,
+                        receiver_base_type: None,
+                        receiver_field: None,
+                        kind: DispatchKind::ArrayElement,
+                        byte_start: array.start_byte(),
+                        line: array.start_position().row as u32 + 1,
+                        target: None,
+                    });
                 }
             }
 
@@ -1008,6 +1054,14 @@ impl TreeSitterAnalyzer {
         }
 
         for site in sites.iter_mut() {
+            // A table that named itself already has its container: asking
+            // the declaration what `kvm_vmx_exit_handlers` is answers `int`,
+            // which would replace the answer with a wrong one. A table held
+            // in a struct field has not, and typing its base is what would
+            // let it be resolved later.
+            if site.kind == DispatchKind::ArrayElement && site.receiver_type.is_some() {
+                continue;
+            }
             let Some(receiver) = site.receiver_expr.as_deref() else {
                 continue;
             };
@@ -1207,6 +1261,14 @@ impl TreeSitterAnalyzer {
             }
 
             if node.kind() != "initializer_list" {
+                continue;
+            }
+
+            // A table of function pointers names no type to fill and no
+            // member to fill it with. The table itself is the container, and
+            // every element is a way in.
+            if let Some(table) = Self::function_pointer_table(node, source) {
+                found.extend(Self::table_elements(node, source, &table));
                 continue;
             }
 
@@ -1469,6 +1531,102 @@ impl TreeSitterAnalyzer {
     /// outer type and the path `ops` are what this file proves; resolution
     /// turns them into the container, exactly as it does for a receiver that
     /// reads through a field.
+    /// The name of the array of function pointers this list initialises.
+    ///
+    /// ```text
+    /// static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
+    ///         [EXIT_REASON_CPUID] = kvm_emulate_cpuid,
+    /// ```
+    ///
+    /// The declaration states `int`, which says nothing, and the elements
+    /// name an index rather than a member — so neither the type walk nor the
+    /// member walk can see this, and everything reached through such a table
+    /// looks uncalled. What identifies the slot is the table's own name.
+    ///
+    /// Recognised by shape: a declarator that is a function returning through
+    /// a parenthesised pointer to an array, which is how C spells an array of
+    /// function pointers and is not how it spells anything else.
+    fn function_pointer_table(list: tree_sitter::Node, source: &str) -> Option<String> {
+        let parent = list.parent()?;
+        if parent.kind() != "init_declarator" {
+            return None;
+        }
+
+        let mut node = parent.child_by_field_name("declarator")?;
+        let (mut saw_function, mut saw_pointer, mut saw_array) = (false, false, false);
+        loop {
+            match node.kind() {
+                "function_declarator" => saw_function = true,
+                "pointer_declarator" => saw_pointer = true,
+                "array_declarator" => saw_array = true,
+                "identifier" => break,
+                _ => {}
+            }
+            node = node
+                .child_by_field_name("declarator")
+                .or_else(|| node.named_child(0))?;
+        }
+
+        if !(saw_function && saw_pointer && saw_array) {
+            return None;
+        }
+
+        let name = source[node.byte_range()].to_string();
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// The functions a table of function pointers holds.
+    ///
+    /// Both designated elements, `[EXIT_REASON_CPUID] = kvm_emulate_cpuid`,
+    /// and positional ones. The index is not recorded as the member: a call
+    /// through the table computes it at run time, so every element is a
+    /// candidate and recording which one would suggest a precision the join
+    /// does not have.
+    fn table_elements(list: tree_sitter::Node, source: &str, table: &str) -> Vec<RawRegistration> {
+        let mut found = Vec::new();
+        let mut cursor = list.walk();
+
+        for child in list.named_children(&mut cursor) {
+            let value = match child.kind() {
+                "initializer_pair" => match child.child_by_field_name("value") {
+                    Some(value) => value,
+                    None => continue,
+                },
+                "identifier" => child,
+                _ => continue,
+            };
+
+            let target_node = match value.kind() {
+                "identifier" => Some(value),
+                "pointer_expression" => value
+                    .child_by_field_name("argument")
+                    .filter(|a| a.kind() == "identifier"),
+                _ => None,
+            };
+            let Some(target_node) = target_node else {
+                continue;
+            };
+
+            let target = source[target_node.byte_range()].to_string();
+            if target.is_empty() {
+                continue;
+            }
+
+            found.push(RawRegistration {
+                container_type: table.to_string(),
+                container_base_type: None,
+                container_field: None,
+                member: ARRAY_ELEMENT_MEMBER.to_string(),
+                target,
+                byte_start: target_node.start_byte(),
+                line: target_node.start_position().row as u32 + 1,
+                kind: RegistrationKind::DesignatedInit,
+            });
+        }
+
+        found
+    }
+
     fn initializer_container(
         list: tree_sitter::Node,
         source: &str,
@@ -4814,6 +4972,105 @@ mod tests {
 
         let run = found.iter().find(|r| r.member == "run").unwrap();
         assert_eq!(run.container_type, "outer");
+    }
+
+    #[test]
+    fn a_table_of_function_pointers_records_its_elements() {
+        // kvm_vmx_exit_handlers is this shape. The declaration's type is
+        // `int`, and the elements name an exit reason rather than a member,
+        // so nothing else in the extractor sees these installations.
+        let found = registration_rows(
+            "int handle_cpuid(struct kvm_vcpu *vcpu);\n\
+             int handle_vmx_instruction(struct kvm_vcpu *vcpu);\n\
+             static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {\n\
+             \t[EXIT_REASON_CPUID] = handle_cpuid,\n\
+             \t[EXIT_REASON_VMCALL] = handle_vmx_instruction,\n\
+             };\n",
+            "vmx.c",
+        );
+
+        let targets: Vec<&str> = found.iter().map(|r| r.target.as_str()).collect();
+        assert!(targets.contains(&"handle_cpuid"), "{found:?}");
+        assert!(targets.contains(&"handle_vmx_instruction"), "{found:?}");
+        for row in &found {
+            assert_eq!(row.container_type, "kvm_vmx_exit_handlers");
+            assert_eq!(row.member, "[]");
+        }
+    }
+
+    #[test]
+    fn a_positional_table_records_its_elements() {
+        let found = registration_rows(
+            "int first(void);\n\
+             int second(void);\n\
+             static int (*table[])(void) = { first, second };\n",
+            "t.c",
+        );
+
+        let targets: Vec<&str> = found.iter().map(|r| r.target.as_str()).collect();
+        assert_eq!(targets, vec!["first", "second"], "{found:?}");
+    }
+
+    #[test]
+    fn an_array_of_structs_is_not_a_table_of_function_pointers() {
+        // `.read = f` inside an array of ops structs still records the member
+        // and the struct, not the array.
+        let found = registration_rows(
+            "struct ops { int (*read)(void); };\n\
+             int impl(void);\n\
+             static struct ops table[] = { [0] = { .read = impl } };\n",
+            "t.c",
+        );
+
+        let read = found.iter().find(|r| r.target == "impl").expect("dropped");
+        assert_eq!(read.member, "read");
+        assert_eq!(read.container_type, "ops");
+    }
+
+    #[test]
+    fn a_table_held_in_a_field_is_recorded_without_inventing_a_container() {
+        // `chip->get_delay[i]()` dispatches through an array a struct holds.
+        // The site is worth recording; the container is not knowable from
+        // the array name, because there is not one.
+        let (_functions, sites) = analyze(
+            "int azx_get_position(struct azx *chip, int i)\n\
+             {\n\
+             \treturn chip->get_delay[i](chip);\n\
+             }\n",
+            "hda.c",
+        );
+
+        let site = sites
+            .iter()
+            .find(|s| s.kind == DispatchKind::ArrayElement)
+            .expect("no array dispatch site");
+        assert_eq!(site.receiver_expr.as_deref(), Some("chip->get_delay"));
+        assert_eq!(
+            site.receiver_type, None,
+            "a field is not a table name: {site:?}"
+        );
+    }
+
+    #[test]
+    fn a_call_through_a_table_is_a_dispatch_site() {
+        let (_functions, sites) = analyze(
+            "int __vmx_handle_exit(struct kvm_vcpu *vcpu, int r)\n\
+             {\n\
+             \tint i = exit_reason.basic;\n\
+             \tif (!kvm_vmx_exit_handlers[i])\n\
+             \t\treturn 0;\n\
+             \treturn kvm_vmx_exit_handlers[i](vcpu);\n\
+             }\n",
+            "vmx.c",
+        );
+
+        let site = sites
+            .iter()
+            .find(|s| s.kind == DispatchKind::ArrayElement)
+            .expect("no array dispatch site");
+        assert_eq!(site.member, "[]");
+        assert_eq!(site.receiver_type.as_deref(), Some("kvm_vmx_exit_handlers"));
+        assert_eq!(site.caller_name, "__vmx_handle_exit");
     }
 
     #[test]

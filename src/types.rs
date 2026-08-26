@@ -154,6 +154,14 @@ pub struct ResolvedDispatch {
     pub targets: Vec<String>,
 }
 
+/// The member recorded for a call through, or an installation into, an
+/// element of an array of function pointers.
+///
+/// A table has no members to name, so both sides of the join use this in
+/// place of one and the container is the array itself. No struct declares a
+/// member of this name, so a table cannot collide with a type.
+pub const ARRAY_ELEMENT_MEMBER: &str = "[]";
+
 /// How a dispatch site was written. Stored, so values are append-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DispatchKind {
@@ -170,6 +178,10 @@ pub enum DispatchKind {
     /// A candidate the source itself names, as the kernel's INDIRECT_CALL_n
     /// macros do to help the branch predictor.
     MacroDeclared,
+    /// `table[i](...)`: a call through an element of an array of function
+    /// pointers. The table is the container; a runtime index leaves every
+    /// element it holds a candidate.
+    ArrayElement,
 }
 
 impl DispatchKind {
@@ -181,6 +193,7 @@ impl DispatchKind {
             DispatchKind::PointerLocal => "pointer_local",
             DispatchKind::PointerParam => "pointer_param",
             DispatchKind::MacroDeclared => "macro_declared",
+            DispatchKind::ArrayElement => "array_element",
         }
     }
 
@@ -195,6 +208,7 @@ impl DispatchKind {
             "pointer_local" => Some(DispatchKind::PointerLocal),
             "pointer_param" => Some(DispatchKind::PointerParam),
             "macro_declared" => Some(DispatchKind::MacroDeclared),
+            "array_element" => Some(DispatchKind::ArrayElement),
             _ => None,
         }
     }
