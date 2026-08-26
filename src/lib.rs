@@ -16,6 +16,7 @@ mod treesitter_analyzer;
 mod types;
 mod vectorizer;
 pub mod workdir;
+pub mod worktree;
 
 // Query functionality modules
 pub mod callchain;
