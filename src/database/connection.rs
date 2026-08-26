@@ -155,6 +155,7 @@ pub struct DatabaseManager {
     content_store: ContentStore,
     dispatch_site_store: crate::database::dispatch_sites::DispatchSiteStore,
     registration_store: crate::database::registrations::RegistrationStore,
+    object_macro_store: crate::database::object_macros::ObjectMacroStore,
     symbol_filename_store: SymbolFilenameStore,
     branch_store: IndexedBranchStore,
     workdir_index: std::sync::RwLock<Option<WorkdirIndex>>,
@@ -214,6 +215,9 @@ impl DatabaseManager {
                 connection.clone(),
             ),
             symbol_filename_store: SymbolFilenameStore::new(connection.clone()),
+            object_macro_store: crate::database::object_macros::ObjectMacroStore::new(
+                connection.clone(),
+            ),
             branch_store: IndexedBranchStore::new(connection.clone()),
             workdir_index: std::sync::RwLock::new(None),
             manifest_cache: std::sync::RwLock::new(None),
@@ -922,7 +926,10 @@ impl DatabaseManager {
             symbol_filename_pairs.push((type_info.name.clone(), type_info.file_path.clone()));
         }
 
-        // Note: Macros are now in functions, so no separate loop needed
+        // An object-like macro is stored twice on purpose: as a function,
+        // which is where a caller looks it up by name, and here with its
+        // expansion beside it, which is what reading a declaration needs.
+        let object_macros = Self::object_macros_among(&functions);
 
         // Step 3: Insert content and metadata in parallel
         let (content_result, func_result, type_result, symbol_filename_result) = tokio::join!(
@@ -962,6 +969,7 @@ impl DatabaseManager {
         func_result?;
         type_result?;
         symbol_filename_result?;
+        self.object_macro_store.insert_batch(object_macros).await?;
 
         Ok(())
     }
@@ -1357,15 +1365,45 @@ impl DatabaseManager {
         self.dispatch_site_store.find_by_caller(caller_name).await
     }
 
+    /// The object-like macros in a batch of extracted functions.
+    ///
+    /// A macro reaches the database as a function with no return type; an
+    /// object-like one also has no parameters, and its body is the whole
+    /// `#define`. The expansion is what follows the name — the alias or the
+    /// attribute — and is the only part a declaration needs.
+    fn object_macros_among(
+        functions: &[FunctionInfo],
+    ) -> Vec<crate::database::object_macros::ObjectMacro> {
+        functions
+            .iter()
+            .filter(|f| f.return_type.is_empty() && f.parameters.is_empty())
+            .filter_map(|f| {
+                let directive = f.body.trim_start().strip_prefix('#')?.trim_start();
+                if !directive.starts_with("define") {
+                    return None;
+                }
+                let expansion = f.body.split_once(&f.name).map(|(_, rest)| rest.trim())?;
+                Some(crate::database::object_macros::ObjectMacro {
+                    name: f.name.clone(),
+                    expansion: expansion.to_string(),
+                    file_path: f.file_path.clone(),
+                    git_file_hash: f.git_file_hash.clone(),
+                })
+            })
+            .collect()
+    }
+
     pub async fn insert_functions(&self, functions: Vec<FunctionInfo>) -> Result<()> {
         // Extract (symbol_name, filename) pairs for symbol_filename table
         let symbol_filename_pairs: Vec<(String, String)> = functions
             .iter()
             .map(|f| (f.name.clone(), f.file_path.clone()))
             .collect();
+        let object_macros = Self::object_macros_among(&functions);
 
         // Insert functions
         self.function_store.insert_batch(functions).await?;
+        self.object_macro_store.insert_batch(object_macros).await?;
 
         // Insert into symbol_filename table
         self.symbol_filename_store
@@ -2421,10 +2459,10 @@ impl DatabaseManager {
             return Ok(known.clone());
         }
 
-        let macros = self.function_store.object_like_macros().await?;
+        let macros = self.object_macro_store.all().await?;
         let bodies: HashMap<&str, &str> = macros
             .iter()
-            .map(|(name, body)| (name.as_str(), body.as_str()))
+            .map(|(name, expansion)| (name.as_str(), expansion.as_str()))
             .collect();
 
         let mut attributes = HashSet::new();
