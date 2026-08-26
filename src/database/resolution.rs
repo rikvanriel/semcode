@@ -465,6 +465,12 @@ impl RevisionPaths {
         resolved
     }
 
+    /// The revision these paths are for. Empty when the paths were handed in
+    /// already resolved, which is the only case that cannot name one.
+    pub fn revision(&self) -> &str {
+        &self.git_sha
+    }
+
     /// Whether nothing at all resolved, which says the revision could not be
     /// established rather than that the tree is empty.
     pub fn is_empty(&self) -> bool {

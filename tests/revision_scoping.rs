@@ -24,12 +24,28 @@ fn head_of(repo: &Path) -> String {
     git::get_git_sha(repo).unwrap().unwrap()
 }
 
-/// A repository with two branches, and an index holding both.
-///
-/// `shared.c` is on both branches. `only_on_topic.c` is on `topic` alone, so
-/// a query that says it wants `main` is asking about a tree that never
-/// contained `topic_only`.
+/// Which revisions the index was built from.
+#[derive(Copy, Clone, PartialEq)]
+enum Indexed {
+    /// Both branches, so every revision the tests ask about is in the index.
+    Both,
+    /// `main` alone, so `topic` is a revision the index has files for and
+    /// content for only at another revision.
+    MainOnly,
+}
+
 async fn two_branches() -> (tempfile::TempDir, Arc<DatabaseManager>, String, String) {
+    two_branches_indexing(Indexed::Both).await
+}
+
+/// A repository with two branches.
+///
+/// `shared.c` is on both, with different contents. `only_on_topic.c` is on
+/// `topic` alone, so a query that says it wants `main` is asking about a tree
+/// that never contained `topic_only`.
+async fn two_branches_indexing(
+    indexed: Indexed,
+) -> (tempfile::TempDir, Arc<DatabaseManager>, String, String) {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
 
@@ -53,13 +69,30 @@ async fn two_branches() -> (tempfile::TempDir, Arc<DatabaseManager>, String, Str
     git_run(repo, &["checkout", "-q", "-b", "topic"]);
     std::fs::write(
         repo.join("only_on_topic.c"),
-        "int topic_only(void)\n{\n\
+        "struct topic_only_state {\n\
+\tint counter;\n\
+\tchar label[32];\n};\n\n\
+typedef struct topic_only_state topic_only_state_t;\n\n\
+int topic_only(void)\n{\n\
 \tint x = 10;\n\
 \tint y = 20;\n\
 \tint z = x * y + 7;\n\
 \tchar tmp[64];\n\
 \tsnprintf(tmp, sizeof(tmp), \"topic %d\", z);\n\
 \treturn z + (int)strlen(tmp);\n}\n",
+    )
+    .unwrap();
+    // shared.c differs between the branches, so `topic` holds content that an
+    // index built from `main` alone has never seen.
+    std::fs::write(
+        repo.join("shared.c"),
+        "int shared_function(void)\n{\n\
+\tint a = 3;\n\
+\tint b = 4;\n\
+\tint c = a * b + 42;\n\
+\tchar buf[64];\n\
+\tsnprintf(buf, sizeof(buf), \"topic %d\", c);\n\
+\treturn c + (int)strlen(buf);\n}\n",
     )
     .unwrap();
     git_run(repo, &["add", "."]);
@@ -77,7 +110,11 @@ async fn two_branches() -> (tempfile::TempDir, Arc<DatabaseManager>, String, Str
     db.create_tables().await.unwrap();
 
     let extensions = ["c".to_string(), "h".to_string()];
-    for sha in [&main_sha, &topic_sha] {
+    let revisions: Vec<&String> = match indexed {
+        Indexed::Both => vec![&main_sha, &topic_sha],
+        Indexed::MainOnly => vec![&main_sha],
+    };
+    for sha in revisions {
         semcode::git_range::process_git_tree(repo, sha, &extensions, db.clone(), false, 1)
             .await
             .unwrap();
@@ -91,32 +128,118 @@ async fn two_branches() -> (tempfile::TempDir, Arc<DatabaseManager>, String, Str
 }
 
 #[tokio::test]
-async fn a_function_from_another_branch_is_answered_for_this_one() {
-    // Pinned, not endorsed.
-    //
+async fn a_function_from_another_branch_is_not_answered_for_this_one() {
     // `topic_only` exists only on `topic`. Asked for at `main`, the file it
-    // lives in does not exist, so no path resolves, and the lookup falls back
-    // to every revision in the index rather than reporting an absence:
-    //
-    //     if resolved_hashes.is_empty() {
-    //         tracing::warn!("No files resolved for '{}' at commit '{}'", name, git_sha);
-    //         // Fallback: get all functions and filter implementations
-    //
-    // The warning goes to a log, and the caller is told about a function that
-    // is not in the tree it named. This test records that, and is flipped by
-    // the patch that makes the revision decide.
-    let (_dir, db, main_sha, _topic_sha) = two_branches().await;
+    // lives in is not in that tree, so the answer is that it is not there —
+    // where it does live is a separate question, which the index can answer.
+    let (_dir, db, main_sha, topic_sha) = two_branches().await;
 
     let found = db
         .find_all_functions_git_aware("topic_only", &main_sha)
         .await
         .unwrap();
+    assert!(
+        found.is_empty(),
+        "answered from another revision: {found:?}"
+    );
+
+    // The absence belongs to the revision, not to a missing row: the index
+    // holds the function, and answers for it where it does exist.
+    let row = db.find_function("topic_only").await.unwrap().unwrap();
+    assert_eq!(row.file_path, "only_on_topic.c");
+    assert_eq!(
+        db.find_all_functions_git_aware("topic_only", &topic_sha)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_single_function_lookup_is_not_answered_from_another_branch() {
+    // The same, through the lookup that returns one match and reaches the
+    // absence with a manifest rather than with a commit.
+    let (_dir, db, main_sha, topic_sha) = two_branches().await;
 
     assert!(
-        !found.is_empty(),
-        "the fallback is gone; flip this test to assert the absence"
+        db.find_function_git_aware("topic_only", &main_sha)
+            .await
+            .unwrap()
+            .is_none(),
+        "answered from another revision"
     );
-    assert_eq!(found[0].name, "topic_only");
+    assert!(
+        db.find_function_git_aware("topic_only", &topic_sha)
+            .await
+            .unwrap()
+            .is_some(),
+        "not answered at its own revision"
+    );
+}
+
+#[tokio::test]
+async fn a_type_from_another_branch_is_not_answered_for_this_one() {
+    // Types and typedefs have their own lookups, and had their own fallbacks.
+    let (_dir, db, main_sha, topic_sha) = two_branches().await;
+
+    let types = db
+        .find_types_git_aware("topic_only_state", &main_sha)
+        .await
+        .unwrap();
+    assert!(
+        types.is_empty(),
+        "answered from another revision: {types:?}"
+    );
+    assert_eq!(
+        db.find_types_git_aware("topic_only_state", &topic_sha)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "not answered at its own revision"
+    );
+
+    assert!(
+        db.find_typedef_git_aware("topic_only_state_t", &main_sha)
+            .await
+            .unwrap()
+            .is_none(),
+        "typedef answered from another revision"
+    );
+    assert!(
+        db.find_typedef_git_aware("topic_only_state_t", &topic_sha)
+            .await
+            .unwrap()
+            .is_some(),
+        "typedef not answered at its own revision"
+    );
+}
+
+#[tokio::test]
+async fn content_the_index_never_read_is_not_answered_from_the_revision_it_did() {
+    // The second leak, which is not a resolution failure: `shared.c` is in
+    // both trees with different contents, and the index holds only `main`.
+    // Asked at `topic` the path resolves, no row carries the blob it resolves
+    // to, and the answer used to be `main`'s row.
+    let (_dir, db, main_sha, topic_sha) = two_branches_indexing(Indexed::MainOnly).await;
+
+    let found = db
+        .find_all_functions_git_aware("shared_function", &topic_sha)
+        .await
+        .unwrap();
+    assert!(
+        found.is_empty(),
+        "answered with content from another revision: {found:?}"
+    );
+
+    // Same name, same path, and the revision that was indexed still answers.
+    let found = db
+        .find_all_functions_git_aware("shared_function", &main_sha)
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].file_path, "shared.c");
 }
 
 #[tokio::test]

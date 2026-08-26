@@ -35,6 +35,95 @@ pub const OPTIMAL_BATCH_SIZE: usize = 65536;
 /// walks the whole tree.
 type GitManifest = std::sync::Arc<crate::database::resolution::RevisionPaths>;
 
+/// Why a revision cannot account for a symbol. The answer is the same in all
+/// three cases; the reason is what tells an index that does not have the tree
+/// apart from a symbol that is not in it.
+#[derive(Copy, Clone)]
+enum Absent {
+    /// The revision itself did not resolve, so no path could be looked up in
+    /// it. Either the repository does not have that commit or git failed.
+    RevisionUnknown,
+    /// The files the symbol lives in are not in that tree.
+    PathsNotInTree,
+    /// The files are in the tree, holding content no indexed row has.
+    ContentNotIndexed,
+}
+
+impl Absent {
+    fn reason(self) -> &'static str {
+        match self {
+            Absent::RevisionUnknown => "the revision did not resolve",
+            Absent::PathsNotInTree => "its files are not in that tree",
+            Absent::ContentNotIndexed => "no indexed row holds the content that tree has",
+        }
+    }
+}
+
+/// Where a name's rows do live, for the line that reports it absent.
+///
+/// A revision with no branch is normal: the index records commits it read,
+/// and only some of them were branch tips.
+fn describe_revisions(
+    revisions: &[String],
+    branches: &[crate::database::branches::IndexedBranchInfo],
+) -> String {
+    let revs: Vec<&str> = revisions
+        .iter()
+        .map(|r| &r[..r.len().min(12)])
+        .take(4)
+        .collect();
+    let more = revisions.len().saturating_sub(revs.len());
+    let at = if more > 0 {
+        format!("{} and {} more", revs.join(", "), more)
+    } else {
+        revs.join(", ")
+    };
+    if branches.is_empty() {
+        return format!("its rows are at {at}, on no indexed branch");
+    }
+    let names: Vec<&str> = branches.iter().map(|b| b.branch_name.as_str()).collect();
+    format!("its rows are at {at}, on {}", names.join(", "))
+}
+
+/// The same, for an index that cannot name a revision: the files the rows
+/// came from and the content they carry. `processed_files` holds a revision
+/// only when the indexer was given one, so this is what most indexes can
+/// say, and it is enough to tell a caller which tree to look in.
+fn describe_files(places: &[(String, String)]) -> String {
+    let mut seen = HashSet::new();
+    let mut described = Vec::new();
+    for (path, hash) in places {
+        if !seen.insert(path) {
+            continue;
+        }
+        if described.len() < 3 {
+            described.push(format!("{path} (blob {})", &hash[..hash.len().min(12)]));
+        }
+    }
+    if described.is_empty() {
+        return "the index has no row for it".to_string();
+    }
+    let more = seen.len().saturating_sub(described.len());
+    if more > 0 {
+        format!("its rows are in {}, and {more} more", described.join(", "))
+    } else {
+        format!("its rows are in {}", described.join(", "))
+    }
+}
+
+/// One line per absence, because an answer that is missing says nothing. An
+/// unresolvable revision is the operator's problem and warns; a symbol that
+/// is simply not in the tree is an answer and informs.
+fn log_absence(kind: &str, name: &str, git_sha: &str, why: Absent, elsewhere: &str) {
+    let reason = why.reason();
+    match why {
+        Absent::RevisionUnknown => {
+            tracing::warn!("{kind} '{name}' is not answered for {git_sha}: {reason}; {elsewhere}")
+        }
+        _ => tracing::info!("{kind} '{name}' is not at {git_sha}: {reason}; {elsewhere}"),
+    }
+}
+
 pub struct DatabaseManager {
     connection: Connection,
     git_repo_path: String,
@@ -1286,6 +1375,154 @@ impl DatabaseManager {
         }
     }
 
+    /// The answer when the requested revision cannot be mapped onto the files
+    /// a symbol lives in: the paths do not exist at that revision, the
+    /// revision itself does not resolve, or no row carries the content the
+    /// revision holds.
+    ///
+    /// All three say the same thing — the index cannot show the symbol is in
+    /// the tree that was named — so all three answer that it is not there.
+    /// Where its rows do live is logged, from the revisions the index recorded
+    /// for their content.
+    async fn function_not_at_revision(
+        &self,
+        name: &str,
+        git_sha: &str,
+        why: Absent,
+    ) -> Result<Option<FunctionInfo>> {
+        self.log_absent_function(name, git_sha, why).await;
+        Ok(None)
+    }
+
+    /// The same, for a lookup that returns every match rather than one.
+    async fn functions_not_at_revision(
+        &self,
+        name: &str,
+        git_sha: &str,
+        why: Absent,
+    ) -> Result<Vec<FunctionInfo>> {
+        self.log_absent_function(name, git_sha, why).await;
+        Ok(Vec::new())
+    }
+
+    /// The same, for types. A dirty file is part of the revision the caller
+    /// asked about — the tree plus what is on disk — so a match from one is an
+    /// answer for that revision, not a borrowed answer from another.
+    async fn types_not_at_revision(
+        &self,
+        name: &str,
+        git_sha: &str,
+        why: Absent,
+        workdir_matches: Vec<TypeInfo>,
+    ) -> Result<Vec<TypeInfo>> {
+        if !workdir_matches.is_empty() {
+            return Ok(workdir_matches);
+        }
+        let place = self
+            .find_type(name)
+            .await?
+            .map(|ty| (ty.file_path, ty.git_file_hash));
+        self.log_absent_symbol("type", name, git_sha, why, place)
+            .await;
+        Ok(Vec::new())
+    }
+
+    /// The same, for typedefs.
+    async fn typedef_not_at_revision(
+        &self,
+        name: &str,
+        git_sha: &str,
+        why: Absent,
+    ) -> Result<Option<TypedefInfo>> {
+        let place = self
+            .find_typedef(name)
+            .await?
+            .map(|td| (td.file_path, td.git_file_hash));
+        self.log_absent_symbol("typedef", name, git_sha, why, place)
+            .await;
+        Ok(None)
+    }
+
+    /// Report a function absent at a revision, naming the revisions its rows
+    /// were indexed at, or the files they came from when the index recorded no
+    /// revision for their content.
+    async fn log_absent_function(&self, name: &str, git_sha: &str, why: Absent) {
+        let elsewhere = match self.symbol_revisions(name).await {
+            Ok((revisions, branches)) if !revisions.is_empty() => {
+                describe_revisions(&revisions, &branches)
+            }
+            Ok(_) => match self.function_store.find_all_by_name_unfiltered(name).await {
+                Ok(rows) => describe_files(
+                    &rows
+                        .into_iter()
+                        .map(|r| (r.file_path, r.git_file_hash))
+                        .collect::<Vec<_>>(),
+                ),
+                Err(e) => format!("the index could not say where it is: {e}"),
+            },
+            Err(e) => format!("the index could not say where it is: {e}"),
+        };
+        log_absence("function", name, git_sha, why, &elsewhere);
+    }
+
+    /// The same for a symbol whose rows are not in the functions table. The
+    /// row is read to describe where its content lives, never to answer with.
+    async fn log_absent_symbol(
+        &self,
+        kind: &str,
+        name: &str,
+        git_sha: &str,
+        why: Absent,
+        place: Option<(String, String)>,
+    ) {
+        let Some((path, hash)) = place else {
+            log_absence(kind, name, git_sha, why, "the index has no row for it");
+            return;
+        };
+        let elsewhere = match self.where_hash_lives(&hash).await {
+            Ok((revisions, branches)) if !revisions.is_empty() => {
+                describe_revisions(&revisions, &branches)
+            }
+            Ok(_) => describe_files(&[(path, hash)]),
+            Err(e) => format!("the index could not say where it is: {e}"),
+        };
+        log_absence(kind, name, git_sha, why, &elsewhere);
+    }
+
+    /// Whether the repository can resolve a revision at all.
+    fn revision_resolves(&self, git_sha: &str) -> bool {
+        match gix::discover(&self.git_repo_path) {
+            Ok(repo) => crate::git::resolve_to_commit(&repo, git_sha).is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// Which absence it is when no path resolved. `resolve_git_file_hashes`
+    /// answers with an empty map both for a path that is not in the tree and
+    /// for a git failure, so ask the repository which one happened. Only
+    /// reached on the absence path, so the extra `gix::discover` is not on any
+    /// answer's way.
+    fn why_nothing_resolved(&self, git_sha: &str) -> Absent {
+        if self.revision_resolves(git_sha) {
+            Absent::PathsNotInTree
+        } else {
+            Absent::RevisionUnknown
+        }
+    }
+
+    /// The revisions and branches that hold one file blob.
+    async fn where_hash_lives(
+        &self,
+        hash: &str,
+    ) -> Result<(
+        Vec<String>,
+        Vec<crate::database::branches::IndexedBranchInfo>,
+    )> {
+        let revisions = self.revisions_for_file_hash(hash).await?;
+        let branches = self.branches_for_file_hash(hash).await?;
+        Ok((revisions, branches))
+    }
+
     /// Find a function by name without git awareness (non-git-aware)
     ///
     /// **WARNING**: This method does NOT filter by git commit and may return outdated versions.
@@ -1300,47 +1537,6 @@ impl DatabaseManager {
     /// Returns the "best match" from all indexed versions without considering git history.
     /// Prefers .c over .h files, implementations over declarations, but may not match
     /// the version currently in your working directory.
-    /// An answer given without establishing the revision.
-    ///
-    /// Every lookup below reaches this when the requested revision cannot be
-    /// mapped onto the files a symbol lives in: the paths do not exist at that
-    /// revision, the manifest is empty, or no row carries the content the
-    /// revision holds. Each case has the same meaning — the index cannot show
-    /// that the symbol is in that tree — and the same behaviour today, which
-    /// is to answer from every revision it has.
-    ///
-    /// Collected here so that behaviour has one name, one changelog entry, and
-    /// one place to change. Nothing about it changes in this patch.
-    async fn function_without_revision(&self, name: &str) -> Result<Option<FunctionInfo>> {
-        self.find_function(name).await
-    }
-
-    /// The same, for a lookup that returns every match rather than one.
-    async fn functions_without_revision(&self, name: &str) -> Result<Vec<FunctionInfo>> {
-        let all_functions = self
-            .function_store
-            .find_all_by_name_unfiltered(name)
-            .await?;
-        Ok(self.filter_implementations_only(all_functions))
-    }
-
-    /// The same, for types, which prefer a dirty-file match if there is one.
-    async fn types_without_revision(
-        &self,
-        name: &str,
-        workdir_matches: Vec<TypeInfo>,
-    ) -> Result<Vec<TypeInfo>> {
-        if !workdir_matches.is_empty() {
-            return Ok(workdir_matches);
-        }
-        Ok(self.find_type(name).await?.into_iter().collect())
-    }
-
-    /// The same, for typedefs.
-    async fn typedef_without_revision(&self, name: &str) -> Result<Option<TypedefInfo>> {
-        self.find_typedef(name).await
-    }
-
     pub async fn find_function(&self, name: &str) -> Result<Option<FunctionInfo>> {
         // Get all functions with this name and select the best one (prefers .c over .h, implementations over declarations)
         let all_matches = self
@@ -1367,12 +1563,8 @@ impl DatabaseManager {
         }
         let git_manifest = self.git_manifest_cached(git_sha).await?;
         if git_manifest.is_empty() {
-            tracing::info!(
-                "No files resolved for '{}' at commit '{}' - falling back to non-git lookup",
-                name,
-                git_sha
-            );
-            return self.function_without_revision(name).await;
+            let why = self.why_nothing_resolved(git_sha);
+            return self.function_not_at_revision(name, git_sha, why).await;
         }
         self.find_function_with_manifest(name, &git_manifest).await
     }
@@ -1400,8 +1592,14 @@ impl DatabaseManager {
             }
         }
 
+        let revision = match git_manifest.revision() {
+            "" => "the revision asked about",
+            sha => sha,
+        };
         if resolved_hashes.is_empty() {
-            return self.function_without_revision(name).await;
+            return self
+                .function_not_at_revision(name, revision, Absent::PathsNotInTree)
+                .await;
         }
 
         // Step 3: Direct targeted search for each (filename, git_hash) combination
@@ -1418,8 +1616,9 @@ impl DatabaseManager {
 
         // Step 4: Pick the best result (prefer implementation over declaration)
         if matches.is_empty() {
-            // Fallback: do a regular find to get any available function
-            return self.find_function(name).await;
+            return self
+                .function_not_at_revision(name, revision, Absent::ContentNotIndexed)
+                .await;
         }
 
         let best_match = self.select_best_function_match(matches);
@@ -1564,8 +1763,9 @@ impl DatabaseManager {
             .resolve_git_file_hashes(&unique_file_paths, git_sha)
             .await?;
         if resolved_hashes.is_empty() {
-            tracing::warn!("No files resolved for '{}' at commit '{}'", name, git_sha);
-            return self.functions_without_revision(name).await;
+            return self
+                .functions_not_at_revision(name, git_sha, self.why_nothing_resolved(git_sha))
+                .await;
         }
 
         // Step 3: Direct targeted search for each (filename, git_hash) combination
@@ -1595,13 +1795,10 @@ impl DatabaseManager {
         // Step 4: Filter out declarations but keep all implementations
         if matches.is_empty() {
             // Not a resolution failure: the revision is known and no row holds
-            // the content it has. The answer given is the same one.
-            tracing::warn!(
-                "No exact matches found for '{}' at commit '{}', falling back",
-                name,
-                git_sha
-            );
-            return self.functions_without_revision(name).await;
+            // the content it has. Either way the symbol is not in that tree.
+            return self
+                .functions_not_at_revision(name, git_sha, Absent::ContentNotIndexed)
+                .await;
         }
 
         // Filter out DB results from dirty/deleted files, then merge with workdir results
@@ -1980,12 +2177,10 @@ impl DatabaseManager {
             .resolve_git_file_hashes(&unique_file_paths, git_sha)
             .await?;
         if resolved_hashes.is_empty() {
-            tracing::info!(
-                "No files resolved for type '{}' at commit '{}' - falling back to non-git lookup",
-                name,
-                git_sha
-            );
-            return self.types_without_revision(name, workdir_matches).await;
+            let why = self.why_nothing_resolved(git_sha);
+            return self
+                .types_not_at_revision(name, git_sha, why, workdir_matches)
+                .await;
         }
 
         // Step 3: Direct targeted search using git hashes
@@ -1996,16 +2191,9 @@ impl DatabaseManager {
             .await?;
 
         if types.is_empty() {
-            tracing::info!(
-                "No exact matches found for type '{}' at commit '{}', falling back to non-git lookup",
-                name,
-                git_sha
-            );
-            if !workdir_matches.is_empty() {
-                return Ok(workdir_matches);
-            }
-            // Fallback: do a regular find to get any available type
-            return Ok(self.find_type(name).await?.into_iter().collect());
+            return self
+                .types_not_at_revision(name, git_sha, Absent::ContentNotIndexed, workdir_matches)
+                .await;
         }
 
         // Replace committed definitions from dirty files with their overlay versions,
@@ -2171,12 +2359,8 @@ impl DatabaseManager {
             .resolve_git_file_hashes(&unique_file_paths, git_sha)
             .await?;
         if resolved_hashes.is_empty() {
-            tracing::info!(
-                "No files resolved for typedef '{}' at commit '{}' - falling back to non-git lookup",
-                name,
-                git_sha
-            );
-            return self.typedef_without_revision(name).await;
+            let why = self.why_nothing_resolved(git_sha);
+            return self.typedef_not_at_revision(name, git_sha, why).await;
         }
 
         // Step 3: Direct targeted search using git hashes
@@ -2187,13 +2371,9 @@ impl DatabaseManager {
             .await?;
 
         if typedefs.is_empty() {
-            tracing::info!(
-                "No exact matches found for typedef '{}' at commit '{}', falling back to non-git lookup",
-                name,
-                git_sha
-            );
-            // Fallback: do a regular find to get any available typedef
-            return self.find_typedef(name).await;
+            return self
+                .typedef_not_at_revision(name, git_sha, Absent::ContentNotIndexed)
+                .await;
         }
 
         // Return the first match
@@ -4346,10 +4526,7 @@ impl DatabaseManager {
                 ),
             }
         };
-        let valid = match gix::discover(&self.git_repo_path) {
-            Ok(repo) => crate::git::resolve_to_commit(&repo, git_sha).is_ok(),
-            Err(_) => false,
-        };
+        let valid = self.revision_resolves(git_sha);
         Ok(crate::database::resolution::RevisionPaths::new_lazy(
             std::path::PathBuf::from(&self.git_repo_path),
             git_sha.to_string(),
