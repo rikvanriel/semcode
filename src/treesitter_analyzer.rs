@@ -215,6 +215,15 @@ pub struct TreeSitterAnalyzer {
     python_queries: &'static LanguageQueries,
 }
 
+/// A table of function pointers, and the typedef that hid that fact when the
+/// declaration did not spell it out.
+struct Table {
+    name: String,
+    /// The element type, when it is a name defined elsewhere. `None` means
+    /// the declarator itself said the elements are functions.
+    element_type: Option<String>,
+}
+
 impl TreeSitterAnalyzer {
     pub fn new() -> Result<Self> {
         // Initialize C parser and queries
@@ -1524,23 +1533,6 @@ impl TreeSitterAnalyzer {
         members
     }
 
-    /// The type an initializer list fills in, and the path of fields to reach
-    /// it from the type the file states.
-    ///
-    /// A list directly under a declaration or a compound literal names its
-    /// own type and the path is empty. A nested one does not:
-    ///
-    /// ```text
-    /// static struct nft_set_type nft_set_rbtree_type = {
-    ///         .ops = {
-    ///                 .activate = nft_rbtree_activate,
-    /// ```
-    ///
-    /// `activate` belongs to whatever `ops` is declared as within
-    /// `nft_set_type`, which lives with that struct rather than here. The
-    /// outer type and the path `ops` are what this file proves; resolution
-    /// turns them into the container, exactly as it does for a receiver that
-    /// reads through a field.
     /// The name of the array of function pointers this list initialises.
     ///
     /// ```text
@@ -1556,7 +1548,7 @@ impl TreeSitterAnalyzer {
     /// Recognised by shape: a declarator that is a function returning through
     /// a parenthesised pointer to an array, which is how C spells an array of
     /// function pointers and is not how it spells anything else.
-    fn function_pointer_table(list: tree_sitter::Node, source: &str) -> Option<String> {
+    fn function_pointer_table(list: tree_sitter::Node, source: &str) -> Option<Table> {
         let parent = list.parent()?;
         if parent.kind() != "init_declarator" {
             return None;
@@ -1577,12 +1569,34 @@ impl TreeSitterAnalyzer {
                 .or_else(|| node.named_child(0))?;
         }
 
-        if !(saw_function && saw_pointer && saw_array) {
+        let name = source[node.byte_range()].to_string();
+        if name.is_empty() {
             return None;
         }
 
-        let name = source[node.byte_range()].to_string();
-        (!name.is_empty()).then_some(name)
+        // Written out: `int (*handlers[])(struct kvm_vcpu *)`. The declarator
+        // says outright that the elements are functions.
+        if saw_function && saw_pointer && saw_array {
+            return Some(Table {
+                name,
+                element_type: None,
+            });
+        }
+
+        // Hidden behind a typedef: `static bfa_isr_func_t bfa_isrs[N]`. All
+        // the declarator says is that this is an array of something named
+        // elsewhere, so record which name and let the reader ask the typedef
+        // whether it is a function pointer. Guessing here would make a table
+        // out of every array of enum constants.
+        let declared = list.parent()?.parent()?.child_by_field_name("type")?;
+        if saw_array && !saw_function && declared.kind() == "type_identifier" {
+            return Some(Table {
+                name,
+                element_type: Some(source[declared.byte_range()].to_string()),
+            });
+        }
+
+        None
     }
 
     /// The functions a table of function pointers holds.
@@ -1592,7 +1606,11 @@ impl TreeSitterAnalyzer {
     /// through the table computes it at run time, so every element is a
     /// candidate and recording which one would suggest a precision the join
     /// does not have.
-    fn table_elements(list: tree_sitter::Node, source: &str, table: &str) -> Vec<RawRegistration> {
+    fn table_elements(
+        list: tree_sitter::Node,
+        source: &str,
+        table: &Table,
+    ) -> Vec<RawRegistration> {
         let mut found = Vec::new();
         let mut cursor = list.walk();
 
@@ -1623,8 +1641,12 @@ impl TreeSitterAnalyzer {
             }
 
             found.push(RawRegistration {
-                container_type: table.to_string(),
-                container_base_type: None,
+                container_type: table.name.clone(),
+                // Set only when a typedef stands between the declaration and
+                // the fact that these are functions: the row is a claim that
+                // holds if that name is a function-pointer typedef, and the
+                // reader checks it.
+                container_base_type: table.element_type.clone(),
                 container_field: None,
                 member: ARRAY_ELEMENT_MEMBER.to_string(),
                 target,
@@ -1637,6 +1659,23 @@ impl TreeSitterAnalyzer {
         found
     }
 
+    /// The type an initializer list fills in, and the path of fields to reach
+    /// it from the type the file states.
+    ///
+    /// A list directly under a declaration or a compound literal names its
+    /// own type and the path is empty. A nested one does not:
+    ///
+    /// ```text
+    /// static struct nft_set_type nft_set_rbtree_type = {
+    ///         .ops = {
+    ///                 .activate = nft_rbtree_activate,
+    /// ```
+    ///
+    /// `activate` belongs to whatever `ops` is declared as within
+    /// `nft_set_type`, which lives with that struct rather than here. The
+    /// outer type and the path `ops` are what this file proves; resolution
+    /// turns them into the container, exactly as it does for a receiver that
+    /// reads through a field.
     fn initializer_container(
         list: tree_sitter::Node,
         source: &str,
@@ -5035,6 +5074,49 @@ mod tests {
             "a reader cannot tell it is a function pointer: {:?}",
             pointer.definition
         );
+    }
+
+    #[test]
+    fn a_table_declared_through_a_typedef_is_a_claim_to_check() {
+        // `static bfa_isr_func_t bfa_isrs[N] = { ... }` says only that this
+        // is an array of something named elsewhere. Record the elements and
+        // the name, so the reader can ask the typedef whether they are
+        // functions; deciding here would need a file this one does not have.
+        let found = registration_rows(
+            "int bfa_isr_unhandled(void);\n\
+             int bfa_fcdiag_intr(void);\n\
+             static bfa_isr_func_t bfa_isrs[BFI_MC_MAX] = {\n\
+             \tbfa_isr_unhandled,\n\
+             \tbfa_fcdiag_intr,\n\
+             };\n",
+            "bfa_core.c",
+        );
+
+        assert_eq!(found.len(), 2, "{found:?}");
+        for row in &found {
+            assert_eq!(row.container_type, "bfa_isrs");
+            assert_eq!(row.member, "[]");
+            assert_eq!(
+                row.container_base_type.as_deref(),
+                Some("bfa_isr_func_t"),
+                "the claim to check is missing: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_table_that_spells_out_its_functions_makes_no_claim() {
+        let found = registration_rows(
+            "int handle_cpuid(struct kvm_vcpu *vcpu);\n\
+             static int (*handlers[])(struct kvm_vcpu *vcpu) = {\n\
+             \t[EXIT_REASON_CPUID] = handle_cpuid,\n\
+             };\n",
+            "vmx.c",
+        );
+
+        let row = found.first().expect("dropped");
+        assert_eq!(row.container_type, "handlers");
+        assert_eq!(row.container_base_type, None);
     }
 
     #[test]
