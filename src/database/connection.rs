@@ -1299,6 +1299,47 @@ impl DatabaseManager {
     /// Returns the "best match" from all indexed versions without considering git history.
     /// Prefers .c over .h files, implementations over declarations, but may not match
     /// the version currently in your working directory.
+    /// An answer given without establishing the revision.
+    ///
+    /// Every lookup below reaches this when the requested revision cannot be
+    /// mapped onto the files a symbol lives in: the paths do not exist at that
+    /// revision, the manifest is empty, or no row carries the content the
+    /// revision holds. Each case has the same meaning — the index cannot show
+    /// that the symbol is in that tree — and the same behaviour today, which
+    /// is to answer from every revision it has.
+    ///
+    /// Collected here so that behaviour has one name, one changelog entry, and
+    /// one place to change. Nothing about it changes in this patch.
+    async fn function_without_revision(&self, name: &str) -> Result<Option<FunctionInfo>> {
+        self.find_function(name).await
+    }
+
+    /// The same, for a lookup that returns every match rather than one.
+    async fn functions_without_revision(&self, name: &str) -> Result<Vec<FunctionInfo>> {
+        let all_functions = self
+            .function_store
+            .find_all_by_name_unfiltered(name)
+            .await?;
+        Ok(self.filter_implementations_only(all_functions))
+    }
+
+    /// The same, for types, which prefer a dirty-file match if there is one.
+    async fn types_without_revision(
+        &self,
+        name: &str,
+        workdir_matches: Vec<TypeInfo>,
+    ) -> Result<Vec<TypeInfo>> {
+        if !workdir_matches.is_empty() {
+            return Ok(workdir_matches);
+        }
+        Ok(self.find_type(name).await?.into_iter().collect())
+    }
+
+    /// The same, for typedefs.
+    async fn typedef_without_revision(&self, name: &str) -> Result<Option<TypedefInfo>> {
+        self.find_typedef(name).await
+    }
+
     pub async fn find_function(&self, name: &str) -> Result<Option<FunctionInfo>> {
         // Get all functions with this name and select the best one (prefers .c over .h, implementations over declarations)
         let all_matches = self
@@ -1330,7 +1371,7 @@ impl DatabaseManager {
                 name,
                 git_sha
             );
-            return self.find_function(name).await;
+            return self.function_without_revision(name).await;
         }
         self.find_function_with_manifest(name, &git_manifest).await
     }
@@ -1359,8 +1400,7 @@ impl DatabaseManager {
         }
 
         if resolved_hashes.is_empty() {
-            // Fallback: do a regular find to get any available functions
-            return self.find_function(name).await;
+            return self.function_without_revision(name).await;
         }
 
         // Step 3: Direct targeted search for each (filename, git_hash) combination
@@ -1524,12 +1564,7 @@ impl DatabaseManager {
             .await?;
         if resolved_hashes.is_empty() {
             tracing::warn!("No files resolved for '{}' at commit '{}'", name, git_sha);
-            // Fallback: get all functions and filter implementations
-            let all_functions = self
-                .function_store
-                .find_all_by_name_unfiltered(name)
-                .await?;
-            return Ok(self.filter_implementations_only(all_functions));
+            return self.functions_without_revision(name).await;
         }
 
         // Step 3: Direct targeted search for each (filename, git_hash) combination
@@ -1558,17 +1593,14 @@ impl DatabaseManager {
 
         // Step 4: Filter out declarations but keep all implementations
         if matches.is_empty() {
+            // Not a resolution failure: the revision is known and no row holds
+            // the content it has. The answer given is the same one.
             tracing::warn!(
                 "No exact matches found for '{}' at commit '{}', falling back",
                 name,
                 git_sha
             );
-            // Fallback: get all functions and filter implementations
-            let all_functions = self
-                .function_store
-                .find_all_by_name_unfiltered(name)
-                .await?;
-            return Ok(self.filter_implementations_only(all_functions));
+            return self.functions_without_revision(name).await;
         }
 
         // Filter out DB results from dirty/deleted files, then merge with workdir results
@@ -1952,11 +1984,7 @@ impl DatabaseManager {
                 name,
                 git_sha
             );
-            if !workdir_matches.is_empty() {
-                return Ok(workdir_matches);
-            }
-            // Fallback: do a regular find to get any available type
-            return Ok(self.find_type(name).await?.into_iter().collect());
+            return self.types_without_revision(name, workdir_matches).await;
         }
 
         // Step 3: Direct targeted search using git hashes
@@ -2147,8 +2175,7 @@ impl DatabaseManager {
                 name,
                 git_sha
             );
-            // Fallback: do a regular find to get any available typedef
-            return self.find_typedef(name).await;
+            return self.typedef_without_revision(name).await;
         }
 
         // Step 3: Direct targeted search using git hashes
