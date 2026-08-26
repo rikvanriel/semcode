@@ -329,68 +329,6 @@ impl FunctionStore {
         Ok(())
     }
 
-    /// Object-like macros and what they expand to.
-    ///
-    /// Stored so a declaration can be read: an identifier where a member name
-    /// would be may be an attribute, and only the expansion says which.
-    pub async fn object_like_macros(&self) -> Result<Vec<(String, String)>> {
-        let table = self.connection.open_table("functions").execute().await?;
-        let batches: Vec<RecordBatch> = table
-            .query()
-            .only_if("return_type = ''")
-            .select(lancedb::query::Select::columns(&["name", "body_hash"]))
-            .execute()
-            .await?
-            .try_collect()
-            .await?;
-
-        let mut named_hashes: Vec<(String, String)> = Vec::new();
-        for batch in &batches {
-            let column = |i: usize| {
-                batch
-                    .column(i)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .expect("string column")
-            };
-            let (names, hashes) = (column(0), column(1));
-            for row in 0..batch.num_rows() {
-                if !hashes.is_null(row) {
-                    named_hashes
-                        .push((names.value(row).to_string(), hashes.value(row).to_string()));
-                }
-            }
-        }
-
-        let hashes: Vec<String> = named_hashes.iter().map(|(_, h)| h.clone()).collect();
-        let bodies = self.bulk_get_content(&hashes).await?;
-
-        let mut macros = Vec::new();
-        for (name, hash) in named_hashes {
-            let Some(definition) = bodies.get(&hash) else {
-                continue;
-            };
-            // `#define` and `# define` are both written, the second inside
-            // conditionals, which is exactly where an attribute macro lives.
-            let directive = definition
-                .trim_start()
-                .strip_prefix('#')
-                .map(str::trim_start);
-            if !directive.is_some_and(|d| d.starts_with("define")) {
-                continue;
-            }
-            // `#define NAME value` -> value, which is what an alias points at
-            // and what carries the attribute.
-            let expansion = definition
-                .split_once(&name)
-                .map(|(_, rest)| rest.trim())
-                .unwrap_or("");
-            macros.push((name, expansion.to_string()));
-        }
-
-        Ok(macros)
-    }
-
     pub async fn find_all_by_name(&self, name: &str) -> Result<Vec<FunctionInfo>> {
         let table = self.connection.open_table("functions").execute().await?;
         let escaped_name = name.replace("'", "''");

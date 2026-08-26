@@ -33,7 +33,7 @@ pub enum OptimizeOutcome {
 /// 4: a registration can be recorded before its container type is known,
 ///    carrying the base and field path instead. A version 3 index has no
 ///    such rows at all: it dropped those registrations.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 pub struct SchemaManager {
     connection: Connection,
@@ -87,6 +87,10 @@ impl SchemaManager {
                 &["container_base_type", "container_field"],
             )
             .await?;
+        }
+
+        if !table_names.iter().any(|n| n == "object_macros") {
+            self.create_object_macros_table().await?;
         }
 
         if !table_names.iter().any(|n| n == "schema_meta") {
@@ -208,6 +212,32 @@ impl SchemaManager {
 
     /// Functions installed in struct members: `.read = my_read`. Resolution
     /// joins these against the members dispatch sites go through.
+    /// Object-like macros that can stand where a member name would.
+    ///
+    /// `struct { ... } __packed;` parses the same as `struct { ... } lru_gen;`,
+    /// so reading a declaration means knowing what the identifier expands to,
+    /// and the expansion is written in another file. Kept with the expansion
+    /// beside the name: the question is asked of the whole set at once, and
+    /// answering it from the functions table means fetching 159,455 macro
+    /// bodies out of the content store — 118,218 file opens for one `type`.
+    async fn create_object_macros_table(&self) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            // What the macro stands for: an attribute outright, or the name of
+            // another macro that leads to one.
+            Field::new("expansion", DataType::Utf8, false),
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("git_file_hash", DataType::Utf8, false),
+        ]));
+
+        self.connection
+            .create_table("object_macros", vec![RecordBatch::new_empty(schema)])
+            .execute()
+            .await?;
+
+        Ok(())
+    }
+
     pub async fn create_registrations_table(&self) -> Result<()> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("container_type", DataType::Utf8, false),
