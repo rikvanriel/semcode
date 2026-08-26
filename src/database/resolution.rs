@@ -285,14 +285,55 @@ pub fn group_by_member(sites: Vec<DispatchSite>) -> HashMap<String, Vec<Dispatch
 
 /// Keep only rows whose file is at the revision being queried, the same way
 /// function lookups do.
-pub fn at_revision<T, F>(rows: Vec<T>, manifest: &HashMap<String, String>, key: F) -> Vec<T>
+/// The content each path holds at a revision, as the working tree shows it.
+///
+/// A revision is not a filter a query may apply and may skip: it decides
+/// which rows are answers at all. Giving it a type means a lookup cannot be
+/// written without one, and means how the paths are obtained — a whole-tree
+/// walk, a lookup per path, or the index itself — is a property of this value
+/// rather than of every caller.
+#[derive(Debug, Default, Clone)]
+pub struct RevisionPaths {
+    paths: HashMap<String, String>,
+}
+
+impl RevisionPaths {
+    /// Paths already resolved, with the working tree's answer preferred.
+    pub fn from_map(paths: HashMap<String, String>) -> Self {
+        Self { paths }
+    }
+
+    /// The content this path holds, or None when the revision does not have
+    /// it. None is an answer: the row that named this path is not in this
+    /// tree.
+    pub fn hash_of(&self, path: &str) -> Option<&str> {
+        self.paths.get(path).map(String::as_str)
+    }
+
+    /// Whether nothing at all resolved, which says the revision could not be
+    /// established rather than that the tree is empty.
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.paths.len()
+    }
+
+    /// The paths as a map, for the callers that still hand one to git.
+    pub fn as_map(&self) -> &HashMap<String, String> {
+        &self.paths
+    }
+}
+
+pub fn at_revision<T, F>(rows: Vec<T>, paths: &RevisionPaths, key: F) -> Vec<T>
 where
     F: Fn(&T) -> (&str, &str),
 {
     rows.into_iter()
         .filter(|row| {
             let (file, hash) = key(row);
-            manifest.get(file).map(|h| h == hash).unwrap_or(false)
+            paths.hash_of(file).map(|h| h == hash).unwrap_or(false)
         })
         .collect()
 }

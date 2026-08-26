@@ -33,7 +33,7 @@ pub const OPTIMAL_BATCH_SIZE: usize = 65536;
 
 /// A revision's file manifest: path to blob id, shared because building one
 /// walks the whole tree.
-type GitManifest = std::sync::Arc<std::collections::HashMap<String, String>>;
+type GitManifest = std::sync::Arc<crate::database::resolution::RevisionPaths>;
 
 pub struct DatabaseManager {
     connection: Connection,
@@ -887,7 +887,7 @@ impl DatabaseManager {
     async fn resolve_chained_registrations(
         &self,
         registrations: &mut [crate::types::Registration],
-        manifest: &std::collections::HashMap<String, String>,
+        manifest: &crate::database::resolution::RevisionPaths,
     ) -> Result<()> {
         let mut resolved: std::collections::HashMap<(String, String), Option<String>> =
             std::collections::HashMap::new();
@@ -939,7 +939,7 @@ impl DatabaseManager {
         &self,
         container_name: &str,
         field: &str,
-        manifest: &std::collections::HashMap<String, String>,
+        manifest: &crate::database::resolution::RevisionPaths,
     ) -> Result<Option<String>> {
         use crate::database::resolution::{aggregate_of, at_revision};
 
@@ -1103,7 +1103,7 @@ impl DatabaseManager {
     async fn type_chained_receivers(
         &self,
         sites: &mut [crate::types::DispatchSite],
-        manifest: &std::collections::HashMap<String, String>,
+        manifest: &crate::database::resolution::RevisionPaths,
     ) -> Result<()> {
         let mut resolved: std::collections::HashMap<(String, String), Option<String>> =
             std::collections::HashMap::new();
@@ -1380,7 +1380,7 @@ impl DatabaseManager {
     pub async fn find_function_with_manifest(
         &self,
         name: &str,
-        git_manifest: &std::collections::HashMap<String, String>,
+        git_manifest: &crate::database::resolution::RevisionPaths,
     ) -> Result<Option<FunctionInfo>> {
         // Step 1: Get candidate file paths from symbol_filename table
         let unique_file_paths = self
@@ -1394,8 +1394,8 @@ impl DatabaseManager {
         // Step 2: Use manifest to get hashes for candidate files (fast HashMap lookups)
         let mut resolved_hashes = Vec::new();
         for file_path in &unique_file_paths {
-            if let Some(hash) = git_manifest.get(file_path) {
-                resolved_hashes.push((file_path.clone(), hash.clone()));
+            if let Some(hash) = git_manifest.hash_of(file_path) {
+                resolved_hashes.push((file_path.clone(), hash.to_string()));
             }
         }
 
@@ -1429,7 +1429,7 @@ impl DatabaseManager {
     pub async fn get_function_types_with_manifest(
         &self,
         name: &str,
-        git_manifest: &std::collections::HashMap<String, String>,
+        git_manifest: &crate::database::resolution::RevisionPaths,
     ) -> Result<Vec<String>> {
         // Query functions table directly - only read the columns we need
         let escaped_name = name.replace("'", "''");
@@ -1487,7 +1487,7 @@ impl DatabaseManager {
                     let git_file_hash = git_file_hash_array.value(i);
 
                     // Check if this function exists at the target git SHA
-                    if let Some(expected_hash) = git_manifest.get(file_path) {
+                    if let Some(expected_hash) = git_manifest.hash_of(file_path) {
                         if git_file_hash == expected_hash {
                             // Parse the types JSON
                             let types = if types_array.is_null(i) {
@@ -2420,7 +2420,7 @@ impl DatabaseManager {
                     if self.workdir_is_dirty(path) || self.workdir_is_deleted(path) {
                         continue;
                     }
-                    if git_manifest.get(path).map(String::as_str) != Some(hashes.value(row)) {
+                    if git_manifest.hash_of(path) != Some(hashes.value(row)) {
                         continue;
                     }
                     let identity = format!(
@@ -2484,7 +2484,7 @@ impl DatabaseManager {
                         if self.workdir_is_dirty(path) || self.workdir_is_deleted(path) {
                             continue;
                         }
-                        if git_manifest.get(path).map(String::as_str) != Some(hashes.value(row)) {
+                        if git_manifest.hash_of(path) != Some(hashes.value(row)) {
                             continue;
                         }
                         if types.is_null(row) {
@@ -4023,7 +4023,7 @@ impl DatabaseManager {
         for func in &all_matching_functions {
             // Check if this function's file SHA matches the git manifest
             if let Some(expected_hash) = resolved_hashes.get(&func.file_path) {
-                if &func.git_file_hash == expected_hash {
+                if func.git_file_hash == *expected_hash {
                     if limit > 0 && git_filtered_functions.len() >= limit {
                         limit_hit = true;
                         break;
@@ -4183,8 +4183,8 @@ impl DatabaseManager {
         for caller_name in &all_callers {
             if let Some(func) = caller_functions.get(caller_name).and_then(|f| f.first()) {
                 // Check if this function's file SHA matches the git manifest
-                if let Some(expected_hash) = git_manifest.get(&func.file_path) {
-                    if &func.git_file_hash == expected_hash {
+                if let Some(expected_hash) = git_manifest.hash_of(&func.file_path) {
+                    if func.git_file_hash == expected_hash {
                         valid_callers.push(func.clone());
                         tracing::debug!(
                             "Valid caller: {} in {} (hash: {})",
@@ -4260,7 +4260,7 @@ impl DatabaseManager {
     pub async fn generate_git_manifest(
         &self,
         git_sha: &str,
-    ) -> Result<std::collections::HashMap<String, String>> {
+    ) -> Result<crate::database::resolution::RevisionPaths> {
         let mut manifest = std::collections::HashMap::new();
 
         // Use shared tree traversal utility
@@ -4276,7 +4276,9 @@ impl DatabaseManager {
         )?;
 
         // Merge with workdir overlay (adds dirty files, removes deleted files)
-        Ok(self.workdir_merged_manifest(manifest))
+        Ok(crate::database::resolution::RevisionPaths::from_map(
+            self.workdir_merged_manifest(manifest),
+        ))
     }
 
     /// Fallback callers search when not in git repository
@@ -4371,7 +4373,7 @@ impl DatabaseManager {
     async fn function_exists_in_manifest(
         &self,
         function_name: &str,
-        git_manifest: &std::collections::HashMap<String, String>,
+        git_manifest: &crate::database::resolution::RevisionPaths,
     ) -> Result<bool> {
         // Get all functions with this name (non-git-aware, fast database query)
         let all_functions = self
@@ -4381,8 +4383,8 @@ impl DatabaseManager {
 
         // Check if any function exists in the git manifest (fast HashMap lookup)
         for func in &all_functions {
-            if let Some(expected_hash) = git_manifest.get(&func.file_path) {
-                if &func.git_file_hash == expected_hash {
+            if let Some(expected_hash) = git_manifest.hash_of(&func.file_path) {
+                if func.git_file_hash == expected_hash {
                     return Ok(true);
                 }
             }
@@ -4395,7 +4397,7 @@ impl DatabaseManager {
     pub async fn get_function_callees_with_manifest(
         &self,
         function_name: &str,
-        git_manifest: &std::collections::HashMap<String, String>,
+        git_manifest: &crate::database::resolution::RevisionPaths,
     ) -> Result<Vec<String>> {
         // Query functions table directly - efficient, doesn't fetch bodies
         let escaped_name = function_name.replace("'", "''");
@@ -4453,7 +4455,7 @@ impl DatabaseManager {
                     let git_file_hash = git_file_hash_array.value(i);
 
                     // Fast manifest lookup
-                    if let Some(expected_hash) = git_manifest.get(file_path) {
+                    if let Some(expected_hash) = git_manifest.hash_of(file_path) {
                         if git_file_hash == expected_hash {
                             // Parse the calls JSON
                             let calls = if calls_array.is_null(i) {
@@ -4499,7 +4501,7 @@ impl DatabaseManager {
     /// This is much faster than doing N separate LIKE queries for N functions.
     pub async fn build_caller_index_with_manifest(
         &self,
-        git_manifest: &std::collections::HashMap<String, String>,
+        git_manifest: &crate::database::resolution::RevisionPaths,
     ) -> Result<std::collections::HashMap<String, Vec<String>>> {
         let start = std::time::Instant::now();
         let table = self.connection.open_table("functions").execute().await?;
@@ -4551,7 +4553,7 @@ impl DatabaseManager {
                     let git_file_hash = git_file_hash_array.value(i);
 
                     // Only include functions that exist at the current git commit
-                    if let Some(expected_hash) = git_manifest.get(file_path) {
+                    if let Some(expected_hash) = git_manifest.hash_of(file_path) {
                         if git_file_hash == expected_hash {
                             let caller_name = name_array.value(i);
                             if !calls_array.is_null(i) {
@@ -4582,7 +4584,7 @@ impl DatabaseManager {
     pub async fn get_function_callers_with_manifest(
         &self,
         function_name: &str,
-        git_manifest: &std::collections::HashMap<String, String>,
+        git_manifest: &crate::database::resolution::RevisionPaths,
     ) -> Result<Vec<String>> {
         // Use efficient filtering: find functions whose calls JSON contains the target function name
         let escaped_name = function_name.replace("'", "''"); // SQL escape
@@ -4637,8 +4639,8 @@ impl DatabaseManager {
                     let git_file_hash = git_file_hash_array.value(i).to_string();
 
                     // Fast manifest lookup instead of expensive git resolution
-                    if let Some(expected_hash) = git_manifest.get(file_path) {
-                        if &git_file_hash == expected_hash {
+                    if let Some(expected_hash) = git_manifest.hash_of(file_path) {
+                        if git_file_hash == expected_hash {
                             // This function exists at the git SHA, verify it actually calls our target
                             if !calls_array.is_null(i) {
                                 let calls_json = calls_array.value(i);
