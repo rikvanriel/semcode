@@ -22,10 +22,14 @@ use crate::database::types::{TypeStore, TypedefStore};
 use crate::database::content::{ContentInfo, ContentStore};
 use crate::database::processed_files::{ProcessedFileRecord, ProcessedFileStore};
 use crate::database::vectors::VectorStore;
+use crate::treesitter_analyzer::TreeSitterAnalyzer;
 use crate::types::{FunctionInfo, TypeInfo, TypedefInfo};
 use crate::vectorizer::CodeVectorizer;
 use crate::workdir::WorkdirIndex;
+use crate::worktree::{WorkingCopy, WorkingCopyHashes};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 // Optimal batch size for LanceDB operations
@@ -33,7 +37,110 @@ pub const OPTIMAL_BATCH_SIZE: usize = 65536;
 
 /// A revision's file manifest: path to blob id, shared because building one
 /// walks the whole tree.
-type GitManifest = std::sync::Arc<std::collections::HashMap<String, String>>;
+type GitManifest = std::sync::Arc<crate::database::resolution::RevisionPaths>;
+
+/// Why a revision cannot account for a symbol. The answer is the same in all
+/// three cases; the reason is what tells an index that does not have the tree
+/// apart from a symbol that is not in it.
+#[derive(Copy, Clone)]
+enum Absent {
+    /// The revision itself did not resolve, so no path could be looked up in
+    /// it. Either the repository does not have that commit or git failed.
+    RevisionUnknown,
+    /// The files the symbol lives in are not in that tree.
+    PathsNotInTree,
+    /// The files are in the tree, holding content no indexed row has.
+    ContentNotIndexed,
+}
+
+impl Absent {
+    fn reason(self) -> &'static str {
+        match self {
+            Absent::RevisionUnknown => "the revision did not resolve",
+            Absent::PathsNotInTree => "its files are not in that tree",
+            Absent::ContentNotIndexed => "no indexed row holds the content that tree has",
+        }
+    }
+}
+
+/// What a candidate file holds against the blob hash a query is checking it
+/// against — the row's, or the tree's at the revision asked about. Answering
+/// `Indexed` costs a stat; the other two cost a stat and a hash, of one file,
+/// never a walk of files the query did not name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateFile {
+    /// The disk holds exactly the expected hash: the indexed row is current.
+    Indexed,
+    /// The disk holds something else: an uncommitted edit on top of it.
+    Edited,
+    /// There is no file here any more.
+    Deleted,
+}
+
+/// Where a name's rows do live, for the line that reports it absent.
+///
+/// A revision with no branch is normal: the index records commits it read,
+/// and only some of them were branch tips.
+fn describe_revisions(
+    revisions: &[String],
+    branches: &[crate::database::branches::IndexedBranchInfo],
+) -> String {
+    let revs: Vec<&str> = revisions
+        .iter()
+        .map(|r| &r[..r.len().min(12)])
+        .take(4)
+        .collect();
+    let more = revisions.len().saturating_sub(revs.len());
+    let at = if more > 0 {
+        format!("{} and {} more", revs.join(", "), more)
+    } else {
+        revs.join(", ")
+    };
+    if branches.is_empty() {
+        return format!("its rows are at {at}, on no indexed branch");
+    }
+    let names: Vec<&str> = branches.iter().map(|b| b.branch_name.as_str()).collect();
+    format!("its rows are at {at}, on {}", names.join(", "))
+}
+
+/// The same, for an index that cannot name a revision: the files the rows
+/// came from and the content they carry. `processed_files` holds a revision
+/// only when the indexer was given one, so this is what most indexes can
+/// say, and it is enough to tell a caller which tree to look in.
+fn describe_files(places: &[(String, String)]) -> String {
+    let mut seen = HashSet::new();
+    let mut described = Vec::new();
+    for (path, hash) in places {
+        if !seen.insert(path) {
+            continue;
+        }
+        if described.len() < 3 {
+            described.push(format!("{path} (blob {})", &hash[..hash.len().min(12)]));
+        }
+    }
+    if described.is_empty() {
+        return "the index has no row for it".to_string();
+    }
+    let more = seen.len().saturating_sub(described.len());
+    if more > 0 {
+        format!("its rows are in {}, and {more} more", described.join(", "))
+    } else {
+        format!("its rows are in {}", described.join(", "))
+    }
+}
+
+/// One line per absence, because an answer that is missing says nothing. An
+/// unresolvable revision is the operator's problem and warns; a symbol that
+/// is simply not in the tree is an answer and informs.
+fn log_absence(kind: &str, name: &str, git_sha: &str, why: Absent, elsewhere: &str) {
+    let reason = why.reason();
+    match why {
+        Absent::RevisionUnknown => {
+            tracing::warn!("{kind} '{name}' is not answered for {git_sha}: {reason}; {elsewhere}")
+        }
+        _ => tracing::info!("{kind} '{name}' is not at {git_sha}: {reason}; {elsewhere}"),
+    }
+}
 
 pub struct DatabaseManager {
     connection: Connection,
@@ -56,6 +163,27 @@ pub struct DatabaseManager {
     manifest_cache: std::sync::RwLock<Option<(String, GitManifest)>>,
     /// Identifiers that are compiler attributes, read once per process.
     attribute_names: std::sync::OnceLock<Arc<HashSet<String>>>,
+    /// Hashes of working-copy files a query has already looked at, memoised
+    /// on (size, mtime) so a name asked about twice reads its file once.
+    /// This is what a query stats instead of the working tree.
+    working_copy: WorkingCopyHashes,
+    /// Set when the caller has said it will not be editing: skip the
+    /// per-candidate stat entirely and trust every row, the way `--git-only`
+    /// always has.
+    git_only: AtomicBool,
+    /// Bumped by a long-lived caller (the REPL) once per top-level command,
+    /// so `ensure_workdir_index_built` can tell "asked again within the
+    /// command that just built this" (several `_git_aware` calls in one
+    /// `func` — cheap, must stay a no-op) from "asked again in a later
+    /// command" (a REPL user had a chance to edit a file in between — must
+    /// refresh). A caller that never calls `note_repl_command` (MCP, LSP,
+    /// `-q`) leaves this at 0 forever, which builds the overlay once and
+    /// reuses it — right for a caller with no prompt to edit a file at.
+    workdir_command_generation: AtomicU64,
+    /// The command generation the current `workdir_index` was last built or
+    /// refreshed for. `u64::MAX` means "never built", so the first build on
+    /// generation 0 is not mistaken for already-current.
+    workdir_index_generation: AtomicU64,
 }
 
 impl DatabaseManager {
@@ -90,7 +218,66 @@ impl DatabaseManager {
             workdir_index: std::sync::RwLock::new(None),
             manifest_cache: std::sync::RwLock::new(None),
             attribute_names: std::sync::OnceLock::new(),
+            working_copy: WorkingCopyHashes::new(),
+            git_only: AtomicBool::new(false),
+            workdir_command_generation: AtomicU64::new(0),
+            workdir_index_generation: AtomicU64::new(u64::MAX),
         })
+    }
+
+    /// Mark the start of a new top-level command, so the next lookup that
+    /// needs the working-copy overlay treats it as due for a freshness
+    /// check instead of reusing whatever the previous command already built
+    /// or refreshed — an edit made between two REPL commands becomes visible
+    /// to the first overlay-consuming call in the next one. Call once per
+    /// command read from the prompt, before dispatching it; calling it more
+    /// than once for the same command only costs one extra refresh, calling
+    /// it not at all builds the overlay once and reuses it (see
+    /// `workdir_command_generation`'s doc comment).
+    pub fn note_repl_command(&self) {
+        self.workdir_command_generation
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Say the caller will not be editing: candidate files are trusted
+    /// without a stat, and the working-tree overlay is never built, on-miss
+    /// or otherwise. Matches the REPL's `--git-only`.
+    pub fn set_git_only(&self, git_only: bool) {
+        self.git_only.store(git_only, Ordering::Relaxed);
+    }
+
+    fn is_git_only(&self) -> bool {
+        self.git_only.load(Ordering::Relaxed)
+    }
+
+    /// Whether `git_sha` is the commit currently checked out — the only
+    /// relationship in which the working copy can answer for it. A query
+    /// naming an explicit SHA or branch other than what is checked out has
+    /// no such relationship: the file on disk is some other, unrelated
+    /// version, and comparing it against a blob from that revision would
+    /// manufacture an edit out of an unrelated diff — the wrong-branch
+    /// answer this code exists to prevent, reappearing through the
+    /// working-copy overlay instead of the index. A ref read, not a walk of
+    /// anything, and cheap enough to ask every time rather than trust a
+    /// caller to remember to say so.
+    fn is_checked_out(&self, git_sha: &str) -> bool {
+        if git_sha.is_empty() {
+            return false;
+        }
+        match gix::discover(&self.git_repo_path) {
+            Ok(repo) => repo
+                .head_commit()
+                .map(|c| c.id().to_string() == git_sha)
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
+    /// Whether the working-copy overlay may be consulted for a query naming
+    /// `git_sha`: the caller has not opted out (`git_only`), and the working
+    /// copy actually represents that revision.
+    fn workdir_overlay_usable(&self, git_sha: &str) -> bool {
+        !self.is_git_only() && self.is_checked_out(git_sha)
     }
 
     pub async fn list_tables(&self) -> Result<Vec<String>> {
@@ -153,6 +340,14 @@ impl DatabaseManager {
         self.schema_manager
             .set_index_build(extensions, no_macros)
             .await
+    }
+
+    pub async fn record_tree_sha(&self, sha: &str) -> Result<()> {
+        self.schema_manager.set_tree_sha(sha).await
+    }
+
+    pub async fn recorded_tree_sha(&self) -> Result<Option<String>> {
+        self.schema_manager.meta_value("index:tree_sha").await
     }
 
     /// How the index was built: the extensions indexed, and whether macros
@@ -887,7 +1082,7 @@ impl DatabaseManager {
     async fn resolve_chained_registrations(
         &self,
         registrations: &mut [crate::types::Registration],
-        manifest: &std::collections::HashMap<String, String>,
+        manifest: &crate::database::resolution::RevisionPaths,
     ) -> Result<()> {
         let mut resolved: std::collections::HashMap<(String, String), Option<String>> =
             std::collections::HashMap::new();
@@ -939,7 +1134,7 @@ impl DatabaseManager {
         &self,
         container_name: &str,
         field: &str,
-        manifest: &std::collections::HashMap<String, String>,
+        manifest: &crate::database::resolution::RevisionPaths,
     ) -> Result<Option<String>> {
         use crate::database::resolution::{aggregate_of, at_revision};
 
@@ -1103,7 +1298,7 @@ impl DatabaseManager {
     async fn type_chained_receivers(
         &self,
         sites: &mut [crate::types::DispatchSite],
-        manifest: &std::collections::HashMap<String, String>,
+        manifest: &crate::database::resolution::RevisionPaths,
     ) -> Result<()> {
         let mut resolved: std::collections::HashMap<(String, String), Option<String>> =
             std::collections::HashMap::new();
@@ -1181,15 +1376,98 @@ impl DatabaseManager {
     }
 
     // --- Workdir overlay helpers ---
+    //
+    // Two mechanisms, not one. `candidate_state` answers for a single named
+    // file with a stat and, on a mismatch, a hash, which is what a
+    // name-keyed answer runs on. The `workdir_*` helpers below it still consult a full
+    // `WorkdirIndex`, built by walking every tracked file, for the queries a
+    // name cannot bound in advance (regex, grep, callers) and for the
+    // on-miss fallback (a symbol with no row at all). `ensure_workdir_index_built`
+    // is what makes that walk lazy: the first of these helpers actually
+    // consulted in a process builds it, once, instead of every command
+    // building it whether asked for or not — and keeps it current across
+    // the top-level commands of one REPL session rather than
+    // freezing it at whatever the working tree held on that first build.
+
+    /// Build the working-copy overlay for `git_sha` if nothing has this
+    /// process yet, unless it is unusable for it (see
+    /// `workdir_overlay_usable`); refresh it, at most once per top-level
+    /// command (see `workdir_command_generation`'s doc comment), if it
+    /// already exists.
+    ///
+    /// A naive "refresh whenever asked" is wrong here: a single `func`
+    /// command calls both `get_function_callees_git_aware` and
+    /// `get_function_callers_git_aware`, each of which reaches this through
+    /// its own `workdir_find_*` helper, so an unconditional refresh would
+    /// walk the tracked-file set twice for one command instead of once —
+    /// measured while building this patch: 266,533 statx for `help; func
+    /// alloc_super; help` against ~131,489 for a single build, because the
+    /// second call inside the same `func` command refreshed instead of
+    /// reusing. Gating on the command generation fixes that: every call
+    /// within one command sees the same generation and reuses; the first
+    /// call in the *next* command sees a new one and refreshes through
+    /// `build_incremental`'s own cache (HEAD SHA plus per-file mtime/size,
+    /// the mechanism `test_incremental_reuses_cache` in workdir.rs covers
+    /// directly) — a stat of each tracked file, not a re-read or a re-parse
+    /// of the ones that have not changed. A command that never touches this
+    /// path (`help` on its own) still never pays either cost.
+    fn ensure_workdir_index_built(&self, git_sha: &str) {
+        if !self.workdir_overlay_usable(git_sha) {
+            return;
+        }
+        let current_generation = self.workdir_command_generation.load(Ordering::Relaxed);
+        let built_for_generation = self
+            .workdir_index_generation
+            .swap(current_generation, Ordering::Relaxed);
+        if built_for_generation == current_generation && self.has_workdir_index() {
+            return;
+        }
+        let repo_path = Path::new(&self.git_repo_path);
+        let (built, refreshing) = {
+            let guard = self.workdir_index.read().unwrap();
+            let refreshing = guard.is_some();
+            (
+                WorkdirIndex::build_incremental(repo_path, guard.as_ref()),
+                refreshing,
+            )
+        };
+        match built {
+            Ok(workdir) => {
+                tracing::info!(
+                    "workdir: {} overlay: {} dirty, {} deleted, {} functions, {} types",
+                    if refreshing {
+                        "refreshed"
+                    } else {
+                        "built on demand"
+                    },
+                    workdir.dirty_file_count(),
+                    workdir.deleted_file_count(),
+                    workdir.function_count(),
+                    workdir.type_count(),
+                );
+                self.set_workdir_index(workdir);
+            }
+            Err(e) => tracing::info!(
+                "workdir: could not {} overlay: {e}",
+                if refreshing {
+                    "refresh"
+                } else {
+                    "build on demand"
+                }
+            ),
+        }
+    }
 
     /// Look up a function in the workdir overlay (if set).
-    fn workdir_find_function(&self, name: &str) -> Option<FunctionInfo> {
+    fn workdir_find_function(&self, name: &str, git_sha: &str) -> Option<FunctionInfo> {
+        self.ensure_workdir_index_built(git_sha);
         let guard = self.workdir_index.read().unwrap();
         guard.as_ref().and_then(|w| w.find_function(name).cloned())
     }
 
     /// Look up all functions matching a name in the workdir overlay.
-    fn workdir_find_all_functions(&self, name: &str) -> Vec<FunctionInfo> {
+    fn workdir_find_all_functions(&self, name: &str, git_sha: &str) -> Vec<FunctionInfo> {
+        self.ensure_workdir_index_built(git_sha);
         let guard = self.workdir_index.read().unwrap();
         guard
             .as_ref()
@@ -1198,7 +1476,8 @@ impl DatabaseManager {
     }
 
     /// Look up all types matching a name in the workdir overlay.
-    fn workdir_find_all_types(&self, name: &str) -> Vec<TypeInfo> {
+    fn workdir_find_all_types(&self, name: &str, git_sha: &str) -> Vec<TypeInfo> {
+        self.ensure_workdir_index_built(git_sha);
         let guard = self.workdir_index.read().unwrap();
         guard
             .as_ref()
@@ -1207,7 +1486,8 @@ impl DatabaseManager {
     }
 
     /// Find callers in the workdir overlay.
-    fn workdir_find_callers(&self, name: &str) -> Vec<FunctionInfo> {
+    fn workdir_find_callers(&self, name: &str, git_sha: &str) -> Vec<FunctionInfo> {
+        self.ensure_workdir_index_built(git_sha);
         let guard = self.workdir_index.read().unwrap();
         guard
             .as_ref()
@@ -1216,7 +1496,8 @@ impl DatabaseManager {
     }
 
     /// Find callees in the workdir overlay.
-    fn workdir_find_callees(&self, name: &str) -> Option<Vec<String>> {
+    fn workdir_find_callees(&self, name: &str, git_sha: &str) -> Option<Vec<String>> {
+        self.ensure_workdir_index_built(git_sha);
         let guard = self.workdir_index.read().unwrap();
         guard.as_ref().and_then(|w| w.find_callees(name))
     }
@@ -1226,7 +1507,9 @@ impl DatabaseManager {
         &self,
         pattern: &str,
         path_pattern: Option<&str>,
+        git_sha: &str,
     ) -> Vec<FunctionInfo> {
+        self.ensure_workdir_index_built(git_sha);
         let guard = self.workdir_index.read().unwrap();
         guard
             .as_ref()
@@ -1240,7 +1523,8 @@ impl DatabaseManager {
     }
 
     /// Regex search for functions in the workdir overlay.
-    fn workdir_find_functions_regex(&self, pattern: &str) -> Vec<FunctionInfo> {
+    fn workdir_find_functions_regex(&self, pattern: &str, git_sha: &str) -> Vec<FunctionInfo> {
+        self.ensure_workdir_index_built(git_sha);
         let guard = self.workdir_index.read().unwrap();
         guard
             .as_ref()
@@ -1254,7 +1538,8 @@ impl DatabaseManager {
     }
 
     /// Regex search for types in the workdir overlay.
-    fn workdir_find_types_regex(&self, pattern: &str) -> Vec<TypeInfo> {
+    fn workdir_find_types_regex(&self, pattern: &str, git_sha: &str) -> Vec<TypeInfo> {
+        self.ensure_workdir_index_built(git_sha);
         let guard = self.workdir_index.read().unwrap();
         guard
             .as_ref()
@@ -1263,17 +1548,110 @@ impl DatabaseManager {
     }
 
     /// Check if a file is deleted in the workdir overlay.
-    fn workdir_is_deleted(&self, file_path: &str) -> bool {
+    fn workdir_is_deleted(&self, file_path: &str, git_sha: &str) -> bool {
+        self.ensure_workdir_index_built(git_sha);
         let guard = self.workdir_index.read().unwrap();
         guard.as_ref().is_some_and(|w| w.is_deleted(file_path))
     }
 
-    fn workdir_is_dirty(&self, file_path: &str) -> bool {
+    fn workdir_is_dirty(&self, file_path: &str, git_sha: &str) -> bool {
+        self.ensure_workdir_index_built(git_sha);
         let guard = self.workdir_index.read().unwrap();
         guard.as_ref().is_some_and(|w| w.is_dirty(file_path))
     }
 
+    fn workdir_dirty_count(&self, git_sha: &str) -> usize {
+        self.ensure_workdir_index_built(git_sha);
+        let guard = self.workdir_index.read().unwrap();
+        guard.as_ref().map_or(0, |w| w.dirty_file_count())
+    }
+
+    /// What one candidate file — a path a query already named, with the blob
+    /// hash its row (or the tree) says belongs there — currently holds. The
+    /// primitive a common query runs on: a stat, and only on a
+    /// mismatch a hash, of the handful of files a name-keyed lookup touches,
+    /// never a walk of the tree the query did not ask about. `git_sha` gates
+    /// it on `is_checked_out`: comparing the working copy against a blob
+    /// from a revision it does not represent would answer for the wrong one.
+    fn candidate_state(
+        &self,
+        file_path: &str,
+        expected_hash: &str,
+        git_sha: &str,
+    ) -> CandidateFile {
+        if !self.workdir_overlay_usable(git_sha) {
+            return CandidateFile::Indexed;
+        }
+        let abs_path = Path::new(&self.git_repo_path).join(file_path);
+        match self.working_copy.compare(&abs_path, expected_hash) {
+            Ok(WorkingCopy::Same) => CandidateFile::Indexed,
+            Ok(WorkingCopy::Different) => CandidateFile::Edited,
+            Ok(WorkingCopy::Absent) => CandidateFile::Deleted,
+            Err(e) => {
+                // A stat that fails for a reason other than "not found" (a
+                // permission error, say) is not evidence the file changed;
+                // trust the row rather than manufacture an edit or a
+                // deletion from an I/O error.
+                tracing::debug!("workdir: could not stat {file_path}: {e}");
+                CandidateFile::Indexed
+            }
+        }
+    }
+
+    /// Read and parse one file from the working copy, hashed the same way a
+    /// row's `git_file_hash` is — a git blob id, not the workdir index's
+    /// internal blake3 — so the result is indistinguishable from a row to
+    /// whatever compares it against one.
+    fn reparse_file(&self, file_path: &str) -> Option<crate::treesitter_analyzer::FileAnalysis> {
+        let abs_path = Path::new(&self.git_repo_path).join(file_path);
+        let content = std::fs::read_to_string(&abs_path).ok()?;
+        let hash = self.working_copy.blob_id_of(&abs_path).ok().flatten()?;
+        let mut analyzer = TreeSitterAnalyzer::new().ok()?;
+        let source_root = Some(Path::new(&self.git_repo_path));
+        match analyzer.analyze_source_with_metadata(
+            &content,
+            Path::new(file_path),
+            &hash,
+            source_root,
+        ) {
+            Ok(analysis) => Some(analysis),
+            Err(e) => {
+                tracing::info!("workdir: failed to re-parse {file_path}: {e}");
+                None
+            }
+        }
+    }
+
+    /// The functions and macros named `name` in one edited candidate file —
+    /// the answer for `CandidateFile::Edited`, without building an index over
+    /// anything the query did not name.
+    fn reparse_functions(&self, file_path: &str, name: &str) -> Vec<FunctionInfo> {
+        let Some(analysis) = self.reparse_file(file_path) else {
+            return Vec::new();
+        };
+        analysis
+            .functions
+            .into_iter()
+            .chain(analysis.macros)
+            .filter(|f| f.name.eq_ignore_ascii_case(name))
+            .collect()
+    }
+
+    /// The same, for a type or typedef name (typedefs are extracted into
+    /// `types` with `kind = "typedef"`, the way the indexer stores them).
+    fn reparse_types(&self, file_path: &str, name: &str) -> Vec<TypeInfo> {
+        let Some(analysis) = self.reparse_file(file_path) else {
+            return Vec::new();
+        };
+        analysis
+            .types
+            .into_iter()
+            .filter(|t| t.name.eq_ignore_ascii_case(name))
+            .collect()
+    }
+
     /// Merge a HEAD manifest with workdir dirty/deleted state.
+    #[allow(dead_code)]
     fn workdir_merged_manifest(
         &self,
         head_manifest: std::collections::HashMap<String, String>,
@@ -1283,6 +1661,201 @@ impl DatabaseManager {
             Some(w) => w.merged_manifest(&head_manifest),
             None => head_manifest,
         }
+    }
+
+    /// The answer when the requested revision cannot be mapped onto the files
+    /// a symbol lives in: the paths do not exist at that revision, the
+    /// revision itself does not resolve, or no row carries the content the
+    /// revision holds.
+    ///
+    /// All three say the same thing — the index cannot show the symbol is in
+    /// the tree that was named — so all three answer that it is not there.
+    /// Where its rows do live is logged, from the revisions the index recorded
+    /// for their content.
+    async fn function_not_at_revision(
+        &self,
+        name: &str,
+        git_sha: &str,
+        why: Absent,
+    ) -> Result<Option<FunctionInfo>> {
+        // On-miss scan: a symbol that exists only in an edited file has no
+        // row in the index and no candidate path from symbol_filename. The
+        // eager overlay already answers this before the manifest is built, but
+        // an absence after the manifest has to answer it too, or an edit
+        // would be invisible once the overlay is no longer built eagerly. Scan the overlay here — 197,179 stat calls become a
+        // lookup in a HashMap that is already in memory, ~0.01ms for the four
+        // files a typical query touches against 1.10s for the scan it replaces.
+        if let Some(func) = self.workdir_find_function(name, git_sha) {
+            let dirty = self.workdir_dirty_count(git_sha);
+            tracing::info!(
+                "function '{name}' is not in the index at {git_sha}: {}; but {dirty} dirty file(s) have it — answering from the working tree",
+                why.reason()
+            );
+            return Ok(Some(func));
+        }
+        self.log_absent_function(name, git_sha, why).await;
+        Ok(None)
+    }
+
+    /// The same, for a lookup that returns every match rather than one.
+    async fn functions_not_at_revision(
+        &self,
+        name: &str,
+        git_sha: &str,
+        why: Absent,
+    ) -> Result<Vec<FunctionInfo>> {
+        let workdir_matches = self.workdir_find_all_functions(name, git_sha);
+        if !workdir_matches.is_empty() {
+            let dirty = self.workdir_dirty_count(git_sha);
+            tracing::info!(
+                "function '{name}' is not in the index at {git_sha}: {}; but {dirty} dirty file(s) have {} match(es) — answering from the working tree",
+                why.reason(),
+                workdir_matches.len()
+            );
+            return Ok(self.filter_implementations_only(workdir_matches));
+        }
+        self.log_absent_function(name, git_sha, why).await;
+        Ok(Vec::new())
+    }
+
+    /// The same, for types. A dirty file is part of the revision the caller
+    /// asked about — the tree plus what is on disk — so a match from one is an
+    /// answer for that revision, not a borrowed answer from another.
+    ///
+    /// The candidate-level check in `find_types_git_aware` already answers a
+    /// dirty *known* candidate; this is reached only when no candidate
+    /// existed at all, or none of them held the content indexed — so a match
+    /// here can only come from the on-miss scan, built lazily, once.
+    async fn types_not_at_revision(
+        &self,
+        name: &str,
+        git_sha: &str,
+        why: Absent,
+    ) -> Result<Vec<TypeInfo>> {
+        let on_miss = self.workdir_find_all_types(name, git_sha);
+        if !on_miss.is_empty() {
+            let dirty = self.workdir_dirty_count(git_sha);
+            tracing::info!(
+                "type '{name}' is not in the index at {git_sha}: {}; but {dirty} dirty file(s) have {} match(es) — answering from the working tree (on-miss)",
+                why.reason(),
+                on_miss.len()
+            );
+            return Ok(on_miss);
+        }
+        let place = self
+            .find_type(name)
+            .await?
+            .map(|ty| (ty.file_path, ty.git_file_hash));
+        self.log_absent_symbol("type", name, git_sha, why, place)
+            .await;
+        Ok(Vec::new())
+    }
+
+    /// The same, for typedefs.
+    async fn typedef_not_at_revision(
+        &self,
+        name: &str,
+        git_sha: &str,
+        why: Absent,
+    ) -> Result<Option<TypedefInfo>> {
+        // On-miss scan: typedefs are stored as types in the workdir overlay.
+        // If a dirty file defines a type of the same name, surface that it
+        // exists in the working tree rather than silently returning absence.
+        let on_miss = self.workdir_find_all_types(name, git_sha);
+        if !on_miss.is_empty() {
+            let dirty = self.workdir_dirty_count(git_sha);
+            tracing::info!(
+                "typedef '{name}' is not in the index at {git_sha}: {}; but {dirty} dirty file(s) have a type of the same name — answering from the working tree (on-miss)",
+                why.reason()
+            );
+        }
+        let place = self
+            .find_typedef(name)
+            .await?
+            .map(|td| (td.file_path, td.git_file_hash));
+        self.log_absent_symbol("typedef", name, git_sha, why, place)
+            .await;
+        Ok(None)
+    }
+
+    /// Report a function absent at a revision, naming the revisions its rows
+    /// were indexed at, or the files they came from when the index recorded no
+    /// revision for their content.
+    async fn log_absent_function(&self, name: &str, git_sha: &str, why: Absent) {
+        let elsewhere = match self.symbol_revisions(name).await {
+            Ok((revisions, branches)) if !revisions.is_empty() => {
+                describe_revisions(&revisions, &branches)
+            }
+            Ok(_) => match self.function_store.find_all_by_name_unfiltered(name).await {
+                Ok(rows) => describe_files(
+                    &rows
+                        .into_iter()
+                        .map(|r| (r.file_path, r.git_file_hash))
+                        .collect::<Vec<_>>(),
+                ),
+                Err(e) => format!("the index could not say where it is: {e}"),
+            },
+            Err(e) => format!("the index could not say where it is: {e}"),
+        };
+        log_absence("function", name, git_sha, why, &elsewhere);
+    }
+
+    /// The same for a symbol whose rows are not in the functions table. The
+    /// row is read to describe where its content lives, never to answer with.
+    async fn log_absent_symbol(
+        &self,
+        kind: &str,
+        name: &str,
+        git_sha: &str,
+        why: Absent,
+        place: Option<(String, String)>,
+    ) {
+        let Some((path, hash)) = place else {
+            log_absence(kind, name, git_sha, why, "the index has no row for it");
+            return;
+        };
+        let elsewhere = match self.where_hash_lives(&hash).await {
+            Ok((revisions, branches)) if !revisions.is_empty() => {
+                describe_revisions(&revisions, &branches)
+            }
+            Ok(_) => describe_files(&[(path, hash)]),
+            Err(e) => format!("the index could not say where it is: {e}"),
+        };
+        log_absence(kind, name, git_sha, why, &elsewhere);
+    }
+
+    /// Whether the repository can resolve a revision at all.
+    fn revision_resolves(&self, git_sha: &str) -> bool {
+        match gix::discover(&self.git_repo_path) {
+            Ok(repo) => crate::git::resolve_to_commit(&repo, git_sha).is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// Which absence it is when no path resolved. `resolve_git_file_hashes`
+    /// answers with an empty map both for a path that is not in the tree and
+    /// for a git failure, so ask the repository which one happened. Only
+    /// reached on the absence path, so the extra `gix::discover` is not on any
+    /// answer's way.
+    fn why_nothing_resolved(&self, git_sha: &str) -> Absent {
+        if self.revision_resolves(git_sha) {
+            Absent::PathsNotInTree
+        } else {
+            Absent::RevisionUnknown
+        }
+    }
+
+    /// The revisions and branches that hold one file blob.
+    async fn where_hash_lives(
+        &self,
+        hash: &str,
+    ) -> Result<(
+        Vec<String>,
+        Vec<crate::database::branches::IndexedBranchInfo>,
+    )> {
+        let revisions = self.revisions_for_file_hash(hash).await?;
+        let branches = self.branches_for_file_hash(hash).await?;
+        Ok((revisions, branches))
     }
 
     /// Find a function by name without git awareness (non-git-aware)
@@ -1319,18 +1892,10 @@ impl DatabaseManager {
         name: &str,
         git_sha: &str,
     ) -> Result<Option<FunctionInfo>> {
-        // Check workdir overlay first — if the function is in a dirty file, return it
-        if let Some(func) = self.workdir_find_function(name) {
-            return Ok(Some(func));
-        }
         let git_manifest = self.git_manifest_cached(git_sha).await?;
         if git_manifest.is_empty() {
-            tracing::info!(
-                "No files resolved for '{}' at commit '{}' - falling back to non-git lookup",
-                name,
-                git_sha
-            );
-            return self.find_function(name).await;
+            let why = self.why_nothing_resolved(git_sha);
+            return self.function_not_at_revision(name, git_sha, why).await;
         }
         self.find_function_with_manifest(name, &git_manifest).await
     }
@@ -1339,46 +1904,67 @@ impl DatabaseManager {
     pub async fn find_function_with_manifest(
         &self,
         name: &str,
-        git_manifest: &std::collections::HashMap<String, String>,
+        git_manifest: &crate::database::resolution::RevisionPaths,
     ) -> Result<Option<FunctionInfo>> {
+        let revision = match git_manifest.revision() {
+            "" => "the revision asked about",
+            sha => sha,
+        };
+
         // Step 1: Get candidate file paths from symbol_filename table
         let unique_file_paths = self
             .symbol_filename_store
             .get_filenames_for_symbol(name)
             .await?;
         if unique_file_paths.is_empty() {
-            return Ok(None);
+            // No row has ever named this function: the on-miss path is the
+            // only one that can still find it, in an edit the index has
+            // never seen.
+            return self
+                .function_not_at_revision(name, revision, Absent::PathsNotInTree)
+                .await;
         }
 
         // Step 2: Use manifest to get hashes for candidate files (fast HashMap lookups)
         let mut resolved_hashes = Vec::new();
         for file_path in &unique_file_paths {
-            if let Some(hash) = git_manifest.get(file_path) {
-                resolved_hashes.push((file_path.clone(), hash.clone()));
+            if let Some(hash) = git_manifest.hash_of(file_path) {
+                resolved_hashes.push((file_path.clone(), hash));
             }
         }
 
         if resolved_hashes.is_empty() {
-            // Fallback: do a regular find to get any available functions
-            return self.find_function(name).await;
+            return self
+                .function_not_at_revision(name, revision, Absent::PathsNotInTree)
+                .await;
         }
 
-        // Step 3: Direct targeted search for each (filename, git_hash) combination
+        // Step 3: stat (and, on a mismatch, hash) each candidate against the
+        // blob it has at this revision. A match answers the indexed row with
+        // no further git call; a difference is an edit, answered by parsing
+        // that one file; a deletion answers nothing for that candidate.
         let mut matches = Vec::new();
         for (file_path, git_hash) in &resolved_hashes {
-            if let Some(func) = self
-                .function_store
-                .find_by_name_file_and_hash(name, file_path, git_hash)
-                .await?
-            {
-                matches.push(func);
+            match self.candidate_state(file_path, git_hash, revision) {
+                CandidateFile::Indexed => {
+                    if let Some(func) = self
+                        .function_store
+                        .find_by_name_file_and_hash(name, file_path, git_hash)
+                        .await?
+                    {
+                        matches.push(func);
+                    }
+                }
+                CandidateFile::Edited => matches.extend(self.reparse_functions(file_path, name)),
+                CandidateFile::Deleted => {}
             }
         }
 
         // Step 4: Pick the best result (prefer implementation over declaration)
         if matches.is_empty() {
-            // Fallback: do a regular find to get any available function
-            return self.find_function(name).await;
+            return self
+                .function_not_at_revision(name, revision, Absent::ContentNotIndexed)
+                .await;
         }
 
         let best_match = self.select_best_function_match(matches);
@@ -1389,7 +1975,7 @@ impl DatabaseManager {
     pub async fn get_function_types_with_manifest(
         &self,
         name: &str,
-        git_manifest: &std::collections::HashMap<String, String>,
+        git_manifest: &crate::database::resolution::RevisionPaths,
     ) -> Result<Vec<String>> {
         // Query functions table directly - only read the columns we need
         let escaped_name = name.replace("'", "''");
@@ -1447,7 +2033,7 @@ impl DatabaseManager {
                     let git_file_hash = git_file_hash_array.value(i);
 
                     // Check if this function exists at the target git SHA
-                    if let Some(expected_hash) = git_manifest.get(file_path) {
+                    if let Some(expected_hash) = git_manifest.hash_of(file_path) {
                         if git_file_hash == expected_hash {
                             // Parse the types JSON
                             let types = if types_array.is_null(i) {
@@ -1493,23 +2079,17 @@ impl DatabaseManager {
         name: &str,
         git_sha: &str,
     ) -> Result<Vec<FunctionInfo>> {
-        // Get workdir overlay matches first
-        let workdir_matches = self.workdir_find_all_functions(name);
-        let workdir_files: HashSet<String> = workdir_matches
-            .iter()
-            .map(|f| f.file_path.clone())
-            .collect();
-
         // Step 1: Get candidate file paths from symbol_filename table (optimized - no need to load full function records)
         let unique_file_paths = self
             .symbol_filename_store
             .get_filenames_for_symbol(name)
             .await?;
-        if unique_file_paths.is_empty() && workdir_matches.is_empty() {
-            return Ok(Vec::new());
-        }
         if unique_file_paths.is_empty() {
-            return Ok(self.filter_implementations_only(workdir_matches));
+            // No row has ever named this function: only the on-miss path can
+            // still find it, in an edit the index has never seen.
+            return self
+                .functions_not_at_revision(name, git_sha, Absent::PathsNotInTree)
+                .await;
         }
 
         tracing::debug!(
@@ -1523,64 +2103,43 @@ impl DatabaseManager {
             .resolve_git_file_hashes(&unique_file_paths, git_sha)
             .await?;
         if resolved_hashes.is_empty() {
-            tracing::warn!("No files resolved for '{}' at commit '{}'", name, git_sha);
-            // Fallback: get all functions and filter implementations
-            let all_functions = self
-                .function_store
-                .find_all_by_name_unfiltered(name)
-                .await?;
-            return Ok(self.filter_implementations_only(all_functions));
+            return self
+                .functions_not_at_revision(name, git_sha, self.why_nothing_resolved(git_sha))
+                .await;
         }
 
-        // Step 3: Direct targeted search for each (filename, git_hash) combination
+        // Step 3: stat (and, on a mismatch, hash) each candidate against the
+        // blob it has at this revision — a handful of files, not the working
+        // tree. A match answers the indexed row with no further git call; a
+        // difference is an edit, answered by parsing that one file; a
+        // deletion answers nothing for that candidate.
         let mut matches = Vec::new();
         for (file_path, git_hash) in &resolved_hashes {
-            tracing::debug!(
-                "Searching for: name='{}' file='{}' hash='{}'",
-                name,
-                file_path,
-                git_hash
-            );
-            if let Some(func) = self
-                .function_store
-                .find_by_name_file_and_hash(name, file_path, git_hash)
-                .await?
-            {
-                tracing::debug!(
-                    "Found match: {} in {} (hash: {})",
-                    name,
-                    file_path,
-                    git_hash
-                );
-                matches.push(func);
+            match self.candidate_state(file_path, git_hash, git_sha) {
+                CandidateFile::Indexed => {
+                    if let Some(func) = self
+                        .function_store
+                        .find_by_name_file_and_hash(name, file_path, git_hash)
+                        .await?
+                    {
+                        matches.push(func);
+                    }
+                }
+                CandidateFile::Edited => matches.extend(self.reparse_functions(file_path, name)),
+                CandidateFile::Deleted => {}
             }
         }
 
         // Step 4: Filter out declarations but keep all implementations
         if matches.is_empty() {
-            tracing::warn!(
-                "No exact matches found for '{}' at commit '{}', falling back",
-                name,
-                git_sha
-            );
-            // Fallback: get all functions and filter implementations
-            let all_functions = self
-                .function_store
-                .find_all_by_name_unfiltered(name)
-                .await?;
-            return Ok(self.filter_implementations_only(all_functions));
+            // Not a resolution failure: the revision is known and no row holds
+            // the content it has. Either way the symbol is not in that tree.
+            return self
+                .functions_not_at_revision(name, git_sha, Absent::ContentNotIndexed)
+                .await;
         }
 
-        // Filter out DB results from dirty/deleted files, then merge with workdir results
-        let mut merged: Vec<FunctionInfo> = workdir_matches;
-        for func in matches {
-            if !workdir_files.contains(&func.file_path) && !self.workdir_is_deleted(&func.file_path)
-            {
-                merged.push(func);
-            }
-        }
-
-        let implementations = self.filter_implementations_only(merged);
+        let implementations = self.filter_implementations_only(matches);
         tracing::info!(
             "Git-aware lookup succeeded: found {} implementations of '{}' at commit '{}'",
             implementations.len(),
@@ -1924,22 +2483,17 @@ impl DatabaseManager {
 
     /// Find all type definitions with an exact name at a specific git commit.
     pub async fn find_types_git_aware(&self, name: &str, git_sha: &str) -> Result<Vec<TypeInfo>> {
-        let workdir_matches = self.workdir_find_all_types(name);
-        let workdir_files: HashSet<String> = workdir_matches
-            .iter()
-            .map(|ty| ty.file_path.clone())
-            .collect();
-
         // Step 1: Get candidate file paths from symbol_filename table (optimized - no need to load full type records)
         let unique_file_paths = self
             .symbol_filename_store
             .get_filenames_for_symbol(name)
             .await?;
-        if unique_file_paths.is_empty() && workdir_matches.is_empty() {
-            return Ok(Vec::new());
-        }
         if unique_file_paths.is_empty() {
-            return Ok(workdir_matches);
+            // No row has ever named this type: only the on-miss path can
+            // still find it, in an edit the index has never seen.
+            return self
+                .types_not_at_revision(name, git_sha, Absent::PathsNotInTree)
+                .await;
         }
 
         // Step 2: Resolve file paths to git hashes at target commit
@@ -1947,54 +2501,46 @@ impl DatabaseManager {
             .resolve_git_file_hashes(&unique_file_paths, git_sha)
             .await?;
         if resolved_hashes.is_empty() {
-            tracing::info!(
-                "No files resolved for type '{}' at commit '{}' - falling back to non-git lookup",
-                name,
-                git_sha
+            let why = self.why_nothing_resolved(git_sha);
+            return self.types_not_at_revision(name, git_sha, why).await;
+        }
+
+        // Step 3: stat (and, on a mismatch, hash) each candidate against the
+        // blob it has at this revision. A match keeps its hash for one batched
+        // DB query — the common case pays for a stat and nothing else; a
+        // difference is an edit, answered by parsing that one file; a
+        // deletion answers nothing for that candidate.
+        let mut trusted_hashes: Vec<String> = Vec::new();
+        let mut matches: Vec<TypeInfo> = Vec::new();
+        for (file_path, git_hash) in &resolved_hashes {
+            match self.candidate_state(file_path, git_hash, git_sha) {
+                CandidateFile::Indexed => trusted_hashes.push(git_hash.clone()),
+                CandidateFile::Edited => matches.extend(self.reparse_types(file_path, name)),
+                CandidateFile::Deleted => {}
+            }
+        }
+        if !trusted_hashes.is_empty() {
+            matches.extend(
+                self.type_store
+                    .find_by_git_hashes(&trusted_hashes, Some(name), None)
+                    .await?,
             );
-            if !workdir_matches.is_empty() {
-                return Ok(workdir_matches);
-            }
-            // Fallback: do a regular find to get any available type
-            return Ok(self.find_type(name).await?.into_iter().collect());
         }
 
-        // Step 3: Direct targeted search using git hashes
-        let hash_values: Vec<String> = resolved_hashes.values().cloned().collect();
-        let types = self
-            .type_store
-            .find_by_git_hashes(&hash_values, Some(name), None)
-            .await?;
-
-        if types.is_empty() {
-            tracing::info!(
-                "No exact matches found for type '{}' at commit '{}', falling back to non-git lookup",
-                name,
-                git_sha
-            );
-            if !workdir_matches.is_empty() {
-                return Ok(workdir_matches);
-            }
-            // Fallback: do a regular find to get any available type
-            return Ok(self.find_type(name).await?.into_iter().collect());
+        if matches.is_empty() {
+            return self
+                .types_not_at_revision(name, git_sha, Absent::ContentNotIndexed)
+                .await;
         }
 
-        // Replace committed definitions from dirty files with their overlay versions,
-        // and omit definitions from files deleted in the worktree.
-        let mut merged = workdir_matches;
-        for ty in types {
-            if !workdir_files.contains(&ty.file_path) && !self.workdir_is_deleted(&ty.file_path) {
-                merged.push(ty);
-            }
-        }
-        merged.sort_by(|a, b| {
+        matches.sort_by(|a, b| {
             a.file_path
                 .cmp(&b.file_path)
                 .then(a.line_start.cmp(&b.line_start))
         });
         let attributes = self.attribute_names().await?;
-        Self::flatten_anonymous_members(&mut merged, &attributes);
-        Ok(merged)
+        Self::flatten_anonymous_members(&mut matches, &attributes);
+        Ok(matches)
     }
 
     pub async fn get_all_types(&self) -> Result<Vec<TypeInfo>> {
@@ -2142,13 +2688,8 @@ impl DatabaseManager {
             .resolve_git_file_hashes(&unique_file_paths, git_sha)
             .await?;
         if resolved_hashes.is_empty() {
-            tracing::info!(
-                "No files resolved for typedef '{}' at commit '{}' - falling back to non-git lookup",
-                name,
-                git_sha
-            );
-            // Fallback: do a regular find to get any available typedef
-            return self.find_typedef(name).await;
+            let why = self.why_nothing_resolved(git_sha);
+            return self.typedef_not_at_revision(name, git_sha, why).await;
         }
 
         // Step 3: Direct targeted search using git hashes
@@ -2159,13 +2700,9 @@ impl DatabaseManager {
             .await?;
 
         if typedefs.is_empty() {
-            tracing::info!(
-                "No exact matches found for typedef '{}' at commit '{}', falling back to non-git lookup",
-                name,
-                git_sha
-            );
-            // Fallback: do a regular find to get any available typedef
-            return self.find_typedef(name).await;
+            return self
+                .typedef_not_at_revision(name, git_sha, Absent::ContentNotIndexed)
+                .await;
         }
 
         // Return the first match
@@ -2230,7 +2767,7 @@ impl DatabaseManager {
         pattern: &str,
         git_sha: &str,
     ) -> Result<Vec<TypeInfo>> {
-        let workdir_matches = self.workdir_find_types_regex(pattern);
+        let workdir_matches = self.workdir_find_types_regex(pattern, git_sha);
         let workdir_files: HashSet<String> = workdir_matches
             .iter()
             .map(|t| t.file_path.clone())
@@ -2243,7 +2780,7 @@ impl DatabaseManager {
 
         // Filter out DB results from dirty/deleted files, then prepend workdir matches
         db_results.retain(|t| {
-            !workdir_files.contains(&t.file_path) && !self.workdir_is_deleted(&t.file_path)
+            !workdir_files.contains(&t.file_path) && !self.workdir_is_deleted(&t.file_path, git_sha)
         });
 
         let mut merged = workdir_matches;
@@ -2313,7 +2850,7 @@ impl DatabaseManager {
         pattern: &str,
         git_sha: &str,
     ) -> Result<Vec<FunctionInfo>> {
-        let workdir_matches = self.workdir_find_functions_regex(pattern);
+        let workdir_matches = self.workdir_find_functions_regex(pattern, git_sha);
         let workdir_files: HashSet<String> = workdir_matches
             .iter()
             .map(|f| f.file_path.clone())
@@ -2325,7 +2862,7 @@ impl DatabaseManager {
             .await?;
 
         db_results.retain(|f| {
-            !workdir_files.contains(&f.file_path) && !self.workdir_is_deleted(&f.file_path)
+            !workdir_files.contains(&f.file_path) && !self.workdir_is_deleted(&f.file_path, git_sha)
         });
 
         let mut merged = workdir_matches;
@@ -2390,10 +2927,12 @@ impl DatabaseManager {
 
                 for row in 0..batch.num_rows() {
                     let path = paths.value(row);
-                    if self.workdir_is_dirty(path) || self.workdir_is_deleted(path) {
+                    if self.workdir_is_dirty(path, git_sha)
+                        || self.workdir_is_deleted(path, git_sha)
+                    {
                         continue;
                     }
-                    if git_manifest.get(path).map(String::as_str) != Some(hashes.value(row)) {
+                    if git_manifest.hash_of(path).as_deref() != Some(hashes.value(row)) {
                         continue;
                     }
                     let identity = format!(
@@ -2454,10 +2993,12 @@ impl DatabaseManager {
 
                     for row in 0..batch.num_rows() {
                         let path = paths.value(row);
-                        if self.workdir_is_dirty(path) || self.workdir_is_deleted(path) {
+                        if self.workdir_is_dirty(path, git_sha)
+                            || self.workdir_is_deleted(path, git_sha)
+                        {
                             continue;
                         }
-                        if git_manifest.get(path).map(String::as_str) != Some(hashes.value(row)) {
+                        if git_manifest.hash_of(path).as_deref() != Some(hashes.value(row)) {
                             continue;
                         }
                         if types.is_null(row) {
@@ -2600,7 +3141,7 @@ impl DatabaseManager {
         git_sha: &str,
     ) -> Result<Vec<String>> {
         // Collect callers from workdir overlay
-        let workdir_callers = self.workdir_find_callers(function_name);
+        let workdir_callers = self.workdir_find_callers(function_name, git_sha);
         let mut caller_names: Vec<String> =
             workdir_callers.iter().map(|f| f.name.clone()).collect();
 
@@ -2877,7 +3418,7 @@ impl DatabaseManager {
         git_sha: &str,
     ) -> Result<Vec<String>> {
         // Check workdir overlay first — if the function is in a dirty file, use its callees
-        if let Some(callees) = self.workdir_find_callees(function_name) {
+        if let Some(callees) = self.workdir_find_callees(function_name, git_sha) {
             return Ok(callees);
         }
         let git_manifest = self.git_manifest_cached(git_sha).await?;
@@ -3561,6 +4102,80 @@ impl DatabaseManager {
 
     // ==================== End Branch Management ====================
 
+    // ---- Revision reporting -----------------------------------------------
+
+    /// Revisions that contain a file blob, via `processed_files`.
+    ///
+    /// `git_file_hash` is the blob id stored on each row. Reading
+    /// `processed_files` costs ~0.08s for the whole table versus 0.36s for
+    /// `git ls-tree`; this helper reads only the rows for one hash.
+    pub async fn revisions_for_file_hash(&self, git_file_hash: &str) -> Result<Vec<String>> {
+        self.processed_file_store
+            .get_revisions_for_file_hash(git_file_hash)
+            .await
+    }
+
+    /// Branches that contain a file blob, via `revisions_for_file_hash`
+    /// plus the indexed branch tips. Sorted by branch name for stable output.
+    pub async fn branches_for_file_hash(
+        &self,
+        git_file_hash: &str,
+    ) -> Result<Vec<crate::database::branches::IndexedBranchInfo>> {
+        let revisions = self.revisions_for_file_hash(git_file_hash).await?;
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for rev in revisions {
+            for branch in self.branch_store.get_branches_at_commit(&rev).await? {
+                if seen.insert(branch.branch_name.clone()) {
+                    out.push(branch);
+                }
+            }
+        }
+        out.sort_by(|a, b| a.branch_name.cmp(&b.branch_name));
+        Ok(out)
+    }
+
+    /// Where a symbol of a given name was found: distinct revisions and
+    /// branches that hold at least one row for it. Reads `functions` for the
+    /// name, then `processed_files` for each distinct hash. No caller uses
+    /// this yet; it is the read side of "not at this revision, present on
+    /// ...".
+    pub async fn symbol_revisions(
+        &self,
+        name: &str,
+    ) -> Result<(
+        Vec<String>,
+        Vec<crate::database::branches::IndexedBranchInfo>,
+    )> {
+        let rows = self
+            .function_store
+            .find_all_by_name_unfiltered(name)
+            .await?;
+        let mut hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for row in &rows {
+            hashes.insert(row.git_file_hash.clone());
+        }
+        let mut rev_set = std::collections::HashSet::new();
+        for hash in hashes {
+            for rev in self.revisions_for_file_hash(&hash).await? {
+                rev_set.insert(rev);
+            }
+        }
+        let mut revisions: Vec<String> = rev_set.into_iter().collect();
+        revisions.sort();
+        let mut branches = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for rev in &revisions {
+            for b in self.branch_store.get_branches_at_commit(rev).await? {
+                if seen.insert(b.branch_name.clone()) {
+                    branches.push(b);
+                }
+            }
+        }
+        branches.sort_by(|a, b| a.branch_name.cmp(&b.branch_name));
+        Ok((revisions, branches))
+    }
+
     pub async fn get_existing_function_names(&self) -> Result<std::collections::HashSet<String>> {
         use futures::TryStreamExt;
 
@@ -3946,7 +4561,7 @@ impl DatabaseManager {
         git_sha: &str,
     ) -> Result<(Vec<FunctionInfo>, bool)> {
         // Get workdir overlay matches first
-        let workdir_matches = self.workdir_grep_functions(pattern, path_pattern);
+        let workdir_matches = self.workdir_grep_functions(pattern, path_pattern, git_sha);
         let workdir_files: HashSet<String> = workdir_matches
             .iter()
             .map(|f| f.file_path.clone())
@@ -3996,7 +4611,7 @@ impl DatabaseManager {
         for func in &all_matching_functions {
             // Check if this function's file SHA matches the git manifest
             if let Some(expected_hash) = resolved_hashes.get(&func.file_path) {
-                if &func.git_file_hash == expected_hash {
+                if func.git_file_hash == *expected_hash {
                     if limit > 0 && git_filtered_functions.len() >= limit {
                         limit_hit = true;
                         break;
@@ -4029,7 +4644,8 @@ impl DatabaseManager {
         // Merge workdir results with DB results, excluding dirty/deleted files from DB
         let mut merged = workdir_matches;
         for func in git_filtered_functions {
-            if !workdir_files.contains(&func.file_path) && !self.workdir_is_deleted(&func.file_path)
+            if !workdir_files.contains(&func.file_path)
+                && !self.workdir_is_deleted(&func.file_path, git_sha)
             {
                 merged.push(func);
             }
@@ -4156,8 +4772,8 @@ impl DatabaseManager {
         for caller_name in &all_callers {
             if let Some(func) = caller_functions.get(caller_name).and_then(|f| f.first()) {
                 // Check if this function's file SHA matches the git manifest
-                if let Some(expected_hash) = git_manifest.get(&func.file_path) {
-                    if &func.git_file_hash == expected_hash {
+                if let Some(expected_hash) = git_manifest.hash_of(&func.file_path) {
+                    if func.git_file_hash == expected_hash {
                         valid_callers.push(func.clone());
                         tracing::debug!(
                             "Valid caller: {} in {} (hash: {})",
@@ -4233,23 +4849,25 @@ impl DatabaseManager {
     pub async fn generate_git_manifest(
         &self,
         git_sha: &str,
-    ) -> Result<std::collections::HashMap<String, String>> {
-        let mut manifest = std::collections::HashMap::new();
-
-        // Use shared tree traversal utility
-        crate::git::walk_tree_at_commit(
-            &self.git_repo_path,
-            git_sha,
-            |relative_path, object_id| {
-                // Normalize path by removing any double slashes
-                let normalized_path = relative_path.replace("//", "/");
-                manifest.insert(normalized_path, object_id.to_string());
-                Ok(())
-            },
-        )?;
-
-        // Merge with workdir overlay (adds dirty files, removes deleted files)
-        Ok(self.workdir_merged_manifest(manifest))
+    ) -> Result<crate::database::resolution::RevisionPaths> {
+        let (dirty, deleted) = {
+            let guard = self.workdir_index.read().unwrap();
+            match guard.as_ref() {
+                Some(w) => (w.dirty_file_paths().clone(), w.deleted_file_paths().clone()),
+                None => (
+                    std::collections::HashMap::new(),
+                    std::collections::HashSet::new(),
+                ),
+            }
+        };
+        let valid = self.revision_resolves(git_sha);
+        Ok(crate::database::resolution::RevisionPaths::new_lazy(
+            std::path::PathBuf::from(&self.git_repo_path),
+            git_sha.to_string(),
+            dirty,
+            deleted,
+            valid,
+        ))
     }
 
     /// Fallback callers search when not in git repository
@@ -4344,7 +4962,7 @@ impl DatabaseManager {
     async fn function_exists_in_manifest(
         &self,
         function_name: &str,
-        git_manifest: &std::collections::HashMap<String, String>,
+        git_manifest: &crate::database::resolution::RevisionPaths,
     ) -> Result<bool> {
         // Get all functions with this name (non-git-aware, fast database query)
         let all_functions = self
@@ -4354,8 +4972,8 @@ impl DatabaseManager {
 
         // Check if any function exists in the git manifest (fast HashMap lookup)
         for func in &all_functions {
-            if let Some(expected_hash) = git_manifest.get(&func.file_path) {
-                if &func.git_file_hash == expected_hash {
+            if let Some(expected_hash) = git_manifest.hash_of(&func.file_path) {
+                if func.git_file_hash == expected_hash {
                     return Ok(true);
                 }
             }
@@ -4368,7 +4986,7 @@ impl DatabaseManager {
     pub async fn get_function_callees_with_manifest(
         &self,
         function_name: &str,
-        git_manifest: &std::collections::HashMap<String, String>,
+        git_manifest: &crate::database::resolution::RevisionPaths,
     ) -> Result<Vec<String>> {
         // Query functions table directly - efficient, doesn't fetch bodies
         let escaped_name = function_name.replace("'", "''");
@@ -4426,7 +5044,7 @@ impl DatabaseManager {
                     let git_file_hash = git_file_hash_array.value(i);
 
                     // Fast manifest lookup
-                    if let Some(expected_hash) = git_manifest.get(file_path) {
+                    if let Some(expected_hash) = git_manifest.hash_of(file_path) {
                         if git_file_hash == expected_hash {
                             // Parse the calls JSON
                             let calls = if calls_array.is_null(i) {
@@ -4472,7 +5090,7 @@ impl DatabaseManager {
     /// This is much faster than doing N separate LIKE queries for N functions.
     pub async fn build_caller_index_with_manifest(
         &self,
-        git_manifest: &std::collections::HashMap<String, String>,
+        git_manifest: &crate::database::resolution::RevisionPaths,
     ) -> Result<std::collections::HashMap<String, Vec<String>>> {
         let start = std::time::Instant::now();
         let table = self.connection.open_table("functions").execute().await?;
@@ -4524,7 +5142,7 @@ impl DatabaseManager {
                     let git_file_hash = git_file_hash_array.value(i);
 
                     // Only include functions that exist at the current git commit
-                    if let Some(expected_hash) = git_manifest.get(file_path) {
+                    if let Some(expected_hash) = git_manifest.hash_of(file_path) {
                         if git_file_hash == expected_hash {
                             let caller_name = name_array.value(i);
                             if !calls_array.is_null(i) {
@@ -4555,7 +5173,7 @@ impl DatabaseManager {
     pub async fn get_function_callers_with_manifest(
         &self,
         function_name: &str,
-        git_manifest: &std::collections::HashMap<String, String>,
+        git_manifest: &crate::database::resolution::RevisionPaths,
     ) -> Result<Vec<String>> {
         // Use efficient filtering: find functions whose calls JSON contains the target function name
         let escaped_name = function_name.replace("'", "''"); // SQL escape
@@ -4610,8 +5228,8 @@ impl DatabaseManager {
                     let git_file_hash = git_file_hash_array.value(i).to_string();
 
                     // Fast manifest lookup instead of expensive git resolution
-                    if let Some(expected_hash) = git_manifest.get(file_path) {
-                        if &git_file_hash == expected_hash {
+                    if let Some(expected_hash) = git_manifest.hash_of(file_path) {
+                        if git_file_hash == expected_hash {
                             // This function exists at the git SHA, verify it actually calls our target
                             if !calls_array.is_null(i) {
                                 let calls_json = calls_array.value(i);
@@ -7128,6 +7746,95 @@ mod tests {
             .unwrap();
         assert_eq!(function_counts["target"], 2);
         assert_eq!(type_counts["duplicate"], 3);
+    }
+
+    #[tokio::test]
+    async fn a_later_repl_command_sees_an_edit_the_current_one_did_not() {
+        // The on-miss overlay is built once, lazily, and reused within one
+        // call, so `func alloc_super; help` walks the tree once rather than
+        // twice. What that alone does not do is notice a file
+        // changed *after* that first build: `ensure_workdir_index_built`
+        // used to return immediately whenever an overlay already existed,
+        // for the rest of the process. This test pins both halves of a
+        // trade-off that pulls in opposite directions: refreshing on every
+        // call re-walks the tree
+        // twice for one `func` command (it calls both
+        // `get_function_callees_git_aware` and
+        // `get_function_callers_git_aware`); never refreshing leaves an
+        // edit invisible for the rest of the session. `note_repl_command`
+        // is the line between the two: calls before it share one overlay,
+        // calls after it get a freshness check.
+        //
+        // (workdir.rs's own `test_incremental_reuses_cache` already covers
+        // `build_incremental`'s cache primitive directly; this test is
+        // about `ensure_workdir_index_built` deciding *when* to call it.)
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo_path = repo_dir.path();
+        git(repo_path, &["init", "-q"]);
+        std::fs::write(repo_path.join("a.c"), "/* placeholder */\n").unwrap();
+        git(repo_path, &["add", "a.c"]);
+        git(repo_path, &["commit", "-q", "-m", "initial"]);
+
+        let git_sha = crate::git::get_git_sha(repo_path).unwrap().unwrap();
+
+        let db_path = repo_path.join(".semcode.db");
+        let db = DatabaseManager::new(
+            db_path.to_str().unwrap(),
+            repo_path.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        db.create_tables().await.unwrap();
+
+        // No row anywhere names this function — symbol_filename is empty —
+        // so only the on-miss path (the workdir overlay) can ever answer
+        // it. The first call builds the overlay from a clean tree and finds
+        // nothing.
+        let before = db
+            .find_all_functions_git_aware("brand_new_func", &git_sha)
+            .await
+            .unwrap();
+        assert!(before.is_empty(), "found before it was written: {before:?}");
+        assert!(db.has_workdir_index(), "overlay was not built on first use");
+
+        // Edit the file after the overlay already exists in this process —
+        // what happens between two commands in one REPL session.
+        // (Body has to clear `filter_implementations_only`'s 50-byte
+        // "substantial body" floor, or a real function reads as a bare
+        // declaration and this test would fail for a reason that has
+        // nothing to do with the overlay.)
+        std::fs::write(
+            repo_path.join("a.c"),
+            "int brand_new_func(void)\n{\n    int result = 42;\n    return result;\n}\n",
+        )
+        .unwrap();
+
+        // Still the same command as the first call (nothing told the
+        // database a new one started): the edit must not appear yet, or a
+        // `func` command that checks callees and then callers would walk
+        // the tracked-file set twice instead of once.
+        let still_this_command = db
+            .find_all_functions_git_aware("brand_new_func", &git_sha)
+            .await
+            .unwrap();
+        assert!(
+            still_this_command.is_empty(),
+            "a second lookup in the same command re-walked the tree instead of reusing: {still_this_command:?}"
+        );
+
+        // A new command starts — the REPL calls this once per line read from
+        // the prompt, before dispatching it.
+        db.note_repl_command();
+
+        let next_command = db
+            .find_all_functions_git_aware("brand_new_func", &git_sha)
+            .await
+            .unwrap();
+        assert_eq!(
+            next_command.len(),
+            1,
+            "edit made before the next command is still invisible: {next_command:?}"
+        );
     }
 }
 

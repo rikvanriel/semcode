@@ -22,6 +22,10 @@ struct GitFileTuple {
     file_path: PathBuf,
     file_sha: String,
     object_id: gix::ObjectId,
+    /// The commit this file was read from. Recorded with the file, because it
+    /// is the only place that knows: a range run reads many commits, and a
+    /// row cannot say which tree it belongs to afterwards.
+    commit_sha: String,
 }
 
 /// Results from processing git file tuples (for database insertion batches)
@@ -172,6 +176,7 @@ fn stream_git_file_tuples_batch(
                 file_path: manifest_entry.relative_path.clone(),
                 file_sha: file_sha.clone(),
                 object_id: manifest_entry.object_id,
+                commit_sha: commit_sha.to_string(),
             };
 
             // Send tuple to channel - if channel is closed, workers are done
@@ -269,7 +274,7 @@ fn process_git_file_tuple_with_repo(
     // Track this file as processed
     let processed_file_record = ProcessedFileRecord {
         file: tuple.file_path.to_string_lossy().to_string(),
-        git_sha: None, // Will be set by caller if available
+        git_sha: Some(tuple.commit_sha.clone()),
         git_file_sha: tuple.file_sha.clone(),
         extractor_version: Some(crate::SCHEMA_VERSION),
     };
@@ -809,6 +814,7 @@ fn stream_tree_file_tuples(
             file_path: PathBuf::from(relative_path),
             file_sha,
             object_id: *object_id,
+            commit_sha: commit_sha.clone(),
         };
 
         // Send tuple to channel - if channel is closed, workers are done
@@ -1200,6 +1206,21 @@ pub async fn process_git_tree(
     // told to read. Recorded last: an interrupted run leaves the older version
     // in place and is re-read next time.
     db_manager.record_index_build(extensions, no_macros).await?;
+
+    // The whole tree at this commit has been read, so record which commit it
+    // was. Written last, after record_index_build, so an interrupted run
+    // cannot claim coverage it did not finish.
+    let tree_sha = gix::discover(repo_path)
+        .ok()
+        .and_then(|repo| {
+            crate::git::resolve_to_commit(&repo, commit_sha)
+                .ok()
+                .map(|c| c.id().to_string())
+        })
+        .unwrap_or_else(|| commit_sha.to_string());
+    if let Err(e) = db_manager.record_tree_sha(&tree_sha).await {
+        tracing::warn!("Failed to record index:tree_sha {}: {}", tree_sha, e);
+    }
 
     Ok(())
 }
