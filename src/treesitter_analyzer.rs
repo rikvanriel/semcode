@@ -126,6 +126,14 @@ impl RawRegistration {
     }
 }
 
+/// What one pass over a file's functions yields.
+#[derive(Debug, Default)]
+struct ExtractedFunctions {
+    functions: Vec<FunctionInfo>,
+    dispatch_sites: Vec<DispatchSite>,
+    registrations: Vec<Registration>,
+}
+
 /// A declared function-pointer variable or parameter.
 #[derive(Debug, Clone)]
 struct PointerVar {
@@ -979,8 +987,11 @@ impl TreeSitterAnalyzer {
         };
 
         // Extract functions with embedded call data
-        let (functions, mut dispatch_sites, mut registrations) =
-            self.extract_functions_with_calls(&ctx, &extraction)?;
+        let ExtractedFunctions {
+            functions,
+            mut dispatch_sites,
+            mut registrations,
+        } = self.extract_functions_with_calls(&ctx, &extraction)?;
 
         // Extract types (single traversal as before)
         let types = self.extract_types(
@@ -2280,7 +2291,7 @@ impl TreeSitterAnalyzer {
         &self,
         ctx: &ExtractionContext,
         extraction: &CallExtraction,
-    ) -> Result<(Vec<FunctionInfo>, Vec<DispatchSite>, Vec<Registration>)> {
+    ) -> Result<ExtractedFunctions> {
         let mut dispatch_sites: Vec<DispatchSite> = Vec::new();
         let mut registrations: Vec<Registration> = Vec::new();
         let mut covered_sites: std::collections::HashSet<usize> = Default::default();
@@ -2566,7 +2577,11 @@ impl TreeSitterAnalyzer {
             ));
         }
 
-        Ok((functions, dispatch_sites, registrations))
+        Ok(ExtractedFunctions {
+            functions,
+            dispatch_sites,
+            registrations,
+        })
     }
 
     /// Extract macros with embedded call/type data (optimized)
@@ -2605,7 +2620,7 @@ impl TreeSitterAnalyzer {
             source_root,
             language,
         };
-        let (functions, _dispatch_sites, _registrations) =
+        let ExtractedFunctions { functions, .. } =
             self.extract_functions_with_calls(&ctx, &extraction)?;
 
         Ok(functions)
