@@ -162,6 +162,14 @@ pub struct ResolvedDispatch {
 /// member of this name, so a table cannot collide with a type.
 pub const ARRAY_ELEMENT_MEMBER: &str = "[]";
 
+/// The member recorded for a call through, or an installation into, a
+/// static-call key.
+///
+/// A key holds one function, patched into the call site at run time, so there
+/// is no member and no index — the key is the whole slot. As with a table,
+/// both sides of the join use this in place of a member name.
+pub const STATIC_CALL_MEMBER: &str = "()";
+
 /// How a dispatch site was written. Stored, so values are append-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DispatchKind {
@@ -182,6 +190,9 @@ pub enum DispatchKind {
     /// pointers. The table is the container; a runtime index leaves every
     /// element it holds a candidate.
     ArrayElement,
+    /// `static_call(key)(...)`: a direct call patched at run time to whatever
+    /// was installed in the key.
+    StaticCall,
 }
 
 impl DispatchKind {
@@ -194,6 +205,7 @@ impl DispatchKind {
             DispatchKind::PointerParam => "pointer_param",
             DispatchKind::MacroDeclared => "macro_declared",
             DispatchKind::ArrayElement => "array_element",
+            DispatchKind::StaticCall => "static_call",
         }
     }
 
@@ -209,6 +221,7 @@ impl DispatchKind {
             "pointer_param" => Some(DispatchKind::PointerParam),
             "macro_declared" => Some(DispatchKind::MacroDeclared),
             "array_element" => Some(DispatchKind::ArrayElement),
+            "static_call" => Some(DispatchKind::StaticCall),
             _ => None,
         }
     }

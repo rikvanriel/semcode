@@ -9,6 +9,7 @@ use tree_sitter::{Parser, Query, QueryCursor, Tree};
 use crate::types::{
     DispatchKind, DispatchSite, FieldInfo, FunctionInfo, GlobalTypeRegistry, MacroParams,
     ParameterInfo, Registration, RegistrationKind, TypeInfo, ARRAY_ELEMENT_MEMBER,
+    STATIC_CALL_MEMBER,
 };
 // TemporaryCallRelationship import removed - call relationships are now embedded in function JSON columns
 use crate::hash::compute_file_hash;
@@ -454,6 +455,13 @@ impl TreeSitterAnalyzer {
                     index: (_) @array_index
                 )
             ) @array_call
+
+            (call_expression
+                function: (call_expression
+                    function: (identifier) @static_call_name
+                    arguments: (argument_list (identifier) @static_call_key)
+                )
+            ) @static_call_site
         "#,
         )?;
 
@@ -882,6 +890,9 @@ impl TreeSitterAnalyzer {
             let mut macro_name: Option<tree_sitter::Node> = None;
             let mut macro_args: Option<tree_sitter::Node> = None;
             let mut array_name: Option<tree_sitter::Node> = None;
+            let mut static_call_name: Option<tree_sitter::Node> = None;
+            let mut static_call_key: Option<tree_sitter::Node> = None;
+            let mut static_call_site: Option<tree_sitter::Node> = None;
 
             for capture in call_match.captures {
                 match queries.call_query.capture_names()[capture.index as usize] {
@@ -896,6 +907,9 @@ impl TreeSitterAnalyzer {
                     "macro_name" => macro_name = Some(capture.node),
                     "macro_args" => macro_args = Some(capture.node),
                     "array_name" => array_name = Some(capture.node),
+                    "static_call_name" => static_call_name = Some(capture.node),
+                    "static_call_key" => static_call_key = Some(capture.node),
+                    "static_call_site" => static_call_site = Some(capture.node),
                     "pointer_expr" => {
                         // `(*fp)(...)`: a call through a pointer value, which
                         // the plain call pattern does not match at all.
@@ -923,6 +937,40 @@ impl TreeSitterAnalyzer {
             // reach. Record the table as the container, with every element a
             // candidate — which is what a runtime index leaves open, and what
             // the kernel's exit-handler and syscall tables are.
+            // `static_call(key)(vcpu)`: the callee is itself a call, naming
+            // the key that holds the function. The branch is patched at run
+            // time, so nothing here dispatches through a pointer.
+            if let (Some(name), Some(key), Some(call)) =
+                (static_call_name, static_call_key, static_call_site)
+            {
+                if source_code[name.byte_range()].trim() != "static_call" {
+                    continue;
+                }
+                // `kvm_x86_call(op)` writes `static_call(kvm_x86_##op)`,
+                // which parses as an identifier and the rest of the paste
+                // beside it. The name it means does not exist until the
+                // preprocessor makes it, and half of one joins to nothing, so
+                // the key has to be the only thing in there.
+                if key
+                    .parent()
+                    .is_some_and(|args| args.named_child_count() != 1)
+                {
+                    continue;
+                }
+                let key = source_code[key.byte_range()].to_string();
+                extraction.member_sites.push(RawDispatchSite {
+                    member: STATIC_CALL_MEMBER.to_string(),
+                    receiver_expr: Some(key.clone()),
+                    receiver_type: Some(key),
+                    receiver_base_type: None,
+                    receiver_field: None,
+                    kind: DispatchKind::StaticCall,
+                    byte_start: call.start_byte(),
+                    line: call.start_position().row as u32 + 1,
+                    target: None,
+                });
+            }
+
             if let Some(array) = array_name {
                 // The thing indexed has to be nameable, or there is nothing
                 // to join a table against. A bare name is the table itself;
@@ -1078,7 +1126,11 @@ impl TreeSitterAnalyzer {
             // which would replace the answer with a wrong one. A table held
             // in a struct field has not, and typing its base is what would
             // let it be resolved later.
-            if site.kind == DispatchKind::ArrayElement && site.receiver_type.is_some() {
+            if matches!(
+                site.kind,
+                DispatchKind::ArrayElement | DispatchKind::StaticCall
+            ) && site.receiver_type.is_some()
+            {
                 continue;
             }
             let Some(receiver) = site.receiver_expr.as_deref() else {
@@ -1280,6 +1332,11 @@ impl TreeSitterAnalyzer {
             }
 
             if let Some(registration) = Self::initcall(node, source) {
+                found.push(registration);
+                continue;
+            }
+
+            if let Some(registration) = Self::static_call_install(node, source) {
                 found.push(registration);
                 continue;
             }
@@ -1536,6 +1593,75 @@ impl TreeSitterAnalyzer {
         }
 
         members
+    }
+
+    /// A function installed in a static-call key.
+    ///
+    /// ```text
+    /// DEFINE_STATIC_CALL(kvm_x86_run, vmx_vcpu_run);
+    /// static_call_update(kvm_x86_run, svm_vcpu_run);
+    /// ```
+    ///
+    /// The key is a slot holding one function, and a call through it is
+    /// patched into a direct branch at run time. Nothing dispatches through a
+    /// pointer and nothing assigns one, so neither the member walk nor the
+    /// table walk sees this.
+    ///
+    /// A key built by pasting — the kernel writes `static_call(kvm_x86_##op)`
+    /// behind `kvm_x86_call(op)` — is not recorded, because the name does not
+    /// exist until the preprocessor makes it.
+    fn static_call_install(node: tree_sitter::Node, source: &str) -> Option<RawRegistration> {
+        let call = match node.kind() {
+            "expression_statement" => node.named_child(0)?,
+            "call_expression" => node,
+            _ => return None,
+        };
+        if call.kind() != "call_expression" {
+            return None;
+        }
+
+        let name = call.child_by_field_name("function")?;
+        if name.kind() != "identifier" {
+            return None;
+        }
+        let name = &source[name.byte_range()];
+        // Only these two install the function they name.
+        // `DEFINE_STATIC_CALL_NULL` and `DEFINE_STATIC_CALL_RET0` take a
+        // prototype in that position and install nothing or a stub:
+        // `DEFINE_STATIC_CALL_NULL(amd_pmu_branch_reset,
+        // amd_pmu_branch_reset_t)` names a type, and the key starts out NULL.
+        if !matches!(name, "DEFINE_STATIC_CALL" | "static_call_update") {
+            return None;
+        }
+
+        let arguments = call.child_by_field_name("arguments")?;
+        let mut cursor = arguments.walk();
+        let named: Vec<tree_sitter::Node> = arguments.named_children(&mut cursor).collect();
+        let [key, target] = named[..] else {
+            return None;
+        };
+        if key.kind() != "identifier" || target.kind() != "identifier" {
+            return None;
+        }
+
+        let (key, target) = (
+            source[key.byte_range()].to_string(),
+            source[target.byte_range()].to_string(),
+        );
+        if key.is_empty() || target.is_empty() {
+            return None;
+        }
+
+        Some(RawRegistration {
+            container_type: key,
+            container_base_type: None,
+            container_field: None,
+            member: STATIC_CALL_MEMBER.to_string(),
+            target,
+            byte_start: call.start_byte(),
+            line: call.start_position().row as u32 + 1,
+            kind: RegistrationKind::Assignment,
+        })
     }
 
     /// A function the kernel runs at boot, named by the macro that files it.
@@ -2723,6 +2849,18 @@ impl TreeSitterAnalyzer {
                         for site in &mut facts.sites {
                             site.byte_start += body_start;
                             site.line = body_line + site.line.saturating_sub(1);
+                        }
+                        // A macro's own parameter is not a function.
+                        // `#define hypercall_update(hc) static_call_update(hv_hypercall, hc)`
+                        // installs whatever a caller passes, and `hc` names
+                        // that nowhere. Scoped to static calls: a macro that
+                        // declares an ops table records its parameter on
+                        // purpose, which is a separate decision with its own
+                        // test.
+                        if let Some(names) = parameters.as_ref() {
+                            facts.registrations.retain(|r| {
+                                r.member != STATIC_CALL_MEMBER || !names.contains(&r.target)
+                            });
                         }
                         for registration in &mut facts.registrations {
                             registration.byte_start += body_start;
@@ -5171,6 +5309,94 @@ mod tests {
             pointer.definition.contains("(*)"),
             "a reader cannot tell it is a function pointer: {:?}",
             pointer.definition
+        );
+    }
+
+    #[test]
+    fn a_static_call_that_installs_nothing_records_nothing() {
+        // `DEFINE_STATIC_CALL_NULL(name, type)` takes a prototype in the
+        // second position and leaves the key NULL, so the name there is a
+        // type and nothing is installed.
+        let found = registration_rows(
+            "typedef void (*amd_pmu_branch_reset_t)(void);\n\
+             DEFINE_STATIC_CALL_NULL(amd_pmu_branch_reset, amd_pmu_branch_reset_t);\n",
+            "core.c",
+        );
+
+        assert!(
+            found.iter().all(|r| r.member != "()"),
+            "a prototype was recorded as an installed function: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_macro_parameter_is_not_an_installed_function() {
+        // `#define hypercall_update(hc) static_call_update(hv_hypercall, hc)`
+        // installs whatever a caller passes; `hc` names that nowhere.
+        let found = registration_rows(
+            "#define hypercall_update(hc) static_call_update(hv_hypercall, hc)\n",
+            "mshyperv.c",
+        );
+
+        assert!(
+            found.iter().all(|r| r.target != "hc"),
+            "a macro parameter was recorded as a function: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_static_call_key_holds_the_function_installed_in_it() {
+        let found = registration_rows(
+            "int vmx_vcpu_run(struct kvm_vcpu *vcpu);\n\
+             DEFINE_STATIC_CALL(kvm_x86_run, vmx_vcpu_run);\n",
+            "x86.c",
+        );
+
+        let row = found
+            .iter()
+            .find(|r| r.target == "vmx_vcpu_run")
+            .unwrap_or_else(|| panic!("not recorded: {found:?}"));
+        assert_eq!(row.container_type, "kvm_x86_run");
+        assert_eq!(row.member, "()");
+    }
+
+    #[test]
+    fn a_call_through_a_static_call_key_is_a_dispatch_site() {
+        let (_functions, sites) = analyze(
+            "int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)\n\
+             {\n\
+             \tint r = 0;\n\
+             \tr = static_call(kvm_x86_run)(vcpu);\n\
+             \treturn r;\n\
+             }\n",
+            "x86.c",
+        );
+
+        let site = sites
+            .iter()
+            .find(|s| s.kind == DispatchKind::StaticCall)
+            .unwrap_or_else(|| panic!("no static call site: {sites:?}"));
+        assert_eq!(site.member, "()");
+        assert_eq!(site.receiver_type.as_deref(), Some("kvm_x86_run"));
+    }
+
+    #[test]
+    fn a_pasted_static_call_key_is_not_guessed() {
+        // `kvm_x86_call(op)` expands to `static_call(kvm_x86_##op)`; the name
+        // does not exist until the preprocessor makes it.
+        let (_functions, sites) = analyze(
+            "int f(struct kvm_vcpu *vcpu)\n\
+             {\n\
+             \tint r = 0;\n\
+             \tr = static_call(kvm_x86_##op)(vcpu);\n\
+             \treturn r;\n\
+             }\n",
+            "x86.c",
+        );
+
+        assert!(
+            sites.iter().all(|s| s.kind != DispatchKind::StaticCall),
+            "{sites:?}"
         );
     }
 
