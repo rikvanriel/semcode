@@ -11,6 +11,11 @@ Working directory overlay: queries now reflect uncommitted changes to tracked fi
 Rust indexing is now supported.  This just uses treesitter, but all the
 semcode features are there.
 
+Zig 0.16 indexing is now supported the same way: `.zig` files are parsed
+with tree-sitter, including 0.16 type builtins (`@Int`, `@Struct`,
+`@Union`, `@Enum`, `@Tuple`, `@Pointer`, `@Fn`, `@EnumLiteral`) and
+packed union backing integers.
+
 Now with lore indexing!  semcode-index --lore lkml,netdev (or any list names) will
 pull down the latest git archive from those lists.  See [the lore documentation](docs/lore.md)
 for more details.  This is a database schema change, so you'll need to reindex.
@@ -21,7 +26,7 @@ you'll need to reindex your database.
 
 ## Features
 
-- **Fast indexing** of C/C++ codebases using Tree-sitter
+- **Fast indexing** of C/C++, Rust, Python, and Zig codebases using Tree-sitter
 - **Interactive query interface** with comprehensive command set
 - **Call graph analysis** with forward/reverse traversal
 - **Type and macro discovery** with detailed structural information

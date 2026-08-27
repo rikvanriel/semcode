@@ -19,6 +19,7 @@ pub enum Language {
     C,
     Rust,
     Python,
+    Zig,
 }
 
 impl Language {
@@ -32,6 +33,7 @@ impl Language {
                 }
                 "rs" => Some(Language::Rust),
                 "py" => Some(Language::Python),
+                "zig" => Some(Language::Zig),
                 _ => None,
             })
     }
@@ -211,9 +213,11 @@ pub struct TreeSitterAnalyzer {
     c_parser: Parser,
     rust_parser: Parser,
     python_parser: Parser,
+    zig_parser: Parser,
     c_queries: &'static LanguageQueries,
     rust_queries: &'static LanguageQueries,
     python_queries: &'static LanguageQueries,
+    zig_queries: &'static LanguageQueries,
 }
 
 /// A table of function pointers, and the typedef that hid that fact when the
@@ -242,19 +246,27 @@ impl TreeSitterAnalyzer {
         let mut python_parser = Parser::new();
         python_parser.set_language(&python_language)?;
 
+        // Initialize Zig parser and queries (Zig 0.16 syntax)
+        let zig_language = tree_sitter_zig::LANGUAGE.into();
+        let mut zig_parser = Parser::new();
+        zig_parser.set_language(&zig_language)?;
+
         // Compiled once for the process, not once per analyzer: see
         // c_queries() below.
         let c_queries = Self::c_queries()?;
         let rust_queries = Self::rust_queries()?;
         let python_queries = Self::python_queries()?;
+        let zig_queries = Self::zig_queries()?;
 
         Ok(TreeSitterAnalyzer {
             c_parser,
             rust_parser,
             python_parser,
+            zig_parser,
             c_queries,
             rust_queries,
             python_queries,
+            zig_queries,
         })
     }
 
@@ -301,6 +313,18 @@ impl TreeSitterAnalyzer {
             })
             .as_ref()
             .map_err(|e| anyhow::anyhow!("Python queries: {e}"))
+    }
+
+    fn zig_queries() -> Result<&'static LanguageQueries> {
+        static QUERIES: std::sync::OnceLock<std::result::Result<LanguageQueries, String>> =
+            std::sync::OnceLock::new();
+        QUERIES
+            .get_or_init(|| {
+                Self::create_zig_queries(&tree_sitter_zig::LANGUAGE.into())
+                    .map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("Zig queries: {e}"))
     }
 
     fn create_c_queries(language: &tree_sitter::Language) -> Result<LanguageQueries> {
@@ -621,6 +645,123 @@ impl TreeSitterAnalyzer {
         })
     }
 
+    fn create_zig_queries(language: &tree_sitter::Language) -> Result<LanguageQueries> {
+        // Named functions and tests. Anonymous `fn` types have no name field
+        // and are left to the type query. `!body` is the extern/declaration
+        // form; a second pattern without it would also match definitions.
+        let function_query = Query::new(
+            language,
+            r#"
+            (function_declaration
+                name: (identifier) @function_name
+                (parameters) @parameters
+                type: (_) @return_type
+                body: (block) @body
+            ) @function
+
+            (function_declaration
+                name: (identifier) @function_name
+                (parameters) @parameters
+                type: (_) @return_type
+                !body
+            ) @declaration
+
+            (test_declaration
+                (string) @function_name
+                (block) @body
+            ) @function
+
+            (test_declaration
+                (identifier) @function_name
+                (block) @body
+            ) @function
+        "#,
+        )?;
+
+        let comment_query = Query::new(
+            language,
+            r#"
+            (comment) @comment
+        "#,
+        )?;
+
+        // Zig types are `const Name = struct { ... }` (and enum/union/opaque
+        // / error). The identifier is the type name; the RHS is the body.
+        // Zig 0.16 replaced `@Type` with `@Int`/`@Struct`/`@Union`/`@Enum`/
+        // `@Tuple`/`@Pointer`/`@Fn`/`@EnumLiteral`.
+        let type_query = Query::new(
+            language,
+            r#"
+            (variable_declaration
+                (identifier) @type_name
+                (struct_declaration) @body
+            ) @struct
+
+            (variable_declaration
+                (identifier) @type_name
+                (enum_declaration) @body
+            ) @enum
+
+            (variable_declaration
+                (identifier) @type_name
+                (union_declaration) @body
+            ) @union
+
+            (variable_declaration
+                (identifier) @type_name
+                (opaque_declaration) @body
+            ) @opaque
+
+            (variable_declaration
+                (identifier) @type_name
+                (error_set_declaration) @body
+            ) @error
+
+            (
+              (variable_declaration
+                  (identifier) @type_name
+                  (builtin_function
+                      (builtin_identifier) @builtin
+                  )
+              ) @type_alias
+              (#match? @builtin "^@(Int|Struct|Union|Enum|Tuple|Pointer|Fn|EnumLiteral|Type)$")
+            )
+        "#,
+        )?;
+
+        // Zig has no preprocessor macros.
+        let macro_query = Query::new(language, "(source_file)")?;
+
+        let call_query = Query::new(
+            language,
+            r#"
+            (call_expression
+                function: (identifier) @function_name
+            ) @call
+
+            (call_expression
+                function: (field_expression
+                    object: (_) @receiver
+                    member: (identifier) @member_name
+                )
+            ) @method_call
+
+            (builtin_function
+                (builtin_identifier) @function_name
+            ) @call
+        "#,
+        )?;
+
+        Ok(LanguageQueries {
+            function_query,
+            comment_query,
+            type_query,
+            typedef_query: None,
+            macro_query,
+            call_query,
+        })
+    }
+
     /// Helper method to convert absolute path to relative path based on source root
     fn make_relative_path(&self, file_path: &Path, source_root: Option<&Path>) -> String {
         if let Some(root) = source_root {
@@ -639,6 +780,7 @@ impl TreeSitterAnalyzer {
             Language::C => &mut self.c_parser,
             Language::Rust => &mut self.rust_parser,
             Language::Python => &mut self.python_parser,
+            Language::Zig => &mut self.zig_parser,
         }
     }
 
@@ -648,6 +790,7 @@ impl TreeSitterAnalyzer {
             Language::C => self.c_queries,
             Language::Rust => self.rust_queries,
             Language::Python => self.python_queries,
+            Language::Zig => self.zig_queries,
         }
     }
 
@@ -2594,6 +2737,30 @@ impl TreeSitterAnalyzer {
                             line_start = node.start_position().row as u32 + 1;
                         }
                     }
+                    "opaque" => {
+                        kind = "opaque".to_string();
+                        type_start_byte = node.start_byte();
+                        type_end_byte = node.end_byte();
+                        if line_start == 0 {
+                            line_start = node.start_position().row as u32 + 1;
+                        }
+                    }
+                    "error" => {
+                        kind = "error".to_string();
+                        type_start_byte = node.start_byte();
+                        type_end_byte = node.end_byte();
+                        if line_start == 0 {
+                            line_start = node.start_position().row as u32 + 1;
+                        }
+                    }
+                    "type_alias" => {
+                        kind = "type".to_string();
+                        type_start_byte = node.start_byte();
+                        type_end_byte = node.end_byte();
+                        if line_start == 0 {
+                            line_start = node.start_position().row as u32 + 1;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -2944,6 +3111,10 @@ impl TreeSitterAnalyzer {
         node: tree_sitter::Node,
         source: &str,
     ) -> Vec<ParameterInfo> {
+        if node.kind() == "parameters" {
+            return Self::parse_zig_parameters(node, source);
+        }
+
         let mut parameters = Vec::new();
 
         // Walk through the parameter_list node to find parameter_declaration children
@@ -3164,11 +3335,98 @@ impl TreeSitterAnalyzer {
         declarations
     }
 
+    fn parse_zig_parameters(node: tree_sitter::Node, source: &str) -> Vec<ParameterInfo> {
+        let mut parameters = Vec::new();
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() != "parameter" {
+                continue;
+            }
+            let name = child
+                .child_by_field_name("name")
+                .map(|n| source[n.byte_range()].to_string())
+                .unwrap_or_default();
+            let type_name = child
+                .child_by_field_name("type")
+                .map(|n| collapse_whitespace(&source[n.byte_range()]))
+                .unwrap_or_default();
+            if name.is_empty() && type_name.is_empty() {
+                continue;
+            }
+            parameters.push(ParameterInfo {
+                name,
+                type_name,
+                type_file_path: None,
+                type_git_file_hash: None,
+            });
+        }
+        parameters
+    }
+
+    fn parse_zig_container_fields(body_node: tree_sitter::Node, source: &str) -> Vec<FieldInfo> {
+        let mut members = Vec::new();
+        let mut cursor = body_node.walk();
+        for child in body_node.children(&mut cursor) {
+            if child.kind() != "container_field" {
+                continue;
+            }
+            let name_node = child.child_by_field_name("name");
+            let type_node = child.child_by_field_name("type");
+            let (name, type_name) = match (name_node, type_node) {
+                (Some(name), Some(ty)) => (
+                    source[name.byte_range()].to_string(),
+                    collapse_whitespace(&source[ty.byte_range()]),
+                ),
+                (Some(name), None) => (source[name.byte_range()].to_string(), String::new()),
+                (None, Some(ty)) => (String::new(), collapse_whitespace(&source[ty.byte_range()])),
+                (None, None) => continue,
+            };
+            if name.is_empty() && type_name.is_empty() {
+                continue;
+            }
+            members.push(FieldInfo {
+                name,
+                type_name,
+                offset: None,
+            });
+        }
+        members
+    }
+
+    fn parse_zig_error_members(body_node: tree_sitter::Node, source: &str) -> Vec<FieldInfo> {
+        let mut members = Vec::new();
+        let mut cursor = body_node.walk();
+        for child in body_node.children(&mut cursor) {
+            if child.kind() != "identifier" {
+                continue;
+            }
+            let name = source[child.byte_range()].to_string();
+            if name.is_empty() {
+                continue;
+            }
+            members.push(FieldInfo {
+                name,
+                type_name: String::new(),
+                offset: None,
+            });
+        }
+        members
+    }
+
     fn parse_struct_members_from_node(
         &self,
         body_node: tree_sitter::Node,
         source: &str,
     ) -> Vec<FieldInfo> {
+        match body_node.kind() {
+            "error_set_declaration" => return Self::parse_zig_error_members(body_node, source),
+            "struct_declaration" | "enum_declaration" | "union_declaration"
+            | "opaque_declaration" => {
+                return Self::parse_zig_container_fields(body_node, source);
+            }
+            _ => {}
+        }
+
         let mut members = Vec::new();
 
         for declaration in Self::field_declarations(body_node) {
@@ -4176,8 +4434,8 @@ impl TreeSitterAnalyzer {
         source: &str,
         parameters: &mut Vec<ParameterInfo>,
     ) -> bool {
-        // Check if this node is a parameter_list
-        if node.kind() == "parameter_list" {
+        // Check if this node is a parameter_list (C) or parameters (Zig)
+        if node.kind() == "parameter_list" || node.kind() == "parameters" {
             let extracted_params = self.parse_parameters_from_node(node, source);
             if !extracted_params.is_empty() {
                 parameters.extend(extracted_params);
@@ -5936,5 +6194,187 @@ mod attribute_macros {
         assert!(!TreeSitterAnalyzer::expands_to_an_attribute("(1 << 4)"));
         assert!(!TreeSitterAnalyzer::expands_to_an_attribute("0x40"));
         assert!(!TreeSitterAnalyzer::expands_to_an_attribute(""));
+    }
+}
+
+#[cfg(test)]
+mod zig_tests {
+    use super::*;
+
+    const ZIG_016: &str = r#"
+const std = @import("std");
+
+const Point = struct {
+    x: i32,
+    y: i32,
+
+    pub fn add(self: Point, other: Point) Point {
+        return .{ .x = self.x + other.x, .y = self.y + other.y };
+    }
+};
+
+const Color = enum(u8) {
+    red,
+    green,
+    blue,
+};
+
+const Bits = packed union(u2) {
+    a: i2,
+    b: u2,
+};
+
+const Handle = opaque {};
+
+const IoError = error{
+    Timeout,
+    Reset,
+};
+
+const Width = @Int(.unsigned, 10);
+const Pair = @Tuple(&.{ i32, bool });
+const Tag = @EnumLiteral();
+
+pub fn sum(a: i32, b: i32) i32 {
+    const Int8 = @Int(.unsigned, 8);
+    const p = Point{ .x = a, .y = b };
+    const q = p.add(Point{ .x = 1, .y = 1 });
+    _ = Int8;
+    return helper(q.x);
+}
+
+fn helper(v: i32) i32 {
+    return v;
+}
+
+pub extern fn imported(x: u32) void;
+
+test "sum" {
+    _ = sum(1, 2);
+}
+
+test "helper ok" {
+    _ = helper(0);
+}
+"#;
+
+    fn analyze_zig(source: &str) -> FileAnalysis {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        analyzer
+            .analyze_source_with_metadata(source, Path::new("sample.zig"), "testhash", None)
+            .unwrap()
+    }
+
+    #[test]
+    fn zig_016_functions_have_names_params_and_return_types() {
+        let analysis = analyze_zig(ZIG_016);
+        let names: Vec<&str> = analysis.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"sum"), "{names:?}");
+        assert!(names.contains(&"helper"), "{names:?}");
+        assert!(names.contains(&"add"), "{names:?}");
+        assert!(names.contains(&"imported"), "{names:?}");
+        assert!(names.contains(&"\"sum\""), "{names:?}");
+        assert!(names.contains(&"\"helper ok\""), "{names:?}");
+
+        let sum = analysis.functions.iter().find(|f| f.name == "sum").unwrap();
+        assert_eq!(sum.return_type, "i32");
+        assert_eq!(sum.parameters.len(), 2, "{:?}", sum.parameters);
+        assert_eq!(sum.parameters[0].name, "a");
+        assert_eq!(sum.parameters[0].type_name, "i32");
+        assert_eq!(sum.parameters[1].name, "b");
+        assert_eq!(sum.parameters[1].type_name, "i32");
+        assert!(
+            sum.calls
+                .as_ref()
+                .is_some_and(|c| c.iter().any(|n| n == "helper")),
+            "sum calls: {:?}",
+            sum.calls
+        );
+    }
+
+    #[test]
+    fn zig_016_types_include_packed_union_backing_int_and_type_builtins() {
+        let analysis = analyze_zig(ZIG_016);
+        let by_name: std::collections::HashMap<&str, &TypeInfo> = analysis
+            .types
+            .iter()
+            .map(|t| (t.name.as_str(), t))
+            .collect();
+
+        let point = by_name.get("Point").expect("Point");
+        assert_eq!(point.kind, "struct");
+        let fields: Vec<&str> = point.members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(fields, vec!["x", "y"], "{:?}", point.members);
+        assert_eq!(point.members[0].type_name, "i32");
+
+        let bits = by_name.get("Bits").expect("Bits");
+        assert_eq!(bits.kind, "union");
+        assert!(
+            bits.definition.contains("packed union(u2)"),
+            "{}",
+            bits.definition
+        );
+
+        let color = by_name.get("Color").expect("Color");
+        assert_eq!(color.kind, "enum");
+        let variants: Vec<&str> = color.members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(
+            variants,
+            vec!["red", "green", "blue"],
+            "{:?}",
+            color.members
+        );
+
+        assert_eq!(by_name.get("Handle").expect("Handle").kind, "opaque");
+
+        let err = by_name.get("IoError").expect("IoError");
+        assert_eq!(err.kind, "error");
+        let errors: Vec<&str> = err.members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(errors, vec!["Timeout", "Reset"], "{:?}", err.members);
+
+        assert_eq!(by_name.get("Width").expect("Width").kind, "type");
+        assert!(by_name.get("Width").unwrap().definition.contains("@Int"));
+        assert_eq!(by_name.get("Pair").expect("Pair").kind, "type");
+        assert_eq!(by_name.get("Tag").expect("Tag").kind, "type");
+        assert!(
+            !by_name.contains_key("std"),
+            "std = @import is not a type builtin"
+        );
+    }
+
+    #[test]
+    fn zig_016_records_method_and_builtin_calls() {
+        let analysis = analyze_zig(ZIG_016);
+        let sum = analysis.functions.iter().find(|f| f.name == "sum").unwrap();
+        let member_calls: Vec<&str> = analysis
+            .dispatch_sites
+            .iter()
+            .filter(|s| s.caller_name == "sum")
+            .map(|s| s.member.as_str())
+            .collect();
+        assert!(
+            member_calls.contains(&"add"),
+            "dispatch sites for sum: {member_calls:?}"
+        );
+
+        assert!(
+            sum.calls
+                .as_ref()
+                .is_some_and(|c| c.iter().any(|n| n == "@Int")),
+            "sum builtin calls: {:?}",
+            sum.calls
+        );
+    }
+
+    #[test]
+    fn language_detects_zig_extension() {
+        assert_eq!(
+            Language::from_path(Path::new("src/main.zig")),
+            Some(Language::Zig)
+        );
+        assert_eq!(
+            Language::from_path(Path::new("src/main.rs")),
+            Some(Language::Rust)
+        );
     }
 }

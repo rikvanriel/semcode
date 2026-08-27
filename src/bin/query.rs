@@ -127,12 +127,10 @@ async fn refuse_or_rebuild_stale_index(
         Some(recorded) => recorded,
         None => {
             println!(
-                "Index does not record how it was built; using defaults (c,h,rs, macros indexed)"
+                "Index does not record how it was built; using defaults ({}, macros indexed)",
+                semcode::file_extensions::default_extensions_string()
             );
-            (
-                vec!["c".to_string(), "h".to_string(), "rs".to_string()],
-                false,
-            )
+            (semcode::file_extensions::default_extensions(), false)
         }
     };
 
