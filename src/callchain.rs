@@ -511,20 +511,26 @@ pub async fn show_registrations_to_writer(
     writeln!(writer, "Finding where {} is installed", name.cyan())?;
 
     let found = db.find_registrations_of_git_aware(name, git_sha).await?;
+    let handed = db
+        .find_argument_functions_of_git_aware(name, git_sha)
+        .await?;
 
-    if found.is_empty() {
+    if found.is_empty() && handed.is_empty() {
         writeln!(
             writer,
-            "{} {} is not installed in any struct member",
+            "{} {} is not installed in any struct member, and no call is \
+             handed it",
             "Info:".yellow(),
             name
         )?;
         return Ok(());
     }
 
-    let header = format!("\n{}", "=== Registrations ===".bold().green());
-    writeln!(writer, "{header}")?;
-    writeln!(writer, "{} places install it:", found.len())?;
+    if !found.is_empty() {
+        let header = format!("\n{}", "=== Registrations ===".bold().green());
+        writeln!(writer, "{header}")?;
+        writeln!(writer, "{} places install it:", found.len())?;
+    }
 
     for (i, registration) in found.iter().enumerate() {
         let where_from = if registration.enclosing_function.is_empty() {
@@ -543,6 +549,33 @@ pub async fn show_registrations_to_writer(
             where_from.bright_black(),
             registration.kind.as_str().bright_black()
         )?;
+    }
+
+    if !handed.is_empty() {
+        let header = format!("\n{}", "=== Handed to ===".bold().green());
+        writeln!(writer, "{header}")?;
+        writeln!(
+            writer,
+            "{} calls are handed it as an argument:",
+            handed.len()
+        )?;
+        for (i, argument) in handed.iter().enumerate() {
+            let where_from = if argument.enclosing_function.is_empty() {
+                String::new()
+            } else {
+                format!(" in {}", argument.enclosing_function)
+            };
+            writeln!(
+                writer,
+                "  {}. {}() argument {} at {}:{}{}",
+                (i + 1).to_string().yellow(),
+                argument.callee.cyan(),
+                argument.argument_index,
+                argument.file_path.bright_black(),
+                argument.line,
+                where_from.bright_black(),
+            )?;
+        }
     }
 
     Ok(())

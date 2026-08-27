@@ -1287,6 +1287,33 @@ impl DatabaseManager {
         Ok(registrations)
     }
 
+    /// Every call handed this name, at a revision.
+    ///
+    /// A row records only that an argument named an identifier; the name
+    /// belongs to a function if the functions table says so, which is what
+    /// separates `request_irq(irq, nic_intr, ...)` from an enum constant that
+    /// happens to sit in the same position.
+    pub async fn find_argument_functions_of_git_aware(
+        &self,
+        target: &str,
+        git_sha: &str,
+    ) -> Result<Vec<crate::types::ArgumentFunction>> {
+        if self
+            .find_function_git_aware(target, git_sha)
+            .await?
+            .is_none()
+        {
+            return Ok(Vec::new());
+        }
+
+        let manifest = self.git_manifest_cached(git_sha).await?;
+        Ok(crate::database::resolution::at_revision(
+            self.argument_function_store.find_by_target(target).await?,
+            &manifest,
+            |a| (a.file_path.as_str(), a.git_file_hash.as_str()),
+        ))
+    }
+
     /// Everything installed in one member of one type.
     pub async fn find_registrations_for_slot(
         &self,

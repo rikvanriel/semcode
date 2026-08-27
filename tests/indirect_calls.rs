@@ -262,6 +262,24 @@ async fn a_function_handed_to_a_call_is_recorded() {
     // where some other tree defines a function of that name.
     let local = db.find_argument_functions_of("flags").await.unwrap();
     assert!(local.is_empty(), "a local was recorded: {local:?}");
+
+    // The identifier has to name a function: an enum constant in the same
+    // argument position does not.
+    let constant = db
+        .find_argument_functions_of_git_aware("16", &git_sha)
+        .await
+        .unwrap();
+    assert!(constant.is_empty(), "a constant was reported: {constant:?}");
+
+    let mut output = Vec::new();
+    semcode::callchain::show_registrations_to_writer(&db, "nic_intr", &mut output, &git_sha)
+        .await
+        .unwrap();
+    let output = String::from_utf8(output).unwrap();
+    assert!(
+        output.contains("request_irq") && output.contains("nic_open"),
+        "registrations did not report the handover:\n{output}"
+    );
 }
 
 #[tokio::test]
