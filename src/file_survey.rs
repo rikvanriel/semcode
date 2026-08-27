@@ -24,6 +24,7 @@ enum SurveyLanguage {
     C,
     Rust,
     Python,
+    Zig,
 }
 
 impl SurveyLanguage {
@@ -34,6 +35,7 @@ impl SurveyLanguage {
             }
             "rs" => Some(Self::Rust),
             "py" => Some(Self::Python),
+            "zig" => Some(Self::Zig),
             _ => None,
         }
     }
@@ -74,7 +76,7 @@ pub fn survey_file(workspace_root: &Path, requested_path: &Path) -> Result<FileS
     }
     if !is_supported_for_analysis(path.to_string_lossy().as_ref()) {
         bail!(
-            "unsupported source file '{}'; expected C, C++, Rust, or Python",
+            "unsupported source file '{}'; expected C, C++, Rust, Python, or Zig",
             path.display()
         );
     }
@@ -88,6 +90,7 @@ pub fn survey_file(workspace_root: &Path, requested_path: &Path) -> Result<FileS
         SurveyLanguage::C => tree_sitter_c::LANGUAGE.into(),
         SurveyLanguage::Rust => tree_sitter_rust::LANGUAGE.into(),
         SurveyLanguage::Python => tree_sitter_python::LANGUAGE.into(),
+        SurveyLanguage::Zig => tree_sitter_zig::LANGUAGE.into(),
     };
     parser.set_language(&grammar)?;
     let tree = parser
@@ -253,7 +256,45 @@ fn is_basic_type(language: SurveyLanguage, name: &str) -> bool {
             name,
             "None" | "bool" | "int" | "float" | "complex" | "str" | "bytes" | "bytearray"
         ),
+        SurveyLanguage::Zig => is_zig_basic_type(name),
     }
+}
+
+fn is_zig_basic_type(name: &str) -> bool {
+    matches!(
+        name,
+        "bool"
+            | "f16"
+            | "f32"
+            | "f64"
+            | "f128"
+            | "void"
+            | "type"
+            | "anyerror"
+            | "anyopaque"
+            | "anytype"
+            | "noreturn"
+            | "isize"
+            | "usize"
+            | "comptime_int"
+            | "comptime_float"
+            | "c_short"
+            | "c_ushort"
+            | "c_int"
+            | "c_uint"
+            | "c_long"
+            | "c_ulong"
+            | "c_longlong"
+            | "c_ulonglong"
+            | "c_longdouble"
+    ) || is_zig_integer_type(name)
+}
+
+fn is_zig_integer_type(name: &str) -> bool {
+    let Some(digits) = name.strip_prefix('i').or_else(|| name.strip_prefix('u')) else {
+        return false;
+    };
+    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
 }
 
 fn is_fixed_width_integer(name: &str) -> bool {
@@ -280,6 +321,7 @@ fn walk(node: Node<'_>, source: &[u8], language: SurveyLanguage, out: &mut Surve
         SurveyLanguage::C => extract_c(node, source, out),
         SurveyLanguage::Rust => extract_rust(node, source, out),
         SurveyLanguage::Python => extract_python(node, source, out),
+        SurveyLanguage::Zig => extract_zig(node, source, out),
     }
 
     let mut cursor = node.walk();
@@ -410,6 +452,91 @@ fn extract_python(node: Node<'_>, source: &[u8], out: &mut SurveyBuilder) {
         }
         _ => {}
     }
+}
+
+fn extract_zig(node: Node<'_>, source: &[u8], out: &mut SurveyBuilder) {
+    match node.kind() {
+        "function_declaration" => {
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|n| text(n, source))
+            {
+                out.functions_defined.push((name, line(node)));
+            }
+        }
+        "test_declaration" => {
+            if let Some(name) = node
+                .named_child(0)
+                .filter(|n| matches!(n.kind(), "string" | "identifier"))
+                .and_then(|n| text(n, source))
+            {
+                out.functions_defined.push((name, line(node)));
+            }
+        }
+        "call_expression" => record_call(node, source, out),
+        "builtin_function" => {
+            if let Some(name) = node.named_child(0).and_then(|n| text(n, source)) {
+                increment(&mut out.calls, name);
+            }
+        }
+        "variable_declaration" => {
+            if let Some(name) = zig_type_binding(node, source) {
+                out.types_defined.push((name, line(node)));
+            }
+        }
+        "builtin_type" => {
+            if let Some(value) = text(node, source) {
+                increment(&mut out.types_mentioned, value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn zig_type_binding(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let mut cursor = node.walk();
+    let is_type = node.children(&mut cursor).any(|child| {
+        matches!(
+            child.kind(),
+            "struct_declaration"
+                | "enum_declaration"
+                | "union_declaration"
+                | "opaque_declaration"
+                | "error_set_declaration"
+        ) || zig_type_builtin(child, source)
+    });
+    if !is_type {
+        return None;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "identifier" {
+            return text(child, source);
+        }
+    }
+    None
+}
+
+fn zig_type_builtin(node: Node<'_>, source: &[u8]) -> bool {
+    if node.kind() != "builtin_function" {
+        return false;
+    }
+    node.named_child(0)
+        .and_then(|n| n.utf8_text(source).ok())
+        .is_some_and(|name| {
+            matches!(
+                name,
+                "@Int"
+                    | "@Struct"
+                    | "@Union"
+                    | "@Enum"
+                    | "@Tuple"
+                    | "@Pointer"
+                    | "@Fn"
+                    | "@EnumLiteral"
+                    | "@Type"
+            )
+        })
 }
 
 fn record_call(node: Node<'_>, source: &[u8], out: &mut SurveyBuilder) {
@@ -603,8 +730,61 @@ int defined(struct item *item)
         for name in ["int", "float", "str", "bytes", "None"] {
             assert!(is_basic_type(SurveyLanguage::Python, name), "{name}");
         }
+        for name in ["u8", "i3", "usize", "bool", "f32", "anyerror", "void"] {
+            assert!(is_basic_type(SurveyLanguage::Zig, name), "{name}");
+        }
         for name in ["struct folio", "vm_fault_t", "sector_t"] {
             assert!(!is_basic_type(SurveyLanguage::C, name), "{name}");
         }
+        for name in ["Allocator", "Io"] {
+            assert!(!is_basic_type(SurveyLanguage::Zig, name), "{name}");
+        }
+    }
+
+    #[test]
+    fn surveys_zig_syntax_deterministically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.zig");
+        std::fs::write(
+            &path,
+            r#"
+const Point = struct {
+    x: i32,
+    y: i32,
+};
+
+const Bits = packed union(u2) {
+    a: i2,
+    b: u2,
+};
+
+const Width = @Int(.unsigned, 10);
+
+pub fn add(a: i32, b: i32) i32 {
+    return helper(a) + b;
+}
+
+fn helper(v: i32) i32 {
+    return v;
+}
+
+test "add" {
+    _ = add(1, 2);
+}
+"#,
+        )
+        .unwrap();
+
+        let survey = survey_file(dir.path(), Path::new("sample.zig")).unwrap();
+        assert_eq!(survey.file, "sample.zig");
+        assert!(survey.functions_defined.iter().any(|(n, _)| n == "add"));
+        assert!(survey.functions_defined.iter().any(|(n, _)| n == "helper"));
+        assert!(survey.functions_defined.iter().any(|(n, _)| n == "\"add\""));
+        assert!(survey.calls.iter().any(|(n, _)| n == "helper"));
+        assert!(survey.calls.iter().any(|(n, _)| n == "add"));
+        assert!(survey.types_defined.iter().any(|(n, _)| n == "Point"));
+        assert!(survey.types_defined.iter().any(|(n, _)| n == "Bits"));
+        assert!(survey.types_defined.iter().any(|(n, _)| n == "Width"));
+        assert_eq!(survey.parse_errors, 0);
     }
 }

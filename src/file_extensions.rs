@@ -18,10 +18,11 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "h++", // C++ header files
     "rs",  // Rust source files
     "py",  // Python source files
+    "zig", // Zig source files
 ];
 
 /// Default extensions for indexing (subset of SUPPORTED_EXTENSIONS)
-pub const DEFAULT_EXTENSIONS: &[&str] = &["c", "h", "rs"];
+pub const DEFAULT_EXTENSIONS: &[&str] = &["c", "h", "rs", "zig"];
 
 /// Returns a Vec<String> of all supported extensions
 pub fn supported_extensions() -> Vec<String> {
@@ -69,6 +70,11 @@ pub fn is_python_file(file_path: &str) -> bool {
     file_path.ends_with(".py")
 }
 
+/// Check if a file path is a Zig file
+pub fn is_zig_file(file_path: &str) -> bool {
+    file_path.ends_with(".zig")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,17 +85,18 @@ mod tests {
         assert!(exts.contains(&"c".to_string()));
         assert!(exts.contains(&"rs".to_string()));
         assert!(exts.contains(&"cpp".to_string()));
+        assert!(exts.contains(&"zig".to_string()));
     }
 
     #[test]
     fn test_default_extensions() {
         let exts = default_extensions();
-        assert_eq!(exts, vec!["c", "h", "rs"]);
+        assert_eq!(exts, vec!["c", "h", "rs", "zig"]);
     }
 
     #[test]
     fn test_default_extensions_string() {
-        assert_eq!(default_extensions_string(), "c,h,rs");
+        assert_eq!(default_extensions_string(), "c,h,rs,zig");
     }
 
     #[test]
@@ -99,6 +106,7 @@ mod tests {
         assert!(is_supported_for_analysis("test.cpp"));
         assert!(is_supported_for_analysis("test.hpp"));
         assert!(is_supported_for_analysis("test.py"));
+        assert!(is_supported_for_analysis("test.zig"));
         assert!(!is_supported_for_analysis("test.txt"));
     }
 
@@ -112,6 +120,7 @@ mod tests {
         assert!(is_c_cpp_file("test.hxx"));
         assert!(!is_c_cpp_file("test.rs"));
         assert!(!is_c_cpp_file("test.py"));
+        assert!(!is_c_cpp_file("test.zig"));
     }
 
     #[test]
@@ -120,5 +129,13 @@ mod tests {
         assert!(!is_python_file("test.c"));
         assert!(!is_python_file("test.rs"));
         assert!(!is_python_file("test.txt"));
+    }
+
+    #[test]
+    fn test_is_zig_file() {
+        assert!(is_zig_file("test.zig"));
+        assert!(!is_zig_file("test.c"));
+        assert!(!is_zig_file("test.rs"));
+        assert!(!is_zig_file("test.zon"));
     }
 }
