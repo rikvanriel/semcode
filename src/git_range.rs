@@ -2,6 +2,7 @@
 
 use crate::git::walk_tree_at_commit_with_repo;
 use crate::indexer::{list_shas_in_range, process_commits_pipeline};
+use crate::types::ArgumentFunction;
 use crate::{
     DatabaseManager, DispatchSite, FunctionInfo, GitFileEntry, GitFileManifestEntry,
     ProcessedFileRecord, Registration, TreeSitterAnalyzer, TypeInfo,
@@ -35,6 +36,7 @@ struct GitTupleResults {
     types: Vec<TypeInfo>,
     dispatch_sites: Vec<DispatchSite>,
     registrations: Vec<Registration>,
+    argument_functions: Vec<ArgumentFunction>,
     processed_files: Vec<ProcessedFileRecord>,
     files_processed: usize,
 }
@@ -45,6 +47,7 @@ impl GitTupleResults {
         self.types.extend(other.types);
         self.dispatch_sites.extend(other.dispatch_sites);
         self.registrations.extend(other.registrations);
+        self.argument_functions.extend(other.argument_functions);
         self.processed_files.extend(other.processed_files);
         self.files_processed += other.files_processed;
     }
@@ -255,11 +258,12 @@ fn process_git_file_tuple_with_repo(
 
     // Check analysis results
     let analysis = analysis_result?;
-    let (mut functions, types, dispatch_sites, registrations) = (
+    let (mut functions, types, dispatch_sites, registrations, argument_functions) = (
         analysis.functions,
         analysis.types,
         analysis.dispatch_sites,
         analysis.registrations,
+        analysis.argument_functions,
     );
     let macros = analysis.macros;
 
@@ -284,6 +288,7 @@ fn process_git_file_tuple_with_repo(
         types,
         dispatch_sites,
         registrations,
+        argument_functions,
         processed_files: vec![processed_file_record],
         files_processed: 1,
     };
@@ -620,6 +625,7 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
                             type_result,
                             dispatch_result,
                             registration_result,
+                            argument_function_result,
                             processed_files_result,
                         ) = tokio::join!(
                             async {
@@ -649,6 +655,15 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
                                 if !batch.registrations.is_empty() {
                                     db_manager_clone
                                         .insert_registrations(batch.registrations)
+                                        .await
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                            async {
+                                if !batch.argument_functions.is_empty() {
+                                    db_manager_clone
+                                        .insert_argument_functions(batch.argument_functions)
                                         .await
                                 } else {
                                     Ok(())
@@ -689,6 +704,13 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
                         if let Err(e) = registration_result {
                             error!(
                                 "Inserter {} failed to insert registrations: {}",
+                                inserter_id, e
+                            );
+                            insertion_successful = false;
+                        }
+                        if let Err(e) = argument_function_result {
+                            error!(
+                                "Inserter {} failed to insert argument functions: {}",
                                 inserter_id, e
                             );
                             insertion_successful = false;
@@ -967,6 +989,7 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
                             type_result,
                             dispatch_result,
                             registration_result,
+                            argument_function_result,
                             processed_files_result,
                         ) = tokio::join!(
                             async {
@@ -996,6 +1019,15 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
                                 if !batch.registrations.is_empty() {
                                     db_manager_clone
                                         .insert_registrations(batch.registrations)
+                                        .await
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                            async {
+                                if !batch.argument_functions.is_empty() {
+                                    db_manager_clone
+                                        .insert_argument_functions(batch.argument_functions)
                                         .await
                                 } else {
                                     Ok(())
@@ -1035,6 +1067,13 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
                         if let Err(e) = registration_result {
                             error!(
                                 "Inserter {} failed to insert registrations: {}",
+                                inserter_id, e
+                            );
+                            insertion_successful = false;
+                        }
+                        if let Err(e) = argument_function_result {
+                            error!(
+                                "Inserter {} failed to insert argument functions: {}",
                                 inserter_id, e
                             );
                             insertion_successful = false;

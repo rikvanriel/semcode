@@ -170,6 +170,22 @@ fn write_fixture(repo: &Path) {
     .unwrap();
 }
 
+/// A handler that reaches the hardware only because a registrar was handed
+/// its name, which is how every driver installs an interrupt handler.
+fn write_argument_fixture(repo: &Path) {
+    std::fs::write(
+        repo.join("nic.c"),
+        "int request_irq(unsigned int irq, void *handler, unsigned long flags);\n\
+         static int nic_intr(int irq, void *dev) { return 0; }\n\
+         static int nic_open(void *dev)\n\
+         {\n\
+         \tunsigned long flags = 0;\n\
+         \treturn request_irq(16, nic_intr, flags);\n\
+         }\n",
+    )
+    .unwrap();
+}
+
 async fn index_fixture(repo: &Path) -> (Arc<DatabaseManager>, String) {
     git_run(repo, &["init", "-q"]);
     write_fixture(repo);
@@ -200,6 +216,52 @@ async fn index_fixture(repo: &Path) -> (Arc<DatabaseManager>, String) {
     .unwrap();
 
     (db, git_sha)
+}
+
+#[tokio::test]
+async fn a_function_handed_to_a_call_is_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    git_run(dir.path(), &["init", "-q"]);
+    write_argument_fixture(dir.path());
+    git_run(dir.path(), &["add", "."]);
+    git_run(dir.path(), &["commit", "-q", "-m", "fixture"]);
+
+    let git_sha = git::get_git_sha(dir.path()).unwrap().unwrap();
+    let db = Arc::new(
+        DatabaseManager::new(
+            dir.path().join(".semcode.db").to_str().unwrap(),
+            dir.path().to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap(),
+    );
+    db.create_tables().await.unwrap();
+    semcode::git_range::process_git_tree(
+        dir.path(),
+        &git_sha,
+        &["c".to_string()],
+        db.clone(),
+        false,
+        1,
+    )
+    .await
+    .unwrap();
+
+    let handed = db.find_argument_functions_of("nic_intr").await.unwrap();
+    assert_eq!(
+        handed.len(),
+        1,
+        "expected one call handed nic_intr, got {handed:?}"
+    );
+    assert_eq!(handed[0].callee, "request_irq");
+    assert_eq!(handed[0].argument_index, 1);
+    assert_eq!(handed[0].enclosing_function, "nic_open");
+    assert!(!handed[0].taken_address);
+
+    // `flags` is a local, so naming it is not handing over a function, even
+    // where some other tree defines a function of that name.
+    let local = db.find_argument_functions_of("flags").await.unwrap();
+    assert!(local.is_empty(), "a local was recorded: {local:?}");
 }
 
 #[tokio::test]

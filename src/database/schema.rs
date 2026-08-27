@@ -33,7 +33,7 @@ pub enum OptimizeOutcome {
 /// 4: a registration can be recorded before its container type is known,
 ///    carrying the base and field path instead. A version 3 index has no
 ///    such rows at all: it dropped those registrations.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 pub struct SchemaManager {
     connection: Connection,
@@ -87,6 +87,10 @@ impl SchemaManager {
                 &["container_base_type", "container_field"],
             )
             .await?;
+        }
+
+        if !table_names.iter().any(|n| n == "argument_functions") {
+            self.create_argument_functions_table().await?;
         }
 
         if !table_names.iter().any(|n| n == "object_macros") {
@@ -234,6 +238,42 @@ impl SchemaManager {
             .create_table("object_macros", vec![RecordBatch::new_empty(schema)])
             .execute()
             .await?;
+
+        Ok(())
+    }
+
+    pub async fn create_argument_functions_table(&self) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("target", DataType::Utf8, false),
+            // A macro and a function look the same at a call, so what the
+            // callee does with the argument is decided against the functions
+            // table rather than stored here.
+            Field::new("callee", DataType::Utf8, false),
+            Field::new("argument_index", DataType::Int64, false),
+            Field::new("taken_address", DataType::Boolean, false),
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("git_file_hash", DataType::Utf8, false),
+            Field::new("byte_start", DataType::Int64, false),
+            Field::new("line", DataType::Int64, false),
+            // Empty at file scope.
+            Field::new("enclosing_function", DataType::Utf8, false),
+        ]));
+
+        let table = self
+            .connection
+            .create_table("argument_functions", vec![RecordBatch::new_empty(schema)])
+            .execute()
+            .await?;
+
+        // Asking what a function was handed to filters on the target; asking
+        // what a registrar receives filters on the callee.
+        for column in ["target", "callee"] {
+            table
+                .create_index(&[column], lancedb::index::Index::Auto)
+                .execute()
+                .await
+                .ok();
+        }
 
         Ok(())
     }
@@ -588,6 +628,7 @@ impl SchemaManager {
         self.connection.drop_table(name, &[]).await?;
         match name {
             "processed_files" => self.create_processed_files_table().await,
+            "argument_functions" => self.create_argument_functions_table().await,
             "registrations" => self.create_registrations_table().await,
             "dispatch_sites" => self.create_dispatch_sites_table().await,
             other => Err(anyhow::anyhow!("no way to recreate {other}")),

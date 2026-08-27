@@ -155,6 +155,7 @@ pub struct DatabaseManager {
     content_store: ContentStore,
     dispatch_site_store: crate::database::dispatch_sites::DispatchSiteStore,
     registration_store: crate::database::registrations::RegistrationStore,
+    argument_function_store: crate::database::argument_functions::ArgumentFunctionStore,
     object_macro_store: crate::database::object_macros::ObjectMacroStore,
     symbol_filename_store: SymbolFilenameStore,
     branch_store: IndexedBranchStore,
@@ -214,6 +215,8 @@ impl DatabaseManager {
             registration_store: crate::database::registrations::RegistrationStore::new(
                 connection.clone(),
             ),
+            argument_function_store:
+                crate::database::argument_functions::ArgumentFunctionStore::new(connection.clone()),
             symbol_filename_store: SymbolFilenameStore::new(connection.clone()),
             object_macro_store: crate::database::object_macros::ObjectMacroStore::new(
                 connection.clone(),
@@ -990,6 +993,22 @@ impl DatabaseManager {
         registrations: Vec<crate::types::Registration>,
     ) -> Result<()> {
         self.registration_store.insert_batch(registrations).await
+    }
+
+    /// Record functions named as call arguments.
+    pub async fn insert_argument_functions(
+        &self,
+        arguments: Vec<crate::types::ArgumentFunction>,
+    ) -> Result<()> {
+        self.argument_function_store.insert_batch(arguments).await
+    }
+
+    /// Every call handed this name.
+    pub async fn find_argument_functions_of(
+        &self,
+        target: &str,
+    ) -> Result<Vec<crate::types::ArgumentFunction>> {
+        self.argument_function_store.find_by_target(target).await
     }
 
     /// Everything installed in one member of one type, at a revision.

@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use anyhow::Result;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor, Tree};
 
 use crate::types::{
-    DispatchKind, DispatchSite, FieldInfo, FunctionInfo, GlobalTypeRegistry, MacroParams,
-    ParameterInfo, Registration, RegistrationKind, TypeInfo, ARRAY_ELEMENT_MEMBER,
+    ArgumentFunction, DispatchKind, DispatchSite, FieldInfo, FunctionInfo, GlobalTypeRegistry,
+    MacroParams, ParameterInfo, Registration, RegistrationKind, TypeInfo, ARRAY_ELEMENT_MEMBER,
     STATIC_CALL_MEMBER,
 };
 // TemporaryCallRelationship import removed - call relationships are now embedded in function JSON columns
@@ -68,6 +68,8 @@ pub struct FileAnalysis {
     pub dispatch_sites: Vec<DispatchSite>,
     /// Functions installed in struct members: what those sites can reach.
     pub registrations: Vec<Registration>,
+    /// Functions named as call arguments: what a callee was handed.
+    pub argument_functions: Vec<ArgumentFunction>,
 }
 
 /// Calls found in one file: resolved edges, and dispatch sites whose targets
@@ -81,6 +83,7 @@ struct CallExtraction {
     /// function of that name.
     pointer_vars: Vec<PointerVar>,
     registrations: Vec<RawRegistration>,
+    argument_functions: Vec<RawArgumentFunction>,
 }
 
 /// What a macro body yields once parsed.
@@ -132,6 +135,52 @@ struct ExtractedFunctions {
     functions: Vec<FunctionInfo>,
     dispatch_sites: Vec<DispatchSite>,
     registrations: Vec<Registration>,
+    argument_functions: Vec<ArgumentFunction>,
+}
+
+/// A call argument naming an identifier, before it is attributed to the
+/// function containing the call.
+#[derive(Debug, Clone)]
+struct RawArgumentFunction {
+    callee: String,
+    target: String,
+    argument_index: u32,
+    taken_address: bool,
+    byte_start: usize,
+    line: u32,
+}
+
+impl RawArgumentFunction {
+    fn attribute(&self, enclosing: &str, file_path: &str, git_hash: &str) -> ArgumentFunction {
+        ArgumentFunction {
+            target: self.target.clone(),
+            callee: self.callee.clone(),
+            argument_index: self.argument_index,
+            taken_address: self.taken_address,
+            file_path: file_path.to_string(),
+            git_file_hash: git_hash.to_string(),
+            byte_start: self.byte_start as u64,
+            line: self.line,
+            enclosing_function: enclosing.to_string(),
+        }
+    }
+}
+
+/// Names bound to values, by scope, used to tell an argument that names a
+/// function from one that names a variable.
+struct ValueNames {
+    file_scope: HashSet<String>,
+    per_function: Vec<(usize, usize, HashSet<String>)>,
+}
+
+impl ValueNames {
+    fn contains(&self, name: &str, at: usize) -> bool {
+        self.file_scope.contains(name)
+            || self
+                .per_function
+                .iter()
+                .any(|(start, end, names)| at >= *start && at < *end && names.contains(name))
+    }
 }
 
 /// A declared function-pointer variable or parameter.
@@ -925,6 +974,7 @@ impl TreeSitterAnalyzer {
             macros: raw_macros,
             dispatch_sites,
             registrations,
+            argument_functions,
         } = self.extract_all_with_embedded_data(
             &tree,
             source_code,
@@ -958,6 +1008,7 @@ impl TreeSitterAnalyzer {
             macros,
             dispatch_sites,
             registrations,
+            argument_functions,
         })
     }
 
@@ -991,6 +1042,7 @@ impl TreeSitterAnalyzer {
             functions,
             mut dispatch_sites,
             mut registrations,
+            argument_functions,
         } = self.extract_functions_with_calls(&ctx, &extraction)?;
 
         // Extract types (single traversal as before)
@@ -1021,6 +1073,7 @@ impl TreeSitterAnalyzer {
             macros,
             dispatch_sites,
             registrations,
+            argument_functions,
         })
     }
 
@@ -1203,6 +1256,8 @@ impl TreeSitterAnalyzer {
 
         extraction.pointer_vars = Self::collect_pointer_vars(tree.root_node(), source_code);
         extraction.registrations = Self::collect_registrations(tree.root_node(), source_code);
+        extraction.argument_functions =
+            Self::collect_argument_functions(tree.root_node(), source_code);
         extraction
             .registrations
             .extend(Self::collect_assignments(tree.root_node(), source_code));
@@ -1475,6 +1530,176 @@ impl TreeSitterAnalyzer {
     /// itself states. An initializer whose type is not stated is skipped: a
     /// registration filed under the wrong type joins with the wrong dispatch
     /// sites, which is worse than not having it.
+    /// Names that a scope binds to a value rather than to a function.
+    ///
+    /// `min_t(u32, len, size)` names no function even where the tree defines
+    /// one called `len`, so an argument is only worth recording when the file
+    /// does not declare that name as a variable or a parameter.
+    fn value_names(root: tree_sitter::Node, source: &str) -> ValueNames {
+        let mut file_scope = HashSet::new();
+        let mut per_function: Vec<(usize, usize, HashSet<String>)> = Vec::new();
+        let mut stack = vec![(root, false)];
+        while let Some((node, in_function)) = stack.pop() {
+            let entering_function = node.kind() == "function_definition";
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push((child, in_function || entering_function));
+            }
+            if entering_function {
+                let mut names = HashSet::new();
+                Self::declared_value_names(node, source, &mut names);
+                per_function.push((node.start_byte(), node.end_byte(), names));
+                continue;
+            }
+            if !in_function && node.kind() == "declaration" {
+                Self::declared_value_names(node, source, &mut file_scope);
+            }
+        }
+        ValueNames {
+            file_scope,
+            per_function,
+        }
+    }
+
+    /// Identifiers a declaration binds, skipping function prototypes: those
+    /// name a function, which is what an argument is being tested against.
+    fn declared_value_names(node: tree_sitter::Node, source: &str, out: &mut HashSet<String>) {
+        let mut stack = vec![node];
+        while let Some(current) = stack.pop() {
+            let mut cursor = current.walk();
+            for child in current.children(&mut cursor) {
+                stack.push(child);
+            }
+            if !matches!(current.kind(), "declaration" | "parameter_declaration") {
+                continue;
+            }
+            let mut cursor = current.walk();
+            for declarator in current.children_by_field_name("declarator", &mut cursor) {
+                let mut node = declarator;
+                let mut is_function = false;
+                loop {
+                    if node.kind() == "function_declarator" {
+                        is_function = true;
+                    }
+                    if node.kind() == "identifier" {
+                        if !is_function {
+                            out.insert(source[node.byte_range()].to_string());
+                        }
+                        break;
+                    }
+                    match node
+                        .child_by_field_name("declarator")
+                        .or_else(|| node.named_child(0))
+                    {
+                        Some(next) => node = next,
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Calls that name an identifier as an argument.
+    ///
+    /// ```text
+    /// request_irq(irq, e1000_intr, flags, name, dev);
+    /// ```
+    ///
+    /// `e1000_intr` is handed to `request_irq`, which is the edge that makes
+    /// the handler reachable. Whether the callee stores it, calls it, or
+    /// merely names it cannot be decided here: the callee's body is usually
+    /// in another file. So every identifier argument the file does not bind
+    /// to a value is recorded, and the reader keeps those that name a
+    /// function.
+    fn collect_argument_functions(
+        root: tree_sitter::Node,
+        source: &str,
+    ) -> Vec<RawArgumentFunction> {
+        let bound = Self::value_names(root, source);
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+            if node.kind() != "call_expression" {
+                continue;
+            }
+            let Some(callee) = node.child_by_field_name("function") else {
+                continue;
+            };
+            if callee.kind() != "identifier" {
+                continue;
+            }
+            let callee_name = &source[callee.byte_range()];
+            if Self::names_without_handing_over(callee_name) {
+                continue;
+            }
+            let Some(arguments) = node.child_by_field_name("arguments") else {
+                continue;
+            };
+            let mut cursor = arguments.walk();
+            for (index, argument) in arguments.named_children(&mut cursor).enumerate() {
+                let (identifier, taken_address) = match argument.kind() {
+                    "identifier" => (Some(argument), false),
+                    "pointer_expression" => (
+                        argument
+                            .child_by_field_name("argument")
+                            .filter(|node| node.kind() == "identifier"),
+                        true,
+                    ),
+                    _ => (None, false),
+                };
+                let Some(identifier) = identifier else {
+                    continue;
+                };
+                let name = &source[identifier.byte_range()];
+                // A call naming itself is recursion, not a handover.
+                if name == callee_name || Self::is_c_keyword(name) {
+                    continue;
+                }
+                if bound.contains(name, identifier.start_byte()) {
+                    continue;
+                }
+                out.push(RawArgumentFunction {
+                    callee: callee_name.to_string(),
+                    target: name.to_string(),
+                    argument_index: index as u32,
+                    taken_address,
+                    byte_start: identifier.start_byte(),
+                    line: identifier.start_position().row as u32 + 1,
+                });
+            }
+        }
+        out
+    }
+
+    /// Callees that name a function without handing it anywhere.
+    ///
+    /// An export names its own function, and `container_of` takes a type and
+    /// a member. `module_init` and `module_exit` install one, but the initcall
+    /// they build is recorded already, and recording it twice would double
+    /// every module entry point.
+    fn names_without_handing_over(callee: &str) -> bool {
+        callee.starts_with("EXPORT_SYMBOL")
+            || callee.starts_with("KSYMTAB")
+            || callee.starts_with("SYMBOL_")
+            || callee.starts_with("MODULE_")
+            || callee.starts_with("BTF_ID")
+            || matches!(
+                callee,
+                "container_of"
+                    | "container_of_const"
+                    | "offsetof"
+                    | "offsetofend"
+                    | "sizeof_field"
+                    | "typeof_member"
+                    | "module_init"
+                    | "module_exit"
+            )
+    }
+
     fn collect_registrations(root: tree_sitter::Node, source: &str) -> Vec<RawRegistration> {
         let mut found = Vec::new();
         let mut stack = vec![root];
@@ -2296,6 +2521,8 @@ impl TreeSitterAnalyzer {
         let mut registrations: Vec<Registration> = Vec::new();
         let mut covered_sites: std::collections::HashSet<usize> = Default::default();
         let mut covered_registrations: std::collections::HashSet<usize> = Default::default();
+        let mut argument_functions: Vec<ArgumentFunction> = Vec::new();
+        let mut covered_argument_functions: std::collections::HashSet<usize> = Default::default();
         let mut pointer_call_sites: Vec<RawDispatchSite> = Vec::new();
         let queries = self.get_queries(ctx.language);
         let mut cursor = QueryCursor::new();
@@ -2517,6 +2744,19 @@ impl TreeSitterAnalyzer {
                     ));
                 }
 
+                for raw in extraction.argument_functions.iter().filter(|arg| {
+                    arg.byte_start >= function_start_byte && arg.byte_start < function_end_byte
+                }) {
+                    if !covered_argument_functions.insert(raw.byte_start) {
+                        continue;
+                    }
+                    argument_functions.push(raw.attribute(
+                        &name,
+                        &self.make_relative_path(ctx.file_path, ctx.source_root),
+                        ctx.git_hash,
+                    ));
+                }
+
                 let func = FunctionInfo {
                     name: name.clone(),
                     file_path: self.make_relative_path(ctx.file_path, ctx.source_root),
@@ -2563,6 +2803,18 @@ impl TreeSitterAnalyzer {
             ));
         }
 
+        for raw in extraction
+            .argument_functions
+            .iter()
+            .filter(|arg| !covered_argument_functions.contains(&arg.byte_start))
+        {
+            argument_functions.push(raw.attribute(
+                "",
+                &self.make_relative_path(ctx.file_path, ctx.source_root),
+                ctx.git_hash,
+            ));
+        }
+
         // Python module level and class bodies, C++ and Rust static
         // initializers: a dispatch that belongs to no function still happened.
         for raw in extraction
@@ -2581,6 +2833,7 @@ impl TreeSitterAnalyzer {
             functions,
             dispatch_sites,
             registrations,
+            argument_functions,
         })
     }
 
