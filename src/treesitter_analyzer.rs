@@ -2853,14 +2853,9 @@ impl TreeSitterAnalyzer {
                         // A macro's own parameter is not a function.
                         // `#define hypercall_update(hc) static_call_update(hv_hypercall, hc)`
                         // installs whatever a caller passes, and `hc` names
-                        // that nowhere. Scoped to static calls: a macro that
-                        // declares an ops table records its parameter on
-                        // purpose, which is a separate decision with its own
-                        // test.
+                        // that nowhere.
                         if let Some(names) = parameters.as_ref() {
-                            facts.registrations.retain(|r| {
-                                r.member != STATIC_CALL_MEMBER || !names.contains(&r.target)
-                            });
+                            facts.registrations.retain(|r| !names.contains(&r.target));
                         }
                         for registration in &mut facts.registrations {
                             registration.byte_start += body_start;
@@ -4915,24 +4910,25 @@ mod tests {
     }
 
     #[test]
-    fn a_macro_that_declares_an_ops_table_registers_it() {
-        // ACPI and the error-injection macros build tables this way: the
-        // macro declares the thing it initialises, so its type is stated.
+    fn a_macro_that_declares_a_table_records_no_function() {
+        // A macro that declares what it initialises does state the type, so
+        // this used to be recorded as `ops::run = fn`. But `fn` is the
+        // macro's own parameter: it names whatever a caller passes, which is
+        // to say nothing, and a row claiming a function called `fn` was
+        // installed is a claim about a function that does not exist.
+        //
+        // Over a Linux tree this shape recorded 16 rows across 12 macros, and
+        // none of them installed a function: `TNUM(_v, _m)` fills
+        // `tnum::value` with an integer, `XA_LIMIT(_min, _max)` fills
+        // `xa_limit::min`, `UVC_INFO_QUIRK(q)` fills a bitmask. They are value
+        // constructors, and what they fill is not callable.
         let found = registrations_of(
             "struct ops { int (*run)(void); };\n\
              #define DEFINE_OPS(name, fn) struct ops name = { .run = fn }\n",
             "test.c",
         );
 
-        assert_eq!(
-            found,
-            vec![(
-                "ops".to_string(),
-                "run".to_string(),
-                "fn".to_string(),
-                "DEFINE_OPS".to_string()
-            )]
-        );
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
