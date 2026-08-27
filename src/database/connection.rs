@@ -1087,6 +1087,54 @@ impl DatabaseManager {
     /// whole tree's types are available. A row whose path cannot be resolved
     /// keeps an empty container and joins nothing, which is what it did
     /// before it was recorded at all.
+    /// Drop table rows whose claim the typedef does not support.
+    ///
+    /// `static bfa_isr_func_t bfa_isrs[N] = { ... }` is a table only because
+    /// `bfa_isr_func_t` is a typedef for a function pointer, and the file that
+    /// declares the table does not say so. The extractor records the claim and
+    /// the name; this is where it is checked, against the typedef the index
+    /// holds. An array of enum constants declared the same way keeps no rows.
+    async fn keep_verified_tables(
+        &self,
+        registrations: &mut Vec<crate::types::Registration>,
+        git_sha: &str,
+    ) -> Result<()> {
+        let claimed: HashSet<String> = registrations
+            .iter()
+            .filter(|r| r.member == crate::types::ARRAY_ELEMENT_MEMBER)
+            .filter_map(|r| r.container_base_type.clone())
+            .collect();
+        if claimed.is_empty() {
+            return Ok(());
+        }
+
+        let mut points_at_a_function = HashMap::new();
+        for name in claimed {
+            // A typedef the index does not hold cannot support the claim.
+            // Saying so costs a table; keeping it would invent one.
+            let verdict = match self.find_typedef_git_aware(&name, git_sha).await? {
+                Some(typedef) => {
+                    let underlying = typedef.underlying_type;
+                    underlying.contains("(*)") || underlying.contains("(*")
+                }
+                None => false,
+            };
+            points_at_a_function.insert(name, verdict);
+        }
+
+        registrations.retain(|r| {
+            let Some(claim) = r.container_base_type.as_deref() else {
+                return true;
+            };
+            if r.member != crate::types::ARRAY_ELEMENT_MEMBER {
+                return true;
+            }
+            points_at_a_function.get(claim).copied().unwrap_or(false)
+        });
+
+        Ok(())
+    }
+
     async fn resolve_chained_registrations(
         &self,
         registrations: &mut [crate::types::Registration],
@@ -1193,6 +1241,8 @@ impl DatabaseManager {
         );
         self.resolve_chained_registrations(&mut registrations, &manifest)
             .await?;
+        self.keep_verified_tables(&mut registrations, git_sha)
+            .await?;
         registrations.retain(|r| r.container_type == container_type);
 
         Ok(registrations)
@@ -1211,6 +1261,8 @@ impl DatabaseManager {
             |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
         );
         self.resolve_chained_registrations(&mut registrations, &manifest)
+            .await?;
+        self.keep_verified_tables(&mut registrations, git_sha)
             .await?;
 
         Ok(registrations)
@@ -1265,6 +1317,8 @@ impl DatabaseManager {
             |r| (r.file_path.as_str(), r.git_file_hash.as_str()),
         );
         self.resolve_chained_registrations(&mut registrations, &manifest)
+            .await?;
+        self.keep_verified_tables(&mut registrations, git_sha)
             .await?;
         let stated = at_revision(
             self.dispatch_site_store.find_by_target(target).await?,

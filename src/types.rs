@@ -154,6 +154,22 @@ pub struct ResolvedDispatch {
     pub targets: Vec<String>,
 }
 
+/// The member recorded for a call through, or an installation into, an
+/// element of an array of function pointers.
+///
+/// A table has no members to name, so both sides of the join use this in
+/// place of one and the container is the array itself. No struct declares a
+/// member of this name, so a table cannot collide with a type.
+pub const ARRAY_ELEMENT_MEMBER: &str = "[]";
+
+/// The member recorded for a call through, or an installation into, a
+/// static-call key.
+///
+/// A key holds one function, patched into the call site at run time, so there
+/// is no member and no index — the key is the whole slot. As with a table,
+/// both sides of the join use this in place of a member name.
+pub const STATIC_CALL_MEMBER: &str = "()";
+
 /// How a dispatch site was written. Stored, so values are append-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DispatchKind {
@@ -170,6 +186,13 @@ pub enum DispatchKind {
     /// A candidate the source itself names, as the kernel's INDIRECT_CALL_n
     /// macros do to help the branch predictor.
     MacroDeclared,
+    /// `table[i](...)`: a call through an element of an array of function
+    /// pointers. The table is the container; a runtime index leaves every
+    /// element it holds a candidate.
+    ArrayElement,
+    /// `static_call(key)(...)`: a direct call patched at run time to whatever
+    /// was installed in the key.
+    StaticCall,
 }
 
 impl DispatchKind {
@@ -181,6 +204,8 @@ impl DispatchKind {
             DispatchKind::PointerLocal => "pointer_local",
             DispatchKind::PointerParam => "pointer_param",
             DispatchKind::MacroDeclared => "macro_declared",
+            DispatchKind::ArrayElement => "array_element",
+            DispatchKind::StaticCall => "static_call",
         }
     }
 
@@ -195,6 +220,8 @@ impl DispatchKind {
             "pointer_local" => Some(DispatchKind::PointerLocal),
             "pointer_param" => Some(DispatchKind::PointerParam),
             "macro_declared" => Some(DispatchKind::MacroDeclared),
+            "array_element" => Some(DispatchKind::ArrayElement),
+            "static_call" => Some(DispatchKind::StaticCall),
             _ => None,
         }
     }

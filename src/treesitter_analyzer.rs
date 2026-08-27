@@ -8,7 +8,8 @@ use tree_sitter::{Parser, Query, QueryCursor, Tree};
 
 use crate::types::{
     DispatchKind, DispatchSite, FieldInfo, FunctionInfo, GlobalTypeRegistry, MacroParams,
-    ParameterInfo, Registration, RegistrationKind, TypeInfo,
+    ParameterInfo, Registration, RegistrationKind, TypeInfo, ARRAY_ELEMENT_MEMBER,
+    STATIC_CALL_MEMBER,
 };
 // TemporaryCallRelationship import removed - call relationships are now embedded in function JSON columns
 use crate::hash::compute_file_hash;
@@ -215,6 +216,15 @@ pub struct TreeSitterAnalyzer {
     python_queries: &'static LanguageQueries,
 }
 
+/// A table of function pointers, and the typedef that hid that fact when the
+/// declaration did not spell it out.
+struct Table {
+    name: String,
+    /// The element type, when it is a name defined elsewhere. `None` means
+    /// the declarator itself said the elements are functions.
+    element_type: Option<String>,
+}
+
 impl TreeSitterAnalyzer {
     pub fn new() -> Result<Self> {
         // Initialize C parser and queries
@@ -382,6 +392,16 @@ impl TreeSitterAnalyzer {
                 type: (_) @underlying_type
                 declarator: (type_identifier) @typedef_name
             ) @typedef
+
+            (type_definition
+                type: (_) @underlying_type
+                declarator: (function_declarator
+                    declarator: (parenthesized_declarator
+                        (pointer_declarator declarator: (type_identifier) @typedef_name)
+                    )
+                    parameters: (parameter_list) @pointer_params
+                )
+            ) @typedef
         "#,
         )?;
 
@@ -428,6 +448,20 @@ impl TreeSitterAnalyzer {
                 function: (identifier) @macro_name
                 arguments: (argument_list) @macro_args
             ) @macro_call
+
+            (call_expression
+                function: (subscript_expression
+                    argument: (_) @array_name
+                    index: (_) @array_index
+                )
+            ) @array_call
+
+            (call_expression
+                function: (call_expression
+                    function: (identifier) @static_call_name
+                    arguments: (argument_list (identifier) @static_call_key)
+                )
+            ) @static_call_site
         "#,
         )?;
 
@@ -855,6 +889,10 @@ impl TreeSitterAnalyzer {
             let mut receiver: Option<tree_sitter::Node> = None;
             let mut macro_name: Option<tree_sitter::Node> = None;
             let mut macro_args: Option<tree_sitter::Node> = None;
+            let mut array_name: Option<tree_sitter::Node> = None;
+            let mut static_call_name: Option<tree_sitter::Node> = None;
+            let mut static_call_key: Option<tree_sitter::Node> = None;
+            let mut static_call_site: Option<tree_sitter::Node> = None;
 
             for capture in call_match.captures {
                 match queries.call_query.capture_names()[capture.index as usize] {
@@ -868,6 +906,10 @@ impl TreeSitterAnalyzer {
                     "receiver" => receiver = Some(capture.node),
                     "macro_name" => macro_name = Some(capture.node),
                     "macro_args" => macro_args = Some(capture.node),
+                    "array_name" => array_name = Some(capture.node),
+                    "static_call_name" => static_call_name = Some(capture.node),
+                    "static_call_key" => static_call_key = Some(capture.node),
+                    "static_call_site" => static_call_site = Some(capture.node),
                     "pointer_expr" => {
                         // `(*fp)(...)`: a call through a pointer value, which
                         // the plain call pattern does not match at all.
@@ -887,6 +929,77 @@ impl TreeSitterAnalyzer {
                         }
                     }
                     _ => {}
+                }
+            }
+
+            // `table[i](...)`: the call names no function and no member, and
+            // the table it indexes is the only thing that says what it can
+            // reach. Record the table as the container, with every element a
+            // candidate — which is what a runtime index leaves open, and what
+            // the kernel's exit-handler and syscall tables are.
+            // `static_call(key)(vcpu)`: the callee is itself a call, naming
+            // the key that holds the function. The branch is patched at run
+            // time, so nothing here dispatches through a pointer.
+            if let (Some(name), Some(key), Some(call)) =
+                (static_call_name, static_call_key, static_call_site)
+            {
+                if source_code[name.byte_range()].trim() != "static_call" {
+                    continue;
+                }
+                // `kvm_x86_call(op)` writes `static_call(kvm_x86_##op)`,
+                // which parses as an identifier and the rest of the paste
+                // beside it. The name it means does not exist until the
+                // preprocessor makes it, and half of one joins to nothing, so
+                // the key has to be the only thing in there.
+                if key
+                    .parent()
+                    .is_some_and(|args| args.named_child_count() != 1)
+                {
+                    continue;
+                }
+                let key = source_code[key.byte_range()].to_string();
+                extraction.member_sites.push(RawDispatchSite {
+                    member: STATIC_CALL_MEMBER.to_string(),
+                    receiver_expr: Some(key.clone()),
+                    receiver_type: Some(key),
+                    receiver_base_type: None,
+                    receiver_field: None,
+                    kind: DispatchKind::StaticCall,
+                    byte_start: call.start_byte(),
+                    line: call.start_position().row as u32 + 1,
+                    target: None,
+                });
+            }
+
+            if let Some(array) = array_name {
+                // The thing indexed has to be nameable, or there is nothing
+                // to join a table against. A bare name is the table itself;
+                // a field is a table held in a struct, which receiver typing
+                // can still say something about. Anything else names no
+                // container — a macro body can parse as a subscripted call —
+                // and recording one would invent a table out of whatever text
+                // sat between the brackets.
+                let container = match array.kind() {
+                    "identifier" => Some(collapse_whitespace(&source_code[array.byte_range()])),
+                    "field_expression" => None,
+                    _ => continue,
+                };
+                let name = collapse_whitespace(&source_code[array.byte_range()]);
+                if !name.is_empty() {
+                    extraction.member_sites.push(RawDispatchSite {
+                        member: ARRAY_ELEMENT_MEMBER.to_string(),
+                        receiver_expr: Some(name),
+                        // A table is named, not typed: the array variable is
+                        // the container, and no struct declares a member of
+                        // this name, so the two cannot collide.
+                        receiver_type: container,
+                        receiver_base_type: None,
+                        receiver_field: None,
+                        kind: DispatchKind::ArrayElement,
+                        byte_start: array.start_byte(),
+                        line: array.start_position().row as u32 + 1,
+                        target: None,
+                    });
                 }
             }
 
@@ -1008,6 +1121,18 @@ impl TreeSitterAnalyzer {
         }
 
         for site in sites.iter_mut() {
+            // A table that named itself already has its container: asking
+            // the declaration what `kvm_vmx_exit_handlers` is answers `int`,
+            // which would replace the answer with a wrong one. A table held
+            // in a struct field has not, and typing its base is what would
+            // let it be resolved later.
+            if matches!(
+                site.kind,
+                DispatchKind::ArrayElement | DispatchKind::StaticCall
+            ) && site.receiver_type.is_some()
+            {
+                continue;
+            }
             let Some(receiver) = site.receiver_expr.as_deref() else {
                 continue;
             };
@@ -1206,7 +1331,25 @@ impl TreeSitterAnalyzer {
                 stack.push(child);
             }
 
+            if let Some(registration) = Self::initcall(node, source) {
+                found.push(registration);
+                continue;
+            }
+
+            if let Some(registration) = Self::static_call_install(node, source) {
+                found.push(registration);
+                continue;
+            }
+
             if node.kind() != "initializer_list" {
+                continue;
+            }
+
+            // A table of function pointers names no type to fill and no
+            // member to fill it with. The table itself is the container, and
+            // every element is a way in.
+            if let Some(table) = Self::function_pointer_table(node, source) {
+                found.extend(Self::table_elements(node, source, &table));
                 continue;
             }
 
@@ -1450,6 +1593,294 @@ impl TreeSitterAnalyzer {
         }
 
         members
+    }
+
+    /// A function installed in a static-call key.
+    ///
+    /// ```text
+    /// DEFINE_STATIC_CALL(kvm_x86_run, vmx_vcpu_run);
+    /// static_call_update(kvm_x86_run, svm_vcpu_run);
+    /// ```
+    ///
+    /// The key is a slot holding one function, and a call through it is
+    /// patched into a direct branch at run time. Nothing dispatches through a
+    /// pointer and nothing assigns one, so neither the member walk nor the
+    /// table walk sees this.
+    ///
+    /// A key built by pasting — the kernel writes `static_call(kvm_x86_##op)`
+    /// behind `kvm_x86_call(op)` — is not recorded, because the name does not
+    /// exist until the preprocessor makes it.
+    fn static_call_install(node: tree_sitter::Node, source: &str) -> Option<RawRegistration> {
+        let call = match node.kind() {
+            "expression_statement" => node.named_child(0)?,
+            "call_expression" => node,
+            _ => return None,
+        };
+        if call.kind() != "call_expression" {
+            return None;
+        }
+
+        let name = call.child_by_field_name("function")?;
+        if name.kind() != "identifier" {
+            return None;
+        }
+        let name = &source[name.byte_range()];
+        // Only these two install the function they name.
+        // `DEFINE_STATIC_CALL_NULL` and `DEFINE_STATIC_CALL_RET0` take a
+        // prototype in that position and install nothing or a stub:
+        // `DEFINE_STATIC_CALL_NULL(amd_pmu_branch_reset,
+        // amd_pmu_branch_reset_t)` names a type, and the key starts out NULL.
+        if !matches!(name, "DEFINE_STATIC_CALL" | "static_call_update") {
+            return None;
+        }
+
+        let arguments = call.child_by_field_name("arguments")?;
+        let mut cursor = arguments.walk();
+        let named: Vec<tree_sitter::Node> = arguments.named_children(&mut cursor).collect();
+        let [key, target] = named[..] else {
+            return None;
+        };
+        if key.kind() != "identifier" || target.kind() != "identifier" {
+            return None;
+        }
+
+        let (key, target) = (
+            source[key.byte_range()].to_string(),
+            source[target.byte_range()].to_string(),
+        );
+        if key.is_empty() || target.is_empty() {
+            return None;
+        }
+
+        Some(RawRegistration {
+            container_type: key,
+            container_base_type: None,
+            container_field: None,
+            member: STATIC_CALL_MEMBER.to_string(),
+            target,
+            byte_start: call.start_byte(),
+            line: call.start_position().row as u32 + 1,
+            kind: RegistrationKind::Assignment,
+        })
+    }
+
+    /// A function the kernel runs at boot, named by the macro that files it.
+    ///
+    /// ```text
+    /// device_initcall(foo_init);
+    /// ```
+    ///
+    /// The macro puts a pointer to `foo_init` in a section that
+    /// `do_initcalls()` walks, so nothing in the source calls it and nothing
+    /// assigns it anywhere: the function reads as dead. What the file does say
+    /// is which level it is filed under, and that is what this records.
+    ///
+    /// No dispatch site is claimed. The call is a walk over a linker section
+    /// in another file, and pretending to know that from here would be a
+    /// guess. `registrations foo_init` answers; `callers foo_init` still says
+    /// nothing calls it, which remains true of the source.
+    fn initcall(node: tree_sitter::Node, source: &str) -> Option<RawRegistration> {
+        // File scope: an initcall inside a function is something else.
+        if node.kind() != "expression_statement" || node.parent()?.kind() != "translation_unit" {
+            return None;
+        }
+
+        let call = node
+            .named_child(0)
+            .filter(|c| c.kind() == "call_expression")?;
+        let level = call.child_by_field_name("function")?;
+        if level.kind() != "identifier" {
+            return None;
+        }
+        let level = &source[level.byte_range()];
+        if !Self::is_initcall_macro(level) {
+            return None;
+        }
+
+        let arguments = call.child_by_field_name("arguments")?;
+        let mut cursor = arguments.walk();
+        let named: Vec<tree_sitter::Node> = arguments.named_children(&mut cursor).collect();
+        let [target] = named[..] else {
+            return None;
+        };
+        if target.kind() != "identifier" {
+            return None;
+        }
+
+        let name = source[target.byte_range()].to_string();
+        if name.is_empty() {
+            return None;
+        }
+
+        Some(RawRegistration {
+            container_type: level.to_string(),
+            container_base_type: None,
+            container_field: None,
+            member: ARRAY_ELEMENT_MEMBER.to_string(),
+            target: name,
+            byte_start: target.start_byte(),
+            line: target.start_position().row as u32 + 1,
+            kind: RegistrationKind::DesignatedInit,
+        })
+    }
+
+    /// Whether a name files a function into an init or exit section.
+    ///
+    /// A closed family, spelled out rather than pattern-matched: `module_init`
+    /// is one and `mutex_init` is not, and a suffix rule cannot tell them
+    /// apart.
+    fn is_initcall_macro(name: &str) -> bool {
+        const LEVELS: &[&str] = &[
+            "early_initcall",
+            "pure_initcall",
+            "core_initcall",
+            "core_initcall_sync",
+            "postcore_initcall",
+            "postcore_initcall_sync",
+            "arch_initcall",
+            "arch_initcall_sync",
+            "subsys_initcall",
+            "subsys_initcall_sync",
+            "fs_initcall",
+            "fs_initcall_sync",
+            "rootfs_initcall",
+            "device_initcall",
+            "device_initcall_sync",
+            "late_initcall",
+            "late_initcall_sync",
+            "console_initcall",
+            "security_initcall",
+            "module_init",
+            "module_exit",
+            "subsys_initcall_entry",
+        ];
+        LEVELS.contains(&name)
+    }
+
+    /// The name of the array of function pointers this list initialises.
+    ///
+    /// ```text
+    /// static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
+    ///         [EXIT_REASON_CPUID] = kvm_emulate_cpuid,
+    /// ```
+    ///
+    /// The declaration states `int`, which says nothing, and the elements
+    /// name an index rather than a member — so neither the type walk nor the
+    /// member walk can see this, and everything reached through such a table
+    /// looks uncalled. What identifies the slot is the table's own name.
+    ///
+    /// Recognised by shape: a declarator that is a function returning through
+    /// a parenthesised pointer to an array, which is how C spells an array of
+    /// function pointers and is not how it spells anything else.
+    fn function_pointer_table(list: tree_sitter::Node, source: &str) -> Option<Table> {
+        let parent = list.parent()?;
+        if parent.kind() != "init_declarator" {
+            return None;
+        }
+
+        let mut node = parent.child_by_field_name("declarator")?;
+        let (mut saw_function, mut saw_pointer, mut saw_array) = (false, false, false);
+        loop {
+            match node.kind() {
+                "function_declarator" => saw_function = true,
+                "pointer_declarator" => saw_pointer = true,
+                "array_declarator" => saw_array = true,
+                "identifier" => break,
+                _ => {}
+            }
+            node = node
+                .child_by_field_name("declarator")
+                .or_else(|| node.named_child(0))?;
+        }
+
+        let name = source[node.byte_range()].to_string();
+        if name.is_empty() {
+            return None;
+        }
+
+        // Written out: `int (*handlers[])(struct kvm_vcpu *)`. The declarator
+        // says outright that the elements are functions.
+        if saw_function && saw_pointer && saw_array {
+            return Some(Table {
+                name,
+                element_type: None,
+            });
+        }
+
+        // Hidden behind a typedef: `static bfa_isr_func_t bfa_isrs[N]`. All
+        // the declarator says is that this is an array of something named
+        // elsewhere, so record which name and let the reader ask the typedef
+        // whether it is a function pointer. Guessing here would make a table
+        // out of every array of enum constants.
+        let declared = list.parent()?.parent()?.child_by_field_name("type")?;
+        if saw_array && !saw_function && declared.kind() == "type_identifier" {
+            return Some(Table {
+                name,
+                element_type: Some(source[declared.byte_range()].to_string()),
+            });
+        }
+
+        None
+    }
+
+    /// The functions a table of function pointers holds.
+    ///
+    /// Both designated elements, `[EXIT_REASON_CPUID] = kvm_emulate_cpuid`,
+    /// and positional ones. The index is not recorded as the member: a call
+    /// through the table computes it at run time, so every element is a
+    /// candidate and recording which one would suggest a precision the join
+    /// does not have.
+    fn table_elements(
+        list: tree_sitter::Node,
+        source: &str,
+        table: &Table,
+    ) -> Vec<RawRegistration> {
+        let mut found = Vec::new();
+        let mut cursor = list.walk();
+
+        for child in list.named_children(&mut cursor) {
+            let value = match child.kind() {
+                "initializer_pair" => match child.child_by_field_name("value") {
+                    Some(value) => value,
+                    None => continue,
+                },
+                "identifier" => child,
+                _ => continue,
+            };
+
+            let target_node = match value.kind() {
+                "identifier" => Some(value),
+                "pointer_expression" => value
+                    .child_by_field_name("argument")
+                    .filter(|a| a.kind() == "identifier"),
+                _ => None,
+            };
+            let Some(target_node) = target_node else {
+                continue;
+            };
+
+            let target = source[target_node.byte_range()].to_string();
+            if target.is_empty() {
+                continue;
+            }
+
+            found.push(RawRegistration {
+                container_type: table.name.clone(),
+                // Set only when a typedef stands between the declaration and
+                // the fact that these are functions: the row is a claim that
+                // holds if that name is a function-pointer typedef, and the
+                // reader checks it.
+                container_base_type: table.element_type.clone(),
+                container_field: None,
+                member: ARRAY_ELEMENT_MEMBER.to_string(),
+                target,
+                byte_start: target_node.start_byte(),
+                line: target_node.start_position().row as u32 + 1,
+                kind: RegistrationKind::DesignatedInit,
+            });
+        }
+
+        found
     }
 
     /// The type an initializer list fills in, and the path of fields to reach
@@ -2227,6 +2658,7 @@ impl TreeSitterAnalyzer {
             let mut line_start = 0;
             let mut typedef_start_byte = 0;
             let mut typedef_end_byte = 0;
+            let mut pointer_params: Option<String> = None;
 
             for capture in m.captures {
                 let node = capture.node;
@@ -2240,6 +2672,12 @@ impl TreeSitterAnalyzer {
                     }
                     "underlying_type" => {
                         underlying_type = Some(text.to_string());
+                    }
+                    // `typedef void (*bfa_isr_func_t)(struct bfa_s *)` aliases
+                    // a function pointer, and the return type alone would read
+                    // as an alias for `void`. Spell what it points at.
+                    "pointer_params" => {
+                        pointer_params = Some(collapse_whitespace(text));
                     }
                     "typedef" => {
                         typedef_start_byte = node.start_byte();
@@ -2255,6 +2693,15 @@ impl TreeSitterAnalyzer {
             if let Some(name) = typedef_name {
                 // Get the complete typedef definition
                 let definition = &source[typedef_start_byte..typedef_end_byte];
+
+                // What a function-pointer typedef aliases is a pointer to a
+                // function, not the return type the grammar puts in `type`.
+                let underlying_type = match pointer_params {
+                    Some(params) => underlying_type
+                        .map(|returns| format!("{returns} (*){params}"))
+                        .or(Some(format!("(*){params}"))),
+                    None => underlying_type,
+                };
 
                 // Create TypeInfo with kind="typedef"
                 // Store underlying type info in the definition field
@@ -2402,6 +2849,13 @@ impl TreeSitterAnalyzer {
                         for site in &mut facts.sites {
                             site.byte_start += body_start;
                             site.line = body_line + site.line.saturating_sub(1);
+                        }
+                        // A macro's own parameter is not a function.
+                        // `#define hypercall_update(hc) static_call_update(hv_hypercall, hc)`
+                        // installs whatever a caller passes, and `hc` names
+                        // that nowhere.
+                        if let Some(names) = parameters.as_ref() {
+                            facts.registrations.retain(|r| !names.contains(&r.target));
                         }
                         for registration in &mut facts.registrations {
                             registration.byte_start += body_start;
@@ -4456,24 +4910,25 @@ mod tests {
     }
 
     #[test]
-    fn a_macro_that_declares_an_ops_table_registers_it() {
-        // ACPI and the error-injection macros build tables this way: the
-        // macro declares the thing it initialises, so its type is stated.
+    fn a_macro_that_declares_a_table_records_no_function() {
+        // A macro that declares what it initialises does state the type, so
+        // this used to be recorded as `ops::run = fn`. But `fn` is the
+        // macro's own parameter: it names whatever a caller passes, which is
+        // to say nothing, and a row claiming a function called `fn` was
+        // installed is a claim about a function that does not exist.
+        //
+        // Over a Linux tree this shape recorded 16 rows across 12 macros, and
+        // none of them installed a function: `TNUM(_v, _m)` fills
+        // `tnum::value` with an integer, `XA_LIMIT(_min, _max)` fills
+        // `xa_limit::min`, `UVC_INFO_QUIRK(q)` fills a bitmask. They are value
+        // constructors, and what they fill is not callable.
         let found = registrations_of(
             "struct ops { int (*run)(void); };\n\
              #define DEFINE_OPS(name, fn) struct ops name = { .run = fn }\n",
             "test.c",
         );
 
-        assert_eq!(
-            found,
-            vec![(
-                "ops".to_string(),
-                "run".to_string(),
-                "fn".to_string(),
-                "DEFINE_OPS".to_string()
-            )]
-        );
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
@@ -4814,6 +5269,317 @@ mod tests {
 
         let run = found.iter().find(|r| r.member == "run").unwrap();
         assert_eq!(run.container_type, "outer");
+    }
+
+    #[test]
+    fn a_typedef_for_a_function_pointer_is_recorded() {
+        // `typedef void (*bfa_isr_func_t)(struct bfa_s *)` puts the name
+        // inside a function declarator, so a query wanting a bare
+        // type_identifier matches nothing and the typedef is not recorded at
+        // all. Every table declared through one is then unrecognisable.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "typedef void (*bfa_isr_func_t)(struct bfa_s *bfa);\n\
+                 typedef unsigned long sector_t;\n",
+                Path::new("bfa.h"),
+                "testhash",
+                None,
+            )
+            .unwrap();
+
+        let typedefs: Vec<&TypeInfo> = analysis
+            .types
+            .iter()
+            .filter(|t| t.kind == "typedef")
+            .collect();
+        let names: Vec<&str> = typedefs.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"bfa_isr_func_t"), "{names:?}");
+        assert!(names.contains(&"sector_t"), "{names:?}");
+
+        let pointer = typedefs
+            .iter()
+            .find(|t| t.name == "bfa_isr_func_t")
+            .unwrap();
+        assert!(
+            pointer.definition.contains("(*)"),
+            "a reader cannot tell it is a function pointer: {:?}",
+            pointer.definition
+        );
+    }
+
+    #[test]
+    fn a_static_call_that_installs_nothing_records_nothing() {
+        // `DEFINE_STATIC_CALL_NULL(name, type)` takes a prototype in the
+        // second position and leaves the key NULL, so the name there is a
+        // type and nothing is installed.
+        let found = registration_rows(
+            "typedef void (*amd_pmu_branch_reset_t)(void);\n\
+             DEFINE_STATIC_CALL_NULL(amd_pmu_branch_reset, amd_pmu_branch_reset_t);\n",
+            "core.c",
+        );
+
+        assert!(
+            found.iter().all(|r| r.member != "()"),
+            "a prototype was recorded as an installed function: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_macro_parameter_is_not_an_installed_function() {
+        // `#define hypercall_update(hc) static_call_update(hv_hypercall, hc)`
+        // installs whatever a caller passes; `hc` names that nowhere.
+        let found = registration_rows(
+            "#define hypercall_update(hc) static_call_update(hv_hypercall, hc)\n",
+            "mshyperv.c",
+        );
+
+        assert!(
+            found.iter().all(|r| r.target != "hc"),
+            "a macro parameter was recorded as a function: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_static_call_key_holds_the_function_installed_in_it() {
+        let found = registration_rows(
+            "int vmx_vcpu_run(struct kvm_vcpu *vcpu);\n\
+             DEFINE_STATIC_CALL(kvm_x86_run, vmx_vcpu_run);\n",
+            "x86.c",
+        );
+
+        let row = found
+            .iter()
+            .find(|r| r.target == "vmx_vcpu_run")
+            .unwrap_or_else(|| panic!("not recorded: {found:?}"));
+        assert_eq!(row.container_type, "kvm_x86_run");
+        assert_eq!(row.member, "()");
+    }
+
+    #[test]
+    fn a_call_through_a_static_call_key_is_a_dispatch_site() {
+        let (_functions, sites) = analyze(
+            "int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)\n\
+             {\n\
+             \tint r = 0;\n\
+             \tr = static_call(kvm_x86_run)(vcpu);\n\
+             \treturn r;\n\
+             }\n",
+            "x86.c",
+        );
+
+        let site = sites
+            .iter()
+            .find(|s| s.kind == DispatchKind::StaticCall)
+            .unwrap_or_else(|| panic!("no static call site: {sites:?}"));
+        assert_eq!(site.member, "()");
+        assert_eq!(site.receiver_type.as_deref(), Some("kvm_x86_run"));
+    }
+
+    #[test]
+    fn a_pasted_static_call_key_is_not_guessed() {
+        // `kvm_x86_call(op)` expands to `static_call(kvm_x86_##op)`; the name
+        // does not exist until the preprocessor makes it.
+        let (_functions, sites) = analyze(
+            "int f(struct kvm_vcpu *vcpu)\n\
+             {\n\
+             \tint r = 0;\n\
+             \tr = static_call(kvm_x86_##op)(vcpu);\n\
+             \treturn r;\n\
+             }\n",
+            "x86.c",
+        );
+
+        assert!(
+            sites.iter().all(|s| s.kind != DispatchKind::StaticCall),
+            "{sites:?}"
+        );
+    }
+
+    #[test]
+    fn an_initcall_records_the_level_it_is_filed_under() {
+        // Nothing calls `foo_init` and nothing assigns it: the macro puts a
+        // pointer to it in a section, so without this it reads as dead code.
+        let found = registration_rows(
+            "static int foo_init(void)\n\
+             {\n\
+             \tint rc = 0;\n\
+             \treturn rc;\n\
+             }\n\
+             device_initcall(foo_init);\n",
+            "foo.c",
+        );
+
+        let row = found
+            .iter()
+            .find(|r| r.target == "foo_init")
+            .unwrap_or_else(|| panic!("initcall not recorded: {found:?}"));
+        assert_eq!(row.container_type, "device_initcall");
+        assert_eq!(row.member, "[]");
+    }
+
+    #[test]
+    fn a_call_that_merely_ends_in_init_is_not_an_initcall() {
+        // `module_init` is one of these and `mutex_init` is not; a suffix
+        // rule cannot tell them apart, which is why the family is spelled out.
+        let found = registration_rows(
+            "struct mutex { int x; };\n\
+             static struct mutex lock;\n\
+             int helper(void)\n\
+             {\n\
+             \tint value = 7;\n\
+             \treturn value;\n\
+             }\n\
+             mutex_init(lock);\n",
+            "foo.c",
+        );
+
+        assert!(
+            found.iter().all(|r| r.container_type != "mutex_init"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_table_declared_through_a_typedef_is_a_claim_to_check() {
+        // `static bfa_isr_func_t bfa_isrs[N] = { ... }` says only that this
+        // is an array of something named elsewhere. Record the elements and
+        // the name, so the reader can ask the typedef whether they are
+        // functions; deciding here would need a file this one does not have.
+        let found = registration_rows(
+            "int bfa_isr_unhandled(void);\n\
+             int bfa_fcdiag_intr(void);\n\
+             static bfa_isr_func_t bfa_isrs[BFI_MC_MAX] = {\n\
+             \tbfa_isr_unhandled,\n\
+             \tbfa_fcdiag_intr,\n\
+             };\n",
+            "bfa_core.c",
+        );
+
+        assert_eq!(found.len(), 2, "{found:?}");
+        for row in &found {
+            assert_eq!(row.container_type, "bfa_isrs");
+            assert_eq!(row.member, "[]");
+            assert_eq!(
+                row.container_base_type.as_deref(),
+                Some("bfa_isr_func_t"),
+                "the claim to check is missing: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_table_that_spells_out_its_functions_makes_no_claim() {
+        let found = registration_rows(
+            "int handle_cpuid(struct kvm_vcpu *vcpu);\n\
+             static int (*handlers[])(struct kvm_vcpu *vcpu) = {\n\
+             \t[EXIT_REASON_CPUID] = handle_cpuid,\n\
+             };\n",
+            "vmx.c",
+        );
+
+        let row = found.first().expect("dropped");
+        assert_eq!(row.container_type, "handlers");
+        assert_eq!(row.container_base_type, None);
+    }
+
+    #[test]
+    fn a_table_of_function_pointers_records_its_elements() {
+        // kvm_vmx_exit_handlers is this shape. The declaration's type is
+        // `int`, and the elements name an exit reason rather than a member,
+        // so nothing else in the extractor sees these installations.
+        let found = registration_rows(
+            "int handle_cpuid(struct kvm_vcpu *vcpu);\n\
+             int handle_vmx_instruction(struct kvm_vcpu *vcpu);\n\
+             static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {\n\
+             \t[EXIT_REASON_CPUID] = handle_cpuid,\n\
+             \t[EXIT_REASON_VMCALL] = handle_vmx_instruction,\n\
+             };\n",
+            "vmx.c",
+        );
+
+        let targets: Vec<&str> = found.iter().map(|r| r.target.as_str()).collect();
+        assert!(targets.contains(&"handle_cpuid"), "{found:?}");
+        assert!(targets.contains(&"handle_vmx_instruction"), "{found:?}");
+        for row in &found {
+            assert_eq!(row.container_type, "kvm_vmx_exit_handlers");
+            assert_eq!(row.member, "[]");
+        }
+    }
+
+    #[test]
+    fn a_positional_table_records_its_elements() {
+        let found = registration_rows(
+            "int first(void);\n\
+             int second(void);\n\
+             static int (*table[])(void) = { first, second };\n",
+            "t.c",
+        );
+
+        let targets: Vec<&str> = found.iter().map(|r| r.target.as_str()).collect();
+        assert_eq!(targets, vec!["first", "second"], "{found:?}");
+    }
+
+    #[test]
+    fn an_array_of_structs_is_not_a_table_of_function_pointers() {
+        // `.read = f` inside an array of ops structs still records the member
+        // and the struct, not the array.
+        let found = registration_rows(
+            "struct ops { int (*read)(void); };\n\
+             int impl(void);\n\
+             static struct ops table[] = { [0] = { .read = impl } };\n",
+            "t.c",
+        );
+
+        let read = found.iter().find(|r| r.target == "impl").expect("dropped");
+        assert_eq!(read.member, "read");
+        assert_eq!(read.container_type, "ops");
+    }
+
+    #[test]
+    fn a_table_held_in_a_field_is_recorded_without_inventing_a_container() {
+        // `chip->get_delay[i]()` dispatches through an array a struct holds.
+        // The site is worth recording; the container is not knowable from
+        // the array name, because there is not one.
+        let (_functions, sites) = analyze(
+            "int azx_get_position(struct azx *chip, int i)\n\
+             {\n\
+             \treturn chip->get_delay[i](chip);\n\
+             }\n",
+            "hda.c",
+        );
+
+        let site = sites
+            .iter()
+            .find(|s| s.kind == DispatchKind::ArrayElement)
+            .expect("no array dispatch site");
+        assert_eq!(site.receiver_expr.as_deref(), Some("chip->get_delay"));
+        assert_eq!(
+            site.receiver_type, None,
+            "a field is not a table name: {site:?}"
+        );
+    }
+
+    #[test]
+    fn a_call_through_a_table_is_a_dispatch_site() {
+        let (_functions, sites) = analyze(
+            "int __vmx_handle_exit(struct kvm_vcpu *vcpu, int r)\n\
+             {\n\
+             \tint i = exit_reason.basic;\n\
+             \tif (!kvm_vmx_exit_handlers[i])\n\
+             \t\treturn 0;\n\
+             \treturn kvm_vmx_exit_handlers[i](vcpu);\n\
+             }\n",
+            "vmx.c",
+        );
+
+        let site = sites
+            .iter()
+            .find(|s| s.kind == DispatchKind::ArrayElement)
+            .expect("no array dispatch site");
+        assert_eq!(site.member, "[]");
+        assert_eq!(site.receiver_type.as_deref(), Some("kvm_vmx_exit_handlers"));
+        assert_eq!(site.caller_name, "__vmx_handle_exit");
     }
 
     #[test]
