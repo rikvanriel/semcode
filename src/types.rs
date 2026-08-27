@@ -259,6 +259,20 @@ pub struct Registration {
     pub container_field: Option<String>,
 }
 
+/// What the call a function was handed to does with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Handover {
+    /// Written into a struct member, reachable from there by dispatch.
+    StoredIn {
+        /// Calls walked to reach it, wrappers included.
+        path: Vec<String>,
+        container_type: String,
+        member: String,
+    },
+    /// Called by the callee, so the handover is itself a call edge.
+    Invoked { path: Vec<String> },
+}
+
 /// A function named as an argument of a call: `request_irq(irq, handler, ...)`.
 ///
 /// Whether the callee does anything with it is a separate question, answered

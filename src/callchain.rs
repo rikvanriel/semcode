@@ -575,6 +575,31 @@ pub async fn show_registrations_to_writer(
                 argument.line,
                 where_from.bright_black(),
             )?;
+
+            // Where that call puts it, and by what route: the slot is a
+            // claim about the registrar, not about this call site.
+            match db
+                .follow_handed_parameter(&argument.callee, argument.argument_index, git_sha)
+                .await?
+            {
+                Some(crate::types::Handover::StoredIn {
+                    path,
+                    container_type,
+                    member,
+                }) => writeln!(
+                    writer,
+                    "     installs it in {}::{} through {}",
+                    container_type.cyan(),
+                    member.cyan(),
+                    path.join(" -> ").bright_black(),
+                )?,
+                Some(crate::types::Handover::Invoked { path }) => writeln!(
+                    writer,
+                    "     which calls it, through {}",
+                    path.join(" -> ").bright_black(),
+                )?,
+                None => {}
+            }
         }
     }
 

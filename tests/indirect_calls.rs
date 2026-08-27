@@ -11,6 +11,25 @@ use std::sync::Arc;
 
 use semcode::{git, DatabaseManager};
 
+/// Output is written for a terminal, and the colour sequences sit between
+/// the words a test wants to match.
+fn plain(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        for c in chars.by_ref() {
+            if c == 'm' {
+                break;
+            }
+        }
+    }
+    out
+}
+
 fn git_run(repo: &Path, args: &[&str]) {
     let status = Command::new("git")
         .args(args)
@@ -171,16 +190,39 @@ fn write_fixture(repo: &Path) {
 }
 
 /// A handler that reaches the hardware only because a registrar was handed
-/// its name, which is how every driver installs an interrupt handler.
+/// its name, which is how every driver installs an interrupt handler. The
+/// registrar is a wrapper, as it is in the kernel: request_irq stores nothing
+/// itself, it hands its parameter to request_threaded_irq.
 fn write_argument_fixture(repo: &Path) {
     std::fs::write(
+        repo.join("irq.h"),
+        "typedef int (*irq_handler_t)(int irq, void *dev);\n\
+         struct irqaction { irq_handler_t handler; };\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("irq.c"),
+        "#include \"irq.h\"\n\
+         int request_threaded_irq(unsigned int irq, irq_handler_t handler)\n\
+         {\n\
+         \tstruct irqaction *action = alloc_action();\n\
+         \taction->handler = handler;\n\
+         \treturn 0;\n\
+         }\n\
+         int request_irq(unsigned int irq, irq_handler_t handler)\n\
+         {\n\
+         \treturn request_threaded_irq(irq, handler);\n\
+         }\n",
+    )
+    .unwrap();
+    std::fs::write(
         repo.join("nic.c"),
-        "int request_irq(unsigned int irq, void *handler, unsigned long flags);\n\
+        "#include \"irq.h\"\n\
          static int nic_intr(int irq, void *dev) { return 0; }\n\
          static int nic_open(void *dev)\n\
          {\n\
          \tunsigned long flags = 0;\n\
-         \treturn request_irq(16, nic_intr, flags);\n\
+         \treturn request_irq(16, nic_intr);\n\
          }\n",
     )
     .unwrap();
@@ -239,7 +281,7 @@ async fn a_function_handed_to_a_call_is_recorded() {
     semcode::git_range::process_git_tree(
         dir.path(),
         &git_sha,
-        &["c".to_string()],
+        &["c".to_string(), "h".to_string()],
         db.clone(),
         false,
         1,
@@ -275,10 +317,24 @@ async fn a_function_handed_to_a_call_is_recorded() {
     semcode::callchain::show_registrations_to_writer(&db, "nic_intr", &mut output, &git_sha)
         .await
         .unwrap();
-    let output = String::from_utf8(output).unwrap();
+    let output = plain(&String::from_utf8(output).unwrap());
     assert!(
         output.contains("request_irq") && output.contains("nic_open"),
         "registrations did not report the handover:\n{output}"
+    );
+
+    // The wrapper installs nothing itself, so saying where the handler ends
+    // up means following it into request_threaded_irq.
+    assert!(
+        output.contains("irqaction::handler"),
+        "the handover was not followed to a member:\n{output}"
+    );
+
+    // Both hops stay visible: a two-hop claim that reads like a one-hop fact
+    // is worse than no answer.
+    assert!(
+        output.contains("request_irq(handler) -> request_threaded_irq(handler)"),
+        "the route was not reported:\n{output}"
     );
 }
 

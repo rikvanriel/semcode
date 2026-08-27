@@ -99,6 +99,41 @@ impl ArgumentFunctionStore {
         Ok(())
     }
 
+    /// Every row, for measurement over the whole table.
+    pub async fn all(&self) -> Result<Vec<ArgumentFunction>> {
+        let table = self
+            .connection
+            .open_table("argument_functions")
+            .execute()
+            .await?;
+        let batches = table
+            .query()
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let mut out = Vec::new();
+        for batch in &batches {
+            let callee = get_column::<StringArray>(batch, "callee")?;
+            let index = get_column::<arrow::array::Int64Array>(batch, "argument_index")?;
+            let target = get_column::<StringArray>(batch, "target")?;
+            for row in 0..batch.num_rows() {
+                out.push(ArgumentFunction {
+                    target: target.value(row).to_string(),
+                    callee: callee.value(row).to_string(),
+                    argument_index: index.value(row) as u32,
+                    taken_address: false,
+                    file_path: String::new(),
+                    git_file_hash: String::new(),
+                    byte_start: 0,
+                    line: 0,
+                    enclosing_function: String::new(),
+                });
+            }
+        }
+        Ok(out)
+    }
+
     /// Every call that was handed this name.
     pub async fn find_by_target(&self, target: &str) -> Result<Vec<ArgumentFunction>> {
         let table = self
