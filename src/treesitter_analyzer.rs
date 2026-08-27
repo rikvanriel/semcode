@@ -129,6 +129,21 @@ impl RawRegistration {
     }
 }
 
+/// What a function does with a parameter it is given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParameterFate {
+    /// Written into a struct member, which is where a dispatch site finds it.
+    StoredIn {
+        /// Empty where the body alone does not say what the container is.
+        container_type: String,
+        member: String,
+    },
+    /// Passed to another call, which is how a wrapper registers.
+    HandedOn { callee: String, argument_index: u32 },
+    /// Called directly.
+    Invoked,
+}
+
 /// What one pass over a file's functions yields.
 #[derive(Debug, Default)]
 struct ExtractedFunctions {
@@ -1530,6 +1545,89 @@ impl TreeSitterAnalyzer {
     /// itself states. An initializer whose type is not stated is skipped: a
     /// registration filed under the wrong type joins with the wrong dispatch
     /// sites, which is worse than not having it.
+    /// What a function does with one of its parameters.
+    ///
+    /// A registrar is not a name on a list: it is a function that puts what it
+    /// was given somewhere. `request_threaded_irq` stores its handler in
+    /// `irqaction::handler`, and `request_irq` is a registrar only because it
+    /// hands its own parameter to that one. Enumerating registrars instead
+    /// would miss every subsystem's own.
+    ///
+    /// Intraprocedural: one body, no value tracking beyond the parameter's
+    /// own name. A caller that wants the wrapper case follows `HandedOn`.
+    pub fn parameter_fate(body: &str, parameter: &str) -> Vec<ParameterFate> {
+        let mut parser = Parser::new();
+        if parser
+            .set_language(&tree_sitter_c::LANGUAGE.into())
+            .is_err()
+        {
+            return Vec::new();
+        }
+        let Some(tree) = parser.parse(body, None) else {
+            return Vec::new();
+        };
+
+        let mut fates = Vec::new();
+
+        // Storing it in a member is what makes the caller's function
+        // reachable, and that shape is already recognised.
+        let mut written = Self::collect_registrations(tree.root_node(), body);
+        written.extend(Self::collect_assignments(tree.root_node(), body));
+        for registration in written {
+            if registration.target == parameter {
+                fates.push(ParameterFate::StoredIn {
+                    container_type: registration.container_type.clone(),
+                    member: registration.member.clone(),
+                });
+            }
+        }
+
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+            if node.kind() != "call_expression" {
+                continue;
+            }
+            let Some(callee) = node.child_by_field_name("function") else {
+                continue;
+            };
+            if callee.kind() == "identifier" && &body[callee.byte_range()] == parameter {
+                fates.push(ParameterFate::Invoked);
+                continue;
+            }
+            if callee.kind() != "identifier" {
+                continue;
+            }
+            let callee_name = body[callee.byte_range()].to_string();
+            let Some(arguments) = node.child_by_field_name("arguments") else {
+                continue;
+            };
+            let mut cursor = arguments.walk();
+            for (index, argument) in arguments.named_children(&mut cursor).enumerate() {
+                let named = match argument.kind() {
+                    "identifier" => Some(argument),
+                    "pointer_expression" => argument
+                        .child_by_field_name("argument")
+                        .filter(|node| node.kind() == "identifier"),
+                    _ => None,
+                };
+                let Some(named) = named else { continue };
+                if &body[named.byte_range()] != parameter {
+                    continue;
+                }
+                fates.push(ParameterFate::HandedOn {
+                    callee: callee_name.clone(),
+                    argument_index: index as u32,
+                });
+            }
+        }
+
+        fates
+    }
+
     /// Names that a scope binds to a value rather than to a function.
     ///
     /// `min_t(u32, len, size)` names no function even where the tree defines
@@ -6644,5 +6742,62 @@ test "helper ok" {
             Language::from_path(Path::new("src/main.rs")),
             Some(Language::Rust)
         );
+    }
+}
+
+#[cfg(test)]
+mod parameter_fate_tests {
+    use super::{ParameterFate, TreeSitterAnalyzer};
+
+    #[test]
+    fn a_parameter_written_into_a_member_is_stored() {
+        let body = "int request_threaded_irq(unsigned int irq, irq_handler_t handler)\n\
+                    {\n\
+                    \tstruct irqaction *action = kzalloc(sizeof(*action));\n\
+                    \taction->handler = handler;\n\
+                    \treturn 0;\n\
+                    }\n";
+        let fates = TreeSitterAnalyzer::parameter_fate(body, "handler");
+        assert!(
+            fates.iter().any(|fate| matches!(
+                fate,
+                ParameterFate::StoredIn { container_type, member }
+                    if container_type == "irqaction" && member == "handler"
+            )),
+            "{fates:?}"
+        );
+    }
+
+    #[test]
+    fn a_wrapper_hands_its_parameter_on() {
+        let body = "static inline int request_irq(unsigned int irq, irq_handler_t handler,\n\
+                    \t\tunsigned long flags, const char *name, void *dev)\n\
+                    {\n\
+                    \treturn request_threaded_irq(irq, handler, NULL, flags, name, dev);\n\
+                    }\n";
+        let fates = TreeSitterAnalyzer::parameter_fate(body, "handler");
+        assert_eq!(
+            fates,
+            vec![ParameterFate::HandedOn {
+                callee: "request_threaded_irq".to_string(),
+                argument_index: 1,
+            }],
+            "{fates:?}"
+        );
+    }
+
+    #[test]
+    fn a_parameter_that_is_called_is_invoked() {
+        let body = "static void run(void (*fn)(void)) { fn(); }\n";
+        assert_eq!(
+            TreeSitterAnalyzer::parameter_fate(body, "fn"),
+            vec![ParameterFate::Invoked]
+        );
+    }
+
+    #[test]
+    fn a_parameter_only_read_has_no_fate() {
+        let body = "static int add(int a, int b) { return a + b; }\n";
+        assert!(TreeSitterAnalyzer::parameter_fate(body, "a").is_empty());
     }
 }
