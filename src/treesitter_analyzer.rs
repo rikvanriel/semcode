@@ -2452,8 +2452,21 @@ impl TreeSitterAnalyzer {
     /// guess. `registrations foo_init` answers; `callers foo_init` still says
     /// nothing calls it, which remains true of the source.
     fn initcall(node: tree_sitter::Node, source: &str) -> Option<RawRegistration> {
-        // File scope: an initcall inside a function is something else.
-        if node.kind() != "expression_statement" || node.parent()?.kind() != "translation_unit" {
+        // File scope: an initcall inside a function is something else. A
+        // conditional is still file scope — `subsys_initcall(cgwb_init)` sits
+        // inside `#ifdef CONFIG_CGROUP_WRITEBACK`, and requiring the parent to
+        // be the translation unit skipped every initcall written that way.
+        if node.kind() != "expression_statement" {
+            return None;
+        }
+        let mut parent = node.parent()?;
+        while matches!(
+            parent.kind(),
+            "preproc_ifdef" | "preproc_if" | "preproc_else" | "preproc_elif"
+        ) {
+            parent = parent.parent()?;
+        }
+        if parent.kind() != "translation_unit" {
             return None;
         }
 
@@ -2501,7 +2514,9 @@ impl TreeSitterAnalyzer {
     /// A closed family, spelled out rather than pattern-matched: `module_init`
     /// is one and `mutex_init` is not, and a suffix rule cannot tell them
     /// apart.
-    fn is_initcall_macro(name: &str) -> bool {
+    /// Whether a name is one of the macros that files a function in an
+    /// initcall section.
+    pub fn is_initcall_macro(name: &str) -> bool {
         const LEVELS: &[&str] = &[
             "early_initcall",
             "pure_initcall",
@@ -6329,6 +6344,31 @@ mod tests {
             .unwrap_or_else(|| panic!("no static call site: {sites:?}"));
         assert_eq!(site.member, "()");
         assert_eq!(site.receiver_type.as_deref(), Some("kvm_x86_run"));
+    }
+
+    #[test]
+    fn an_initcall_inside_a_conditional_is_recorded() {
+        let (_functions, _sites) = analyze("int cgwb_init(void) { return 0; }\n", "bdi.c");
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "#ifdef CONFIG_CGROUP_WRITEBACK\n\
+                 static int cgwb_init(void) { return 0; }\n\
+                 subsys_initcall(cgwb_init);\n\
+                 #endif\n",
+                std::path::Path::new("bdi.c"),
+                "hash",
+                None,
+            )
+            .unwrap();
+        assert!(
+            analysis
+                .registrations
+                .iter()
+                .any(|r| r.target == "cgwb_init" && r.container_type == "subsys_initcall"),
+            "{:?}",
+            analysis.registrations
+        );
     }
 
     #[test]
