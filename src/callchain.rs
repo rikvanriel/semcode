@@ -273,9 +273,43 @@ pub async fn show_callers_to_writer(
             // Always use git-aware callers query
             let callers = db.get_function_callers_git_aware(name, git_sha).await?;
             let indirect = db.find_indirect_callers(name, git_sha).await?;
+            // Nothing in the source calls an initcall: the pointer sits in a
+            // section that do_initcalls() walks at boot. Saying only that
+            // nothing calls it reads as dead code, which is the opposite of
+            // the truth for an entry point.
+            let boot_levels: Vec<String> = db
+                .find_registrations_of_git_aware(name, git_sha)
+                .await?
+                .into_iter()
+                .filter(|registration| {
+                    crate::TreeSitterAnalyzer::is_initcall_macro(&registration.container_type)
+                })
+                .map(|registration| registration.container_type)
+                .collect();
+
+            if !boot_levels.is_empty() {
+                let mut levels = boot_levels.clone();
+                levels.sort();
+                levels.dedup();
+                writeln!(
+                    writer,
+                    "{} runs at boot, filed as {}",
+                    "Entry point:".bold().green(),
+                    levels.join(", ").cyan()
+                )?;
+            }
+
             if callers.is_empty() && indirect.is_empty() {
-                let info_msg = format!("{} No functions call '{}'", "Info:".yellow(), name);
-                writeln!(writer, "{info_msg}")?;
+                if boot_levels.is_empty() {
+                    let info_msg = format!("{} No functions call '{}'", "Info:".yellow(), name);
+                    writeln!(writer, "{info_msg}")?;
+                } else {
+                    writeln!(
+                        writer,
+                        "{} nothing in the source calls it",
+                        "Info:".yellow()
+                    )?;
+                }
             } else if !callers.is_empty() {
                 let header = format!("\n{}", "=== Direct Callers ===".bold().green());
                 writeln!(writer, "{header}")?;
