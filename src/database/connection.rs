@@ -1334,6 +1334,21 @@ impl DatabaseManager {
         })
     }
 
+    /// The aggregate a member of a type is declared as, at a revision.
+    ///
+    /// `inode::i_rcu` is an `rcu_head`, which is what says the head a
+    /// callback was queued on belongs to that inode.
+    pub async fn member_aggregate_git_aware(
+        &self,
+        container_type: &str,
+        member: &str,
+        git_sha: &str,
+    ) -> Result<Option<String>> {
+        let manifest = self.git_manifest_cached(git_sha).await?;
+        self.field_aggregate(container_type, member, &manifest)
+            .await
+    }
+
     /// Where a call puts the function it is handed.
     ///
     /// `request_irq(irq, nic_intr, ...)` installs nothing by itself: the

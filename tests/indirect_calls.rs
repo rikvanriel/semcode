@@ -217,8 +217,13 @@ fn write_argument_fixture(repo: &Path) {
     .unwrap();
     std::fs::write(
         repo.join("rcu.c"),
-        "struct inode { int i_state; struct rcu_head i_rcu; };\n\
+        "struct rcu_head { void (*func)(struct rcu_head *head); };\n\
+         struct inode { int i_state; struct rcu_head i_rcu; };\n\
          static void i_callback(struct rcu_head *head) { }\n\
+         void call_rcu(struct rcu_head *head, void (*func)(struct rcu_head *))\n\
+         {\n\
+         \thead->func = func;\n\
+         }\n\
          static void destroy_inode(struct inode *inode)\n\
          {\n\
          \tcall_rcu(&inode->i_rcu, i_callback);\n\
@@ -369,6 +374,23 @@ async fn a_function_handed_to_a_call_is_recorded() {
     assert!(
         output.contains("called later"),
         "the timing was not reported:\n{output}"
+    );
+
+    // The call passes `netdev->name` too, and the handler has nothing to do
+    // with it: only an object holding what the callee stored is the subject.
+    assert!(
+        !output.contains("attached to"),
+        "an unrelated argument was reported as the subject:\n{output}"
+    );
+
+    let mut output = Vec::new();
+    semcode::callchain::show_registrations_to_writer(&db, "i_callback", &mut output, &git_sha)
+        .await
+        .unwrap();
+    let output = plain(&String::from_utf8(output).unwrap());
+    assert!(
+        output.contains("attached to inode::i_rcu"),
+        "the rcu_head's owner was not reported:\n{output}"
     );
 }
 
