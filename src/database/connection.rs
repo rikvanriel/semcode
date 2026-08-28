@@ -155,6 +155,7 @@ pub struct DatabaseManager {
     content_store: ContentStore,
     dispatch_site_store: crate::database::dispatch_sites::DispatchSiteStore,
     registration_store: crate::database::registrations::RegistrationStore,
+    argument_function_store: crate::database::argument_functions::ArgumentFunctionStore,
     object_macro_store: crate::database::object_macros::ObjectMacroStore,
     symbol_filename_store: SymbolFilenameStore,
     branch_store: IndexedBranchStore,
@@ -214,6 +215,8 @@ impl DatabaseManager {
             registration_store: crate::database::registrations::RegistrationStore::new(
                 connection.clone(),
             ),
+            argument_function_store:
+                crate::database::argument_functions::ArgumentFunctionStore::new(connection.clone()),
             symbol_filename_store: SymbolFilenameStore::new(connection.clone()),
             object_macro_store: crate::database::object_macros::ObjectMacroStore::new(
                 connection.clone(),
@@ -992,6 +995,22 @@ impl DatabaseManager {
         self.registration_store.insert_batch(registrations).await
     }
 
+    /// Record functions named as call arguments.
+    pub async fn insert_argument_functions(
+        &self,
+        arguments: Vec<crate::types::ArgumentFunction>,
+    ) -> Result<()> {
+        self.argument_function_store.insert_batch(arguments).await
+    }
+
+    /// Every call handed this name.
+    pub async fn find_argument_functions_of(
+        &self,
+        target: &str,
+    ) -> Result<Vec<crate::types::ArgumentFunction>> {
+        self.argument_function_store.find_by_target(target).await
+    }
+
     /// Everything installed in one member of one type, at a revision.
     /// What each dispatch inside these functions can reach.
     ///
@@ -1112,13 +1131,7 @@ impl DatabaseManager {
         for name in claimed {
             // A typedef the index does not hold cannot support the claim.
             // Saying so costs a table; keeping it would invent one.
-            let verdict = match self.find_typedef_git_aware(&name, git_sha).await? {
-                Some(typedef) => {
-                    let underlying = typedef.underlying_type;
-                    underlying.contains("(*)") || underlying.contains("(*")
-                }
-                None => false,
-            };
+            let verdict = self.type_is_function_pointer(&name, git_sha).await?;
             points_at_a_function.insert(name, verdict);
         }
 
@@ -1266,6 +1279,150 @@ impl DatabaseManager {
             .await?;
 
         Ok(registrations)
+    }
+
+    /// Every call handed this name, at a revision.
+    ///
+    /// A row records only that an argument named an identifier; the name
+    /// belongs to a function if the functions table says so, which is what
+    /// separates `request_irq(irq, nic_intr, ...)` from an enum constant that
+    /// happens to sit in the same position.
+    pub async fn find_argument_functions_of_git_aware(
+        &self,
+        target: &str,
+        git_sha: &str,
+    ) -> Result<Vec<crate::types::ArgumentFunction>> {
+        if self
+            .find_function_git_aware(target, git_sha)
+            .await?
+            .is_none()
+        {
+            return Ok(Vec::new());
+        }
+
+        let manifest = self.git_manifest_cached(git_sha).await?;
+        Ok(crate::database::resolution::at_revision(
+            self.argument_function_store.find_by_target(target).await?,
+            &manifest,
+            |a| (a.file_path.as_str(), a.git_file_hash.as_str()),
+        ))
+    }
+
+    /// Every recorded argument, for measurement.
+    pub async fn all_argument_functions(&self) -> Result<Vec<crate::types::ArgumentFunction>> {
+        self.argument_function_store.all().await
+    }
+
+    /// Whether a written type denotes a function pointer, following one
+    /// typedef. `irq_handler_t` does; `unsigned int` does not.
+    pub async fn type_is_function_pointer(&self, type_name: &str, git_sha: &str) -> Result<bool> {
+        if type_name.contains("(*") {
+            return Ok(true);
+        }
+        let bare = type_name
+            .replace("const", " ")
+            .replace('*', " ")
+            .trim()
+            .to_string();
+        let Some(name) = bare.split_whitespace().next_back() else {
+            return Ok(false);
+        };
+        // A typedef the index does not hold cannot support the claim.
+        Ok(match self.find_typedef_git_aware(name, git_sha).await? {
+            Some(typedef) => typedef.underlying_type.contains("(*"),
+            None => false,
+        })
+    }
+
+    /// Where a call puts the function it is handed.
+    ///
+    /// `request_irq(irq, nic_intr, ...)` installs nothing by itself: the
+    /// wrapper hands its parameter to `request_threaded_irq`, which stores it
+    /// in `irqaction::handler`. Follow that until a body stores the parameter
+    /// in a member, and report the path taken, because a two-hop claim that
+    /// reads like a one-hop fact is worse than no answer.
+    ///
+    /// Bounded: a wrapper chain that has not reached a member within a few
+    /// hops is not one, and a cycle must not spin.
+    pub async fn follow_handed_parameter(
+        &self,
+        callee: &str,
+        argument_index: u32,
+        git_sha: &str,
+    ) -> Result<Option<crate::types::Handover>> {
+        const MAX_HOPS: usize = 4;
+        const MAX_BRANCHES: usize = 32;
+
+        let mut seen = std::collections::HashSet::new();
+        // Breadth first: a body often hands the same parameter to more than
+        // one call, an error path among them, and the first is not the one
+        // that registers.
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back((callee.to_string(), argument_index, Vec::<String>::new()));
+        let mut visited = 0usize;
+
+        while let Some((current, index, path)) = queue.pop_front() {
+            if path.len() >= MAX_HOPS || visited >= MAX_BRANCHES {
+                continue;
+            }
+            visited += 1;
+            if !seen.insert((current.clone(), index)) {
+                continue;
+            }
+            let Some(function) = self.find_function_git_aware(&current, git_sha).await? else {
+                continue;
+            };
+            let Some(parameter) = function.parameters.get(index as usize) else {
+                continue;
+            };
+            if parameter.name.is_empty() {
+                continue;
+            }
+            // An integer handed into an integer member is not a function
+            // being installed, and following it reports `nla_put_u32`
+            // installing something in `nlattr::nla_type`.
+            if path.is_empty()
+                && !self
+                    .type_is_function_pointer(&parameter.type_name, git_sha)
+                    .await?
+            {
+                return Ok(None);
+            }
+
+            let mut path = path.clone();
+            path.push(format!("{current}({})", parameter.name));
+
+            let fates = crate::TreeSitterAnalyzer::parameter_fate(&function.body, &parameter.name);
+            for fate in &fates {
+                match fate {
+                    crate::ParameterFate::StoredIn {
+                        container_type,
+                        member,
+                    } if !container_type.is_empty() => {
+                        return Ok(Some(crate::types::Handover::StoredIn {
+                            path,
+                            container_type: container_type.clone(),
+                            member: member.clone(),
+                        }));
+                    }
+                    crate::ParameterFate::Invoked => {
+                        return Ok(Some(crate::types::Handover::Invoked { path }));
+                    }
+                    _ => {}
+                }
+            }
+            for fate in &fates {
+                if let crate::ParameterFate::HandedOn {
+                    callee,
+                    argument_index,
+                } = fate
+                {
+                    queue.push_back((callee.clone(), *argument_index, path.clone()));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     /// Everything installed in one member of one type.

@@ -11,6 +11,25 @@ use std::sync::Arc;
 
 use semcode::{git, DatabaseManager};
 
+/// Output is written for a terminal, and the colour sequences sit between
+/// the words a test wants to match.
+fn plain(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        for c in chars.by_ref() {
+            if c == 'm' {
+                break;
+            }
+        }
+    }
+    out
+}
+
 fn git_run(repo: &Path, args: &[&str]) {
     let status = Command::new("git")
         .args(args)
@@ -170,6 +189,55 @@ fn write_fixture(repo: &Path) {
     .unwrap();
 }
 
+/// A handler that reaches the hardware only because a registrar was handed
+/// its name, which is how every driver installs an interrupt handler. The
+/// registrar is a wrapper, as it is in the kernel: request_irq stores nothing
+/// itself, it hands its parameter to request_threaded_irq.
+fn write_argument_fixture(repo: &Path) {
+    std::fs::write(
+        repo.join("irq.h"),
+        "typedef int (*irq_handler_t)(int irq, void *dev);\n\
+         struct irqaction { irq_handler_t handler; };\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("irq.c"),
+        "#include \"irq.h\"\n\
+         int request_threaded_irq(unsigned int irq, irq_handler_t handler)\n\
+         {\n\
+         \tstruct irqaction *action = alloc_action();\n\
+         \taction->handler = handler;\n\
+         \treturn 0;\n\
+         }\n\
+         int request_irq(unsigned int irq, irq_handler_t handler)\n\
+         {\n\
+         \treturn request_threaded_irq(irq, handler);\n\
+         }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("rcu.c"),
+        "struct inode { int i_state; struct rcu_head i_rcu; };\n\
+         static void i_callback(struct rcu_head *head) { }\n\
+         static void destroy_inode(struct inode *inode)\n\
+         {\n\
+         \tcall_rcu(&inode->i_rcu, i_callback);\n\
+         }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("nic.c"),
+        "#include \"irq.h\"\n\
+         static int nic_intr(int irq, void *dev) { return 0; }\n\
+         static int nic_open(void *dev)\n\
+         {\n\
+         \tunsigned long flags = 0;\n\
+         \treturn request_irq(16, nic_intr);\n\
+         }\n",
+    )
+    .unwrap();
+}
+
 async fn index_fixture(repo: &Path) -> (Arc<DatabaseManager>, String) {
     git_run(repo, &["init", "-q"]);
     write_fixture(repo);
@@ -200,6 +268,108 @@ async fn index_fixture(repo: &Path) -> (Arc<DatabaseManager>, String) {
     .unwrap();
 
     (db, git_sha)
+}
+
+#[tokio::test]
+async fn a_function_handed_to_a_call_is_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    git_run(dir.path(), &["init", "-q"]);
+    write_argument_fixture(dir.path());
+    git_run(dir.path(), &["add", "."]);
+    git_run(dir.path(), &["commit", "-q", "-m", "fixture"]);
+
+    let git_sha = git::get_git_sha(dir.path()).unwrap().unwrap();
+    let db = Arc::new(
+        DatabaseManager::new(
+            dir.path().join(".semcode.db").to_str().unwrap(),
+            dir.path().to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap(),
+    );
+    db.create_tables().await.unwrap();
+    semcode::git_range::process_git_tree(
+        dir.path(),
+        &git_sha,
+        &["c".to_string(), "h".to_string()],
+        db.clone(),
+        false,
+        1,
+    )
+    .await
+    .unwrap();
+
+    let handed = db.find_argument_functions_of("nic_intr").await.unwrap();
+    assert_eq!(
+        handed.len(),
+        1,
+        "expected one call handed nic_intr, got {handed:?}"
+    );
+    assert_eq!(handed[0].callee, "request_irq");
+    assert_eq!(handed[0].argument_index, 1);
+    assert_eq!(handed[0].enclosing_function, "nic_open");
+    assert!(!handed[0].taken_address);
+
+    // `flags` is a local, so naming it is not handing over a function, even
+    // where some other tree defines a function of that name.
+    let local = db.find_argument_functions_of("flags").await.unwrap();
+    assert!(local.is_empty(), "a local was recorded: {local:?}");
+
+    // An RCU callback is attached to the object holding the head, which is
+    // the only place that says which type the callback frees.
+    let rcu = db.find_argument_functions_of("i_callback").await.unwrap();
+    assert_eq!(rcu.len(), 1, "{rcu:?}");
+    assert_eq!(
+        rcu[0].subject_type.as_deref(),
+        Some("inode"),
+        "{:?}",
+        rcu[0]
+    );
+    assert_eq!(
+        rcu[0].subject_member.as_deref(),
+        Some("i_rcu"),
+        "{:?}",
+        rcu[0]
+    );
+
+    // The identifier has to name a function: an enum constant in the same
+    // argument position does not.
+    let constant = db
+        .find_argument_functions_of_git_aware("16", &git_sha)
+        .await
+        .unwrap();
+    assert!(constant.is_empty(), "a constant was reported: {constant:?}");
+
+    let mut output = Vec::new();
+    semcode::callchain::show_registrations_to_writer(&db, "nic_intr", &mut output, &git_sha)
+        .await
+        .unwrap();
+    let output = plain(&String::from_utf8(output).unwrap());
+    assert!(
+        output.contains("request_irq") && output.contains("nic_open"),
+        "registrations did not report the handover:\n{output}"
+    );
+
+    // The wrapper installs nothing itself, so saying where the handler ends
+    // up means following it into request_threaded_irq.
+    assert!(
+        output.contains("irqaction::handler"),
+        "the handover was not followed to a member:\n{output}"
+    );
+
+    // Both hops stay visible: a two-hop claim that reads like a one-hop fact
+    // is worse than no answer.
+    assert!(
+        output.contains("request_irq(handler) -> request_threaded_irq(handler)"),
+        "the route was not reported:\n{output}"
+    );
+
+    // Installing is not calling: the handler runs when an interrupt arrives,
+    // and a reader reasoning about a race needs that said out loud.
+    assert!(
+        output.contains("called later"),
+        "the timing was not reported:\n{output}"
+    );
 }
 
 #[tokio::test]
@@ -468,5 +638,42 @@ async fn a_function_with_ordinary_callers_gets_no_pointer_chain() {
         rendered.is_empty(),
         "{}",
         String::from_utf8_lossy(&rendered)
+    );
+}
+
+#[tokio::test]
+async fn the_subject_survives_a_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseManager::new(
+        dir.path().join(".semcode.db").to_str().unwrap(),
+        dir.path().to_string_lossy().into_owned(),
+    )
+    .await
+    .unwrap();
+    db.create_tables().await.unwrap();
+
+    db.insert_argument_functions(vec![semcode::ArgumentFunction {
+        target: "i_callback".to_string(),
+        callee: "call_rcu".to_string(),
+        argument_index: 1,
+        taken_address: false,
+        subject_type: Some("inode".to_string()),
+        subject_member: Some("i_rcu".to_string()),
+        file_path: "rcu.c".to_string(),
+        git_file_hash: "hash".to_string(),
+        byte_start: 178,
+        line: 5,
+        enclosing_function: "destroy_inode".to_string(),
+    }])
+    .await
+    .unwrap();
+
+    let back = db.find_argument_functions_of("i_callback").await.unwrap();
+    assert_eq!(back.len(), 1, "{back:?}");
+    assert_eq!(
+        back[0].subject_type.as_deref(),
+        Some("inode"),
+        "{:?}",
+        back[0]
     );
 }

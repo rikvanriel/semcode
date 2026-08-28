@@ -259,6 +259,68 @@ pub struct Registration {
     pub container_field: Option<String>,
 }
 
+/// What the call a function was handed to does with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Handover {
+    /// Written into a struct member, reachable from there by dispatch.
+    StoredIn {
+        /// Calls walked to reach it, wrappers included.
+        path: Vec<String>,
+        container_type: String,
+        member: String,
+    },
+    /// Called by the callee, so the handover is itself a call edge.
+    Invoked { path: Vec<String> },
+}
+
+impl Handover {
+    /// Whether the call happens after the handover returns.
+    ///
+    /// Storing a function in a member defers it by construction: whoever
+    /// dispatches through that member runs it, at a time the installing
+    /// caller does not choose. `INIT_WORK` and `call_rcu` store; `kref_put`
+    /// calls what it is given before it returns.
+    ///
+    /// Two chains that differ only in this are the same graph to a reader and
+    /// different worlds to anyone reasoning about a race, so the answer says
+    /// which one it is rather than leaving it to be inferred from the
+    /// registrar's name.
+    pub fn fires_later(&self) -> bool {
+        matches!(self, Handover::StoredIn { .. })
+    }
+}
+
+/// A function named as an argument of a call: `request_irq(irq, handler, ...)`.
+///
+/// Whether the callee does anything with it is a separate question, answered
+/// where the callee's own body is known. This records only what the file
+/// proves: at this call, this argument names this identifier.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArgumentFunction {
+    /// Identifier named by the argument.
+    pub target: String,
+    /// Name being called. A macro at this point is indistinguishable from a
+    /// function, and the two are told apart against the functions table.
+    pub callee: String,
+    /// Zero-based position among the arguments.
+    pub argument_index: u32,
+    /// `&handler` rather than `handler`. Both install a function; the address
+    /// form also appears where the argument is an object, so it is kept.
+    pub taken_address: bool,
+    /// The object the function is being attached to, where another argument
+    /// names one: `call_rcu(&inode->i_rcu, i_callback)` attaches the callback
+    /// to an inode through `i_rcu`. Set together, and only where the file
+    /// declares the base's type.
+    pub subject_type: Option<String>,
+    pub subject_member: Option<String>,
+    pub file_path: String,
+    pub git_file_hash: String,
+    pub byte_start: u64,
+    pub line: u32,
+    /// Function containing the call, empty at file scope.
+    pub enclosing_function: String,
+}
+
 /// How a function came to be installed. Stored, so values are append-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RegistrationKind {
