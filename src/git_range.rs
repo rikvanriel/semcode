@@ -2,7 +2,7 @@
 
 use crate::git::walk_tree_at_commit_with_repo;
 use crate::indexer::{list_shas_in_range, process_commits_pipeline};
-use crate::types::ArgumentFunction;
+use crate::types::{ArgumentFunction, GlobalVariable};
 use crate::{
     DatabaseManager, DispatchSite, FunctionInfo, GitFileEntry, GitFileManifestEntry,
     ProcessedFileRecord, Registration, TreeSitterAnalyzer, TypeInfo,
@@ -37,6 +37,7 @@ struct GitTupleResults {
     dispatch_sites: Vec<DispatchSite>,
     registrations: Vec<Registration>,
     argument_functions: Vec<ArgumentFunction>,
+    globals: Vec<GlobalVariable>,
     processed_files: Vec<ProcessedFileRecord>,
     files_processed: usize,
 }
@@ -48,6 +49,7 @@ impl GitTupleResults {
         self.dispatch_sites.extend(other.dispatch_sites);
         self.registrations.extend(other.registrations);
         self.argument_functions.extend(other.argument_functions);
+        self.globals.extend(other.globals);
         self.processed_files.extend(other.processed_files);
         self.files_processed += other.files_processed;
     }
@@ -258,12 +260,13 @@ fn process_git_file_tuple_with_repo(
 
     // Check analysis results
     let analysis = analysis_result?;
-    let (mut functions, types, dispatch_sites, registrations, argument_functions) = (
+    let (mut functions, types, dispatch_sites, registrations, argument_functions, globals) = (
         analysis.functions,
         analysis.types,
         analysis.dispatch_sites,
         analysis.registrations,
         analysis.argument_functions,
+        analysis.globals,
     );
     let macros = analysis.macros;
 
@@ -289,6 +292,7 @@ fn process_git_file_tuple_with_repo(
         dispatch_sites,
         registrations,
         argument_functions,
+        globals,
         processed_files: vec![processed_file_record],
         files_processed: 1,
     };
@@ -626,6 +630,7 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
                             dispatch_result,
                             registration_result,
                             argument_function_result,
+                            global_result,
                             processed_files_result,
                         ) = tokio::join!(
                             async {
@@ -665,6 +670,13 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
                                     db_manager_clone
                                         .insert_argument_functions(batch.argument_functions)
                                         .await
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                            async {
+                                if !batch.globals.is_empty() {
+                                    db_manager_clone.insert_globals(batch.globals).await
                                 } else {
                                     Ok(())
                                 }
@@ -713,6 +725,10 @@ async fn process_git_tuples_streaming(config: StreamingConfig) -> Result<GitTupl
                                 "Inserter {} failed to insert argument functions: {}",
                                 inserter_id, e
                             );
+                            insertion_successful = false;
+                        }
+                        if let Err(e) = global_result {
+                            error!("Inserter {} failed to insert globals: {}", inserter_id, e);
                             insertion_successful = false;
                         }
                         if let Err(e) = processed_files_result {
@@ -990,6 +1006,7 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
                             dispatch_result,
                             registration_result,
                             argument_function_result,
+                            global_result,
                             processed_files_result,
                         ) = tokio::join!(
                             async {
@@ -1029,6 +1046,13 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
                                     db_manager_clone
                                         .insert_argument_functions(batch.argument_functions)
                                         .await
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                            async {
+                                if !batch.globals.is_empty() {
+                                    db_manager_clone.insert_globals(batch.globals).await
                                 } else {
                                     Ok(())
                                 }
@@ -1076,6 +1100,10 @@ async fn process_git_tree_streaming(config: TreeStreamingConfig) -> Result<GitTu
                                 "Inserter {} failed to insert argument functions: {}",
                                 inserter_id, e
                             );
+                            insertion_successful = false;
+                        }
+                        if let Err(e) = global_result {
+                            error!("Inserter {} failed to insert globals: {}", inserter_id, e);
                             insertion_successful = false;
                         }
                         if let Err(e) = processed_files_result {

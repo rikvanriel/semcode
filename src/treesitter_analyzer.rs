@@ -8,8 +8,8 @@ use tree_sitter::{Parser, Query, QueryCursor, Tree};
 
 use crate::types::{
     ArgumentFunction, DispatchKind, DispatchSite, FieldInfo, FunctionInfo, GlobalTypeRegistry,
-    MacroParams, ParameterInfo, Registration, RegistrationKind, TypeInfo, ARRAY_ELEMENT_MEMBER,
-    STATIC_CALL_MEMBER,
+    GlobalVariable, MacroParams, ParameterInfo, Registration, RegistrationKind, TypeInfo,
+    ARRAY_ELEMENT_MEMBER, STATIC_CALL_MEMBER,
 };
 // TemporaryCallRelationship import removed - call relationships are now embedded in function JSON columns
 use crate::hash::compute_file_hash;
@@ -70,6 +70,8 @@ pub struct FileAnalysis {
     pub registrations: Vec<Registration>,
     /// Functions named as call arguments: what a callee was handed.
     pub argument_functions: Vec<ArgumentFunction>,
+    /// File-scope variables of aggregate type.
+    pub globals: Vec<GlobalVariable>,
 }
 
 /// Calls found in one file: resolved edges, and dispatch sites whose targets
@@ -151,6 +153,14 @@ struct ExtractedFunctions {
     dispatch_sites: Vec<DispatchSite>,
     registrations: Vec<Registration>,
     argument_functions: Vec<ArgumentFunction>,
+}
+
+/// A file-scope variable, before its file is known.
+#[derive(Debug, Clone)]
+struct RawGlobal {
+    name: String,
+    type_name: String,
+    line: u32,
 }
 
 /// A call argument naming an identifier, before it is attributed to the
@@ -994,6 +1004,7 @@ impl TreeSitterAnalyzer {
             dispatch_sites,
             registrations,
             argument_functions,
+            globals,
         } = self.extract_all_with_embedded_data(
             &tree,
             source_code,
@@ -1028,6 +1039,7 @@ impl TreeSitterAnalyzer {
             dispatch_sites,
             registrations,
             argument_functions,
+            globals,
         })
     }
 
@@ -1090,6 +1102,23 @@ impl TreeSitterAnalyzer {
         dispatch_sites.extend(macro_sites);
         registrations.extend(macro_registrations);
 
+        // Only C states a variable's aggregate this way; other languages get
+        // their receivers typed by their own pass.
+        let globals = if matches!(language, Language::C) {
+            Self::collect_file_scope_globals(tree.root_node(), source_code)
+                .into_iter()
+                .map(|raw| GlobalVariable {
+                    name: raw.name,
+                    type_name: raw.type_name,
+                    file_path: self.make_relative_path(file_path, source_root),
+                    git_file_hash: git_hash.to_string(),
+                    line: raw.line,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         Ok(FileAnalysis {
             functions,
             types,
@@ -1097,6 +1126,7 @@ impl TreeSitterAnalyzer {
             dispatch_sites,
             registrations,
             argument_functions,
+            globals,
         })
     }
 
@@ -1316,6 +1346,65 @@ impl TreeSitterAnalyzer {
             .retain(|registration| !Self::is_c_keyword(&registration.member));
 
         Ok(extraction)
+    }
+
+    /// File-scope variables of aggregate type, declaration or definition.
+    ///
+    /// `extern struct machdep_calls ppc_md;` is what lets a call written as
+    /// `ppc_md.memory_block_size()` be typed, in a file that includes the
+    /// header rather than containing it.
+    fn collect_file_scope_globals(root: tree_sitter::Node, source: &str) -> Vec<RawGlobal> {
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            // A declaration inside a function is a local, and locals are
+            // typed by the pass that can see the scope.
+            if node.kind() == "function_definition" {
+                continue;
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+            if node.kind() != "declaration" {
+                continue;
+            }
+            let Some(type_node) = node.child_by_field_name("type") else {
+                continue;
+            };
+            let Some(type_name) = Self::aggregate_type_name(type_node, source) else {
+                continue;
+            };
+            let mut cursor = node.walk();
+            for declarator in node.children_by_field_name("declarator", &mut cursor) {
+                let mut current = declarator;
+                let mut is_function = false;
+                loop {
+                    if current.kind() == "function_declarator" {
+                        is_function = true;
+                    }
+                    if current.kind() == "identifier" {
+                        // A prototype names a function, not a variable.
+                        if !is_function {
+                            out.push(RawGlobal {
+                                name: source[current.byte_range()].to_string(),
+                                type_name: type_name.clone(),
+                                line: current.start_position().row as u32 + 1,
+                            });
+                        }
+                        break;
+                    }
+                    match current
+                        .child_by_field_name("declarator")
+                        .or_else(|| current.named_child(0))
+                    {
+                        Some(next) => current = next,
+                        None => break,
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Give each Rust dispatch site the type of its receiver.

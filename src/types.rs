@@ -259,6 +259,21 @@ pub struct Registration {
     pub container_field: Option<String>,
 }
 
+/// A file-scope variable of aggregate type.
+///
+/// `extern struct machdep_calls ppc_md;` sits in a header, so a file calling
+/// `ppc_md.memory_block_size()` never declares it and cannot type the
+/// receiver. Recorded here, the type is available where the answer is given.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalVariable {
+    pub name: String,
+    /// Aggregate the declaration names, without `struct` or qualifiers.
+    pub type_name: String,
+    pub file_path: String,
+    pub git_file_hash: String,
+    pub line: u32,
+}
+
 /// What the call a function was handed to does with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Handover {
