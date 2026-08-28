@@ -3352,7 +3352,7 @@ impl TreeSitterAnalyzer {
                         line_start = node.start_position().row as u32 + 1;
                     }
                     "body" => {
-                        members = self.parse_struct_members_from_node(node, source);
+                        members = self.parse_struct_members_from_node(node, source, language);
                     }
                     "struct" => {
                         kind = "struct".to_string();
@@ -4042,6 +4042,35 @@ impl TreeSitterAnalyzer {
         members
     }
 
+    /// Fields of a Rust struct.
+    ///
+    /// The type is reduced to the aggregate it names, so that a chain like
+    /// `self.inner.write()` can be walked: what a member is declared as has
+    /// to match what a receiver is typed as, and receivers are recorded
+    /// without their references or generic arguments.
+    fn parse_rust_container_fields(body_node: tree_sitter::Node, source: &str) -> Vec<FieldInfo> {
+        let mut members = Vec::new();
+        let mut cursor = body_node.walk();
+        for child in body_node.children(&mut cursor) {
+            if child.kind() != "field_declaration" {
+                continue;
+            }
+            let (Some(name), Some(type_node)) = (
+                child.child_by_field_name("name"),
+                child.child_by_field_name("type"),
+            ) else {
+                continue;
+            };
+            members.push(FieldInfo {
+                name: source[name.byte_range()].to_string(),
+                type_name: Self::rust_type_name(type_node, source)
+                    .unwrap_or_else(|| collapse_whitespace(&source[type_node.byte_range()])),
+                offset: None,
+            });
+        }
+        members
+    }
+
     fn parse_zig_error_members(body_node: tree_sitter::Node, source: &str) -> Vec<FieldInfo> {
         let mut members = Vec::new();
         let mut cursor = body_node.walk();
@@ -4066,12 +4095,18 @@ impl TreeSitterAnalyzer {
         &self,
         body_node: tree_sitter::Node,
         source: &str,
+        language: Language,
     ) -> Vec<FieldInfo> {
         match body_node.kind() {
             "error_set_declaration" => return Self::parse_zig_error_members(body_node, source),
             "struct_declaration" | "enum_declaration" | "union_declaration"
             | "opaque_declaration" => {
                 return Self::parse_zig_container_fields(body_node, source);
+            }
+            // C names its struct body the same thing, and its fields carry a
+            // declarator rather than a name.
+            "field_declaration_list" if matches!(language, Language::Rust) => {
+                return Self::parse_rust_container_fields(body_node, source);
             }
             _ => {}
         }
@@ -7108,6 +7143,35 @@ mod rust_receiver_tests {
             .iter()
             .find(|site| site.member == member)
             .and_then(|site| site.receiver_type.clone())
+    }
+
+    #[test]
+    fn a_rust_struct_records_its_fields() {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "struct GenDisk {\n\
+                 \ttagset: Arc<TagSet>,\n\
+                 \tcount: u32,\n\
+                 }\n",
+                std::path::Path::new("x.rs"),
+                "hash",
+                None,
+            )
+            .unwrap();
+        let disk = analysis
+            .types
+            .iter()
+            .find(|t| t.name == "GenDisk")
+            .unwrap_or_else(|| panic!("{:?}", analysis.types));
+        let members: Vec<(&str, &str)> = disk
+            .members
+            .iter()
+            .map(|m| (m.name.as_str(), m.type_name.as_str()))
+            .collect();
+        // The member's type is reduced the same way a receiver's is, so the
+        // two can be compared when walking a chain.
+        assert_eq!(members, vec![("tagset", "TagSet"), ("count", "u32")]);
     }
 
     #[test]
