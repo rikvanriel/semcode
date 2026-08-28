@@ -1043,8 +1043,12 @@ impl TreeSitterAnalyzer {
         language: Language,
     ) -> Result<FileAnalysis> {
         // Single pass: extract all calls once and map them to functions by byte ranges
-        let extraction =
-            Self::extract_all_calls_optimized(self.get_queries(language), tree, source_code)?;
+        let extraction = Self::extract_all_calls_optimized(
+            self.get_queries(language),
+            tree,
+            source_code,
+            language,
+        )?;
 
         // Create extraction context
         let ctx = ExtractionContext {
@@ -1101,6 +1105,7 @@ impl TreeSitterAnalyzer {
         queries: &LanguageQueries,
         tree: &Tree,
         source_code: &str,
+        language: Language,
     ) -> Result<CallExtraction> {
         let mut extraction = CallExtraction::default();
         let mut cursor = QueryCursor::new();
@@ -1281,7 +1286,16 @@ impl TreeSitterAnalyzer {
             .registrations
             .extend(Self::collect_assignments(tree.root_node(), source_code));
 
-        Self::type_receivers(tree.root_node(), source_code, &mut extraction.member_sites);
+        // The shapes a declaration takes differ per language, so each gets
+        // the pass that can read it.
+        match language {
+            Language::Rust => Self::type_rust_receivers(
+                tree.root_node(),
+                source_code,
+                &mut extraction.member_sites,
+            ),
+            _ => Self::type_receivers(tree.root_node(), source_code, &mut extraction.member_sites),
+        }
 
         // A keyword is not a member, so anything named after one came from a
         // misread, not from the code. Neither is a member reached from
@@ -1302,6 +1316,132 @@ impl TreeSitterAnalyzer {
             .retain(|registration| !Self::is_c_keyword(&registration.member));
 
         Ok(extraction)
+    }
+
+    /// Give each Rust dispatch site the type of its receiver.
+    ///
+    /// Rust states the type of every parameter and of every annotated
+    /// binding, and `self` is whatever the enclosing `impl` names, so a
+    /// receiver that is a plain name can be typed without leaving the file.
+    /// C needs its own pass because the shapes differ; this one reads
+    /// `function_item`, `parameter` and `let_declaration`.
+    fn type_rust_receivers(root: tree_sitter::Node, source: &str, sites: &mut [RawDispatchSite]) {
+        if sites.is_empty() {
+            return;
+        }
+
+        let mut scopes: Vec<(usize, usize, HashMap<String, String>)> = Vec::new();
+        let mut stack = vec![(root, None::<String>)];
+        while let Some((node, self_type)) = stack.pop() {
+            // `impl Foo { ... }` is what `self` means inside.
+            let self_type = if node.kind() == "impl_item" {
+                node.child_by_field_name("type")
+                    .and_then(|t| Self::rust_type_name(t, source))
+                    .or(self_type)
+            } else {
+                self_type
+            };
+
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push((child, self_type.clone()));
+            }
+
+            if node.kind() != "function_item" {
+                continue;
+            }
+
+            let mut declared = HashMap::new();
+            if let Some(self_type) = &self_type {
+                declared.insert("self".to_string(), self_type.clone());
+            }
+            Self::rust_declared_types_in(node, source, &mut declared);
+            scopes.push((node.start_byte(), node.end_byte(), declared));
+        }
+
+        for site in sites.iter_mut() {
+            if site.receiver_type.is_some() {
+                continue;
+            }
+            let Some(receiver) = site.receiver_expr.as_deref() else {
+                continue;
+            };
+            if !is_plain_name(receiver) {
+                continue;
+            }
+            let Some((_, _, declared)) = scopes
+                .iter()
+                .find(|(start, end, _)| site.byte_start >= *start && site.byte_start < *end)
+            else {
+                continue;
+            };
+            if let Some(type_name) = declared.get(receiver) {
+                site.receiver_type = Some(type_name.clone());
+            }
+        }
+    }
+
+    /// Names a Rust body binds to a stated type: parameters, and bindings
+    /// annotated at the `let`. An inferred binding states nothing here, and
+    /// guessing from the initialiser would need the callee's return type.
+    fn rust_declared_types_in(
+        node: tree_sitter::Node,
+        source: &str,
+        out: &mut HashMap<String, String>,
+    ) {
+        let mut stack = vec![node];
+        while let Some(current) = stack.pop() {
+            let mut cursor = current.walk();
+            for child in current.children(&mut cursor) {
+                // A nested closure or item has its own bindings; the outer
+                // ones still apply, so keep walking.
+                stack.push(child);
+            }
+            if !matches!(current.kind(), "parameter" | "let_declaration") {
+                continue;
+            }
+            let (Some(pattern), Some(type_node)) = (
+                current.child_by_field_name("pattern"),
+                current.child_by_field_name("type"),
+            ) else {
+                continue;
+            };
+            if pattern.kind() != "identifier" {
+                continue;
+            }
+            let Some(type_name) = Self::rust_type_name(type_node, source) else {
+                continue;
+            };
+            out.insert(source[pattern.byte_range()].to_string(), type_name);
+        }
+    }
+
+    /// The name a Rust type node denotes, with references, lifetimes and
+    /// generic arguments removed: `&mut fmt::Formatter<'_>` is a Formatter.
+    ///
+    /// A raw pointer is not stripped. `&T` reaches T's methods by
+    /// autoderef, so a call on it dispatches on T, but `(*mut T).cast()` is
+    /// a method of the pointer, and typing the receiver as T would claim a
+    /// member T does not have.
+    fn rust_type_name(node: tree_sitter::Node, source: &str) -> Option<String> {
+        let mut node = node;
+        loop {
+            match node.kind() {
+                "reference_type" => {
+                    node = node.child_by_field_name("type")?;
+                }
+                "generic_type" => {
+                    node = node.child_by_field_name("type")?;
+                }
+                "scoped_type_identifier" => {
+                    node = node.child_by_field_name("name")?;
+                }
+                "type_identifier" | "primitive_type" | "identifier" => {
+                    return Some(source[node.byte_range()].to_string());
+                }
+                _ => return None,
+            }
+        }
     }
 
     /// Give each member dispatch the type of its receiver, where the file
@@ -2991,7 +3131,7 @@ impl TreeSitterAnalyzer {
     ) -> Result<Vec<FunctionInfo>> {
         // Use the optimized approach but without pre-computed calls (for compatibility)
         let extraction =
-            Self::extract_all_calls_optimized(self.get_queries(language), tree, source)?;
+            Self::extract_all_calls_optimized(self.get_queries(language), tree, source, language)?;
         let ctx = ExtractionContext {
             tree,
             source,
@@ -4562,10 +4702,11 @@ impl TreeSitterAnalyzer {
         // A macro body dispatches like any other code: `((o)->run())` is a
         // call through a member wherever it is written. Positions are in the
         // wrapped text, and the caller maps them back to the file.
-        let mut sites = match Self::extract_all_calls_optimized(queries, &tree, &wrapped) {
-            Ok(extraction) => extraction.member_sites,
-            Err(_) => Vec::new(),
-        };
+        let mut sites =
+            match Self::extract_all_calls_optimized(queries, &tree, &wrapped, Language::C) {
+                Ok(extraction) => extraction.member_sites,
+                Err(_) => Vec::new(),
+            };
 
         // A macro body can install a function as well as call one, when it
         // declares the thing it initialises:
@@ -6828,6 +6969,64 @@ mod parameter_fate_tests {
     fn a_parameter_only_read_has_no_fate() {
         let body = "static int add(int a, int b) { return a + b; }\n";
         assert!(TreeSitterAnalyzer::parameter_fate(body, "a").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod rust_receiver_tests {
+    use super::*;
+
+    fn sites_of(source: &str) -> Vec<RawDispatchSite> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let queries = TreeSitterAnalyzer::rust_queries().unwrap();
+        let mut extraction =
+            TreeSitterAnalyzer::extract_all_calls_optimized(queries, &tree, source, Language::Rust)
+                .unwrap();
+        std::mem::take(&mut extraction.member_sites)
+    }
+
+    fn receiver_type_of(sites: &[RawDispatchSite], member: &str) -> Option<String> {
+        sites
+            .iter()
+            .find(|site| site.member == member)
+            .and_then(|site| site.receiver_type.clone())
+    }
+
+    #[test]
+    fn self_is_the_type_the_impl_names() {
+        let sites = sites_of(
+            "struct VmallocPageIter;\n\
+             impl<'a> Iterator for VmallocPageIter<'a> {\n\
+             \tfn next(&mut self) -> Option<u32> { self.size() }\n\
+             }\n",
+        );
+        assert_eq!(
+            receiver_type_of(&sites, "size").as_deref(),
+            Some("VmallocPageIter"),
+            "{sites:?}"
+        );
+    }
+
+    #[test]
+    fn a_parameter_is_typed_from_its_declaration() {
+        let sites = sites_of("fn show(fmt: &mut fmt::Formatter<'_>) { fmt.write_str(\"x\"); }\n");
+        assert_eq!(
+            receiver_type_of(&sites, "write_str").as_deref(),
+            Some("Formatter"),
+            "{sites:?}"
+        );
+    }
+
+    #[test]
+    fn a_raw_pointer_is_not_its_pointee() {
+        // `.cast()` belongs to the pointer. Typing the receiver as `request`
+        // would claim a member that struct does not have.
+        let sites = sites_of("fn f(ptr: *mut request) { ptr.cast(); }\n");
+        assert_eq!(receiver_type_of(&sites, "cast"), None, "{sites:?}");
     }
 }
 
