@@ -273,6 +273,23 @@ pub enum Handover {
     Invoked { path: Vec<String> },
 }
 
+impl Handover {
+    /// Whether the call happens after the handover returns.
+    ///
+    /// Storing a function in a member defers it by construction: whoever
+    /// dispatches through that member runs it, at a time the installing
+    /// caller does not choose. `INIT_WORK` and `call_rcu` store; `kref_put`
+    /// calls what it is given before it returns.
+    ///
+    /// Two chains that differ only in this are the same graph to a reader and
+    /// different worlds to anyone reasoning about a race, so the answer says
+    /// which one it is rather than leaving it to be inferred from the
+    /// registrar's name.
+    pub fn fires_later(&self) -> bool {
+        matches!(self, Handover::StoredIn { .. })
+    }
+}
+
 /// A function named as an argument of a call: `request_irq(irq, handler, ...)`.
 ///
 /// Whether the callee does anything with it is a separate question, answered

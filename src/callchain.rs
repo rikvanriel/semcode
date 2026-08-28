@@ -588,14 +588,16 @@ pub async fn show_registrations_to_writer(
                     member,
                 }) => writeln!(
                     writer,
-                    "     installs it in {}::{} through {}",
+                    "     installs it in {}::{}, {} through {}",
                     container_type.cyan(),
                     member.cyan(),
+                    "called later".yellow(),
                     path.join(" -> ").bright_black(),
                 )?,
                 Some(crate::types::Handover::Invoked { path }) => writeln!(
                     writer,
-                    "     which calls it, through {}",
+                    "     calls it {} through {}",
+                    "before returning".yellow(),
                     path.join(" -> ").bright_black(),
                 )?,
                 None => {}

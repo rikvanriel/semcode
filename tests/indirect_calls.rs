@@ -336,6 +336,13 @@ async fn a_function_handed_to_a_call_is_recorded() {
         output.contains("request_irq(handler) -> request_threaded_irq(handler)"),
         "the route was not reported:\n{output}"
     );
+
+    // Installing is not calling: the handler runs when an interrupt arrives,
+    // and a reader reasoning about a race needs that said out loud.
+    assert!(
+        output.contains("called later"),
+        "the timing was not reported:\n{output}"
+    );
 }
 
 #[tokio::test]
