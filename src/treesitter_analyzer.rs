@@ -1455,17 +1455,29 @@ impl TreeSitterAnalyzer {
             let Some(receiver) = site.receiver_expr.as_deref() else {
                 continue;
             };
-            if !is_plain_name(receiver) {
-                continue;
-            }
             let Some((_, _, declared)) = scopes
                 .iter()
                 .find(|(start, end, _)| site.byte_start >= *start && site.byte_start < *end)
             else {
                 continue;
             };
-            if let Some(type_name) = declared.get(receiver) {
-                site.receiver_type = Some(type_name.clone());
+
+            if is_plain_name(receiver) {
+                if let Some(type_name) = declared.get(receiver) {
+                    site.receiver_type = Some(type_name.clone());
+                }
+                continue;
+            }
+
+            // `self.inner.write()`: this file states what `self` is, and the
+            // fields say what is read from it. What `inner` is declared as
+            // belongs to whichever file defines that struct, so the path is
+            // recorded and resolution walks it against the types table.
+            if let Some((base, fields)) = field_path(receiver) {
+                if let Some(base_type) = declared.get(base) {
+                    site.receiver_base_type = Some(base_type.clone());
+                    site.receiver_field = Some(fields);
+                }
             }
         }
     }
@@ -7197,6 +7209,22 @@ mod rust_receiver_tests {
             Some("Formatter"),
             "{sites:?}"
         );
+    }
+
+    #[test]
+    fn a_field_chain_records_the_base_and_the_path() {
+        let sites = sites_of(
+            "impl GenDisk {\n\
+             \tfn go(&self) { self.inner.write(); }\n\
+             }\n",
+        );
+        let site = sites.iter().find(|s| s.member == "write").unwrap();
+        assert_eq!(
+            site.receiver_base_type.as_deref(),
+            Some("GenDisk"),
+            "{site:?}"
+        );
+        assert_eq!(site.receiver_field.as_deref(), Some("inner"), "{site:?}");
     }
 
     #[test]
