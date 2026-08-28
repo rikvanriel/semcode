@@ -2452,8 +2452,21 @@ impl TreeSitterAnalyzer {
     /// guess. `registrations foo_init` answers; `callers foo_init` still says
     /// nothing calls it, which remains true of the source.
     fn initcall(node: tree_sitter::Node, source: &str) -> Option<RawRegistration> {
-        // File scope: an initcall inside a function is something else.
-        if node.kind() != "expression_statement" || node.parent()?.kind() != "translation_unit" {
+        // File scope: an initcall inside a function is something else. A
+        // conditional is still file scope — `subsys_initcall(cgwb_init)` sits
+        // inside `#ifdef CONFIG_CGROUP_WRITEBACK`, and requiring the parent to
+        // be the translation unit skipped every initcall written that way.
+        if node.kind() != "expression_statement" {
+            return None;
+        }
+        let mut parent = node.parent()?;
+        while matches!(
+            parent.kind(),
+            "preproc_ifdef" | "preproc_if" | "preproc_else" | "preproc_elif"
+        ) {
+            parent = parent.parent()?;
+        }
+        if parent.kind() != "translation_unit" {
             return None;
         }
 
@@ -2465,16 +2478,17 @@ impl TreeSitterAnalyzer {
             return None;
         }
         let level = &source[level.byte_range()];
-        if !Self::is_initcall_macro(level) {
-            return None;
-        }
+        let (argument_index, _) = Self::entry_point_macro(level)?;
 
         let arguments = call.child_by_field_name("arguments")?;
         let mut cursor = arguments.walk();
         let named: Vec<tree_sitter::Node> = arguments.named_children(&mut cursor).collect();
-        let [target] = named[..] else {
+        // A macro that files a function alongside other values names it at a
+        // fixed position; taking anything else would record a string.
+        if named.len() != argument_index + 1 && argument_index == 0 {
             return None;
-        };
+        }
+        let &target = named.get(argument_index)?;
         if target.kind() != "identifier" {
             return None;
         }
@@ -2501,8 +2515,16 @@ impl TreeSitterAnalyzer {
     /// A closed family, spelled out rather than pattern-matched: `module_init`
     /// is one and `mutex_init` is not, and a suffix rule cannot tell them
     /// apart.
-    fn is_initcall_macro(name: &str) -> bool {
-        const LEVELS: &[&str] = &[
+    /// The macros that file a function in a linker section, with the
+    /// argument that names the function and when that section is walked.
+    ///
+    /// A section is walked by code that names no function, so nothing in the
+    /// tree calls any of these and they all read as dead. There is no rule in
+    /// the source that identifies them: the section attribute is inside the
+    /// macro definition, and the name is often pasted together there, so the
+    /// families are listed.
+    pub fn entry_point_macro(name: &str) -> Option<(usize, &'static str)> {
+        const BOOT_LEVELS: &[&str] = &[
             "early_initcall",
             "pure_initcall",
             "core_initcall",
@@ -2522,11 +2544,40 @@ impl TreeSitterAnalyzer {
             "late_initcall_sync",
             "console_initcall",
             "security_initcall",
-            "module_init",
-            "module_exit",
             "subsys_initcall_entry",
         ];
-        LEVELS.contains(&name)
+
+        if BOOT_LEVELS.contains(&name) {
+            return Some((0, "runs at boot"));
+        }
+
+        match name {
+            "module_init" => Some((
+                0,
+                "runs when the module is inserted, or at boot if built in",
+            )),
+            "module_exit" => Some((0, "runs when the module is removed")),
+            "__exitcall" => Some((0, "runs when the kernel shuts down")),
+            // The string is the parameter; the function handles it.
+            "__setup" | "early_param" => {
+                Some((1, "runs at boot if the kernel is given that parameter"))
+            }
+            // A name, a compatible string, then the function.
+            "CLK_OF_DECLARE"
+            | "CLK_OF_DECLARE_DRIVER"
+            | "IRQCHIP_DECLARE"
+            | "TIMER_OF_DECLARE"
+            | "OF_DECLARE_1"
+            | "OF_DECLARE_1_RET"
+            | "OF_DECLARE_2" => Some((2, "runs when a device tree node matches")),
+            _ => None,
+        }
+    }
+
+    /// Whether a name is one of the macros that files a function in a
+    /// section.
+    pub fn is_initcall_macro(name: &str) -> bool {
+        Self::entry_point_macro(name).is_some()
     }
 
     /// The name of the array of function pointers this list initialises.
@@ -6329,6 +6380,31 @@ mod tests {
             .unwrap_or_else(|| panic!("no static call site: {sites:?}"));
         assert_eq!(site.member, "()");
         assert_eq!(site.receiver_type.as_deref(), Some("kvm_x86_run"));
+    }
+
+    #[test]
+    fn an_initcall_inside_a_conditional_is_recorded() {
+        let (_functions, _sites) = analyze("int cgwb_init(void) { return 0; }\n", "bdi.c");
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "#ifdef CONFIG_CGROUP_WRITEBACK\n\
+                 static int cgwb_init(void) { return 0; }\n\
+                 subsys_initcall(cgwb_init);\n\
+                 #endif\n",
+                std::path::Path::new("bdi.c"),
+                "hash",
+                None,
+            )
+            .unwrap();
+        assert!(
+            analysis
+                .registrations
+                .iter()
+                .any(|r| r.target == "cgwb_init" && r.container_type == "subsys_initcall"),
+            "{:?}",
+            analysis.registrations
+        );
     }
 
     #[test]

@@ -255,6 +255,17 @@ fn find_paths_bfs(
 
 // Writer-based versions of callchain functions for both CLI and MCP usage
 
+/// When the section a function is filed in gets walked.
+///
+/// A module's exit function runs when the module is removed, and its init
+/// function runs when the module is inserted, which is boot only for a
+/// built-in. Saying "at boot" for either is wrong for a loadable module.
+fn when_it_runs(level: &str) -> &'static str {
+    crate::TreeSitterAnalyzer::entry_point_macro(level)
+        .map(|(_, when)| when)
+        .unwrap_or("runs at boot")
+}
+
 pub async fn show_callers_to_writer(
     db: &DatabaseManager,
     name: &str,
@@ -273,9 +284,46 @@ pub async fn show_callers_to_writer(
             // Always use git-aware callers query
             let callers = db.get_function_callers_git_aware(name, git_sha).await?;
             let indirect = db.find_indirect_callers(name, git_sha).await?;
+            // Nothing in the source calls an initcall: the pointer sits in a
+            // section that do_initcalls() walks at boot. Saying only that
+            // nothing calls it reads as dead code, which is the opposite of
+            // the truth for an entry point.
+            let boot_levels: Vec<String> = db
+                .find_registrations_of_git_aware(name, git_sha)
+                .await?
+                .into_iter()
+                .filter(|registration| {
+                    crate::TreeSitterAnalyzer::is_initcall_macro(&registration.container_type)
+                })
+                .map(|registration| registration.container_type)
+                .collect();
+
+            if !boot_levels.is_empty() {
+                let mut levels = boot_levels.clone();
+                levels.sort();
+                levels.dedup();
+                for level in &levels {
+                    writeln!(
+                        writer,
+                        "{} {}, filed as {}",
+                        "Entry point:".bold().green(),
+                        when_it_runs(level),
+                        level.cyan()
+                    )?;
+                }
+            }
+
             if callers.is_empty() && indirect.is_empty() {
-                let info_msg = format!("{} No functions call '{}'", "Info:".yellow(), name);
-                writeln!(writer, "{info_msg}")?;
+                if boot_levels.is_empty() {
+                    let info_msg = format!("{} No functions call '{}'", "Info:".yellow(), name);
+                    writeln!(writer, "{info_msg}")?;
+                } else {
+                    writeln!(
+                        writer,
+                        "{} nothing in the source calls it",
+                        "Info:".yellow()
+                    )?;
+                }
             } else if !callers.is_empty() {
                 let header = format!("\n{}", "=== Direct Callers ===".bold().green());
                 writeln!(writer, "{header}")?;
