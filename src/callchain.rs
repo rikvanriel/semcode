@@ -255,6 +255,19 @@ fn find_paths_bfs(
 
 // Writer-based versions of callchain functions for both CLI and MCP usage
 
+/// When the section a function is filed in gets walked.
+///
+/// A module's exit function runs when the module is removed, and its init
+/// function runs when the module is inserted, which is boot only for a
+/// built-in. Saying "at boot" for either is wrong for a loadable module.
+fn when_it_runs(level: &str) -> &'static str {
+    match level {
+        "module_exit" => "runs when the module is removed",
+        "module_init" => "runs when the module is inserted, or at boot if built in",
+        _ => "runs at boot",
+    }
+}
+
 pub async fn show_callers_to_writer(
     db: &DatabaseManager,
     name: &str,
@@ -291,12 +304,15 @@ pub async fn show_callers_to_writer(
                 let mut levels = boot_levels.clone();
                 levels.sort();
                 levels.dedup();
-                writeln!(
-                    writer,
-                    "{} runs at boot, filed as {}",
-                    "Entry point:".bold().green(),
-                    levels.join(", ").cyan()
-                )?;
+                for level in &levels {
+                    writeln!(
+                        writer,
+                        "{} {}, filed as {}",
+                        "Entry point:".bold().green(),
+                        when_it_runs(level),
+                        level.cyan()
+                    )?;
+                }
             }
 
             if callers.is_empty() && indirect.is_empty() {
