@@ -161,6 +161,8 @@ struct RawArgumentFunction {
     target: String,
     argument_index: u32,
     taken_address: bool,
+    subject_type: Option<String>,
+    subject_member: Option<String>,
     byte_start: usize,
     line: u32,
 }
@@ -172,6 +174,8 @@ impl RawArgumentFunction {
             callee: self.callee.clone(),
             argument_index: self.argument_index,
             taken_address: self.taken_address,
+            subject_type: self.subject_type.clone(),
+            subject_member: self.subject_member.clone(),
             file_path: file_path.to_string(),
             git_file_hash: git_hash.to_string(),
             byte_start: self.byte_start as u64,
@@ -1714,6 +1718,7 @@ impl TreeSitterAnalyzer {
         source: &str,
     ) -> Vec<RawArgumentFunction> {
         let bound = Self::value_names(root, source);
+        let locals = Self::collect_local_struct_types(root, source);
         let mut out = Vec::new();
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
@@ -1737,6 +1742,28 @@ impl TreeSitterAnalyzer {
             let Some(arguments) = node.child_by_field_name("arguments") else {
                 continue;
             };
+            // What the function is being attached to, if the call says so.
+            // `call_rcu(&inode->i_rcu, i_callback)` puts the callback in a
+            // member of an rcu_head, and only this argument records which
+            // inode holds that head.
+            let mut cursor = arguments.walk();
+            let subject = arguments.named_children(&mut cursor).find_map(|argument| {
+                let field = match argument.kind() {
+                    "field_expression" => argument,
+                    "pointer_expression" => argument
+                        .child_by_field_name("argument")
+                        .filter(|node| node.kind() == "field_expression")?,
+                    _ => return None,
+                };
+                let base = field.child_by_field_name("argument")?;
+                if base.kind() != "identifier" {
+                    return None;
+                }
+                let member = field.child_by_field_name("field")?;
+                let base_type = locals.get(&source[base.byte_range()])?;
+                Some((base_type.clone(), source[member.byte_range()].to_string()))
+            });
+
             let mut cursor = arguments.walk();
             for (index, argument) in arguments.named_children(&mut cursor).enumerate() {
                 let (identifier, taken_address) = match argument.kind() {
@@ -1765,6 +1792,8 @@ impl TreeSitterAnalyzer {
                     target: name.to_string(),
                     argument_index: index as u32,
                     taken_address,
+                    subject_type: subject.as_ref().map(|(type_name, _)| type_name.clone()),
+                    subject_member: subject.as_ref().map(|(_, member)| member.clone()),
                     byte_start: identifier.start_byte(),
                     line: identifier.start_position().row as u32 + 1,
                 });
@@ -6799,5 +6828,72 @@ mod parameter_fate_tests {
     fn a_parameter_only_read_has_no_fate() {
         let body = "static int add(int a, int b) { return a + b; }\n";
         assert!(TreeSitterAnalyzer::parameter_fate(body, "a").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod argument_subject_tests {
+    use super::*;
+
+    fn parse(source: &str) -> Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_c::LANGUAGE.into())
+            .unwrap();
+        parser.parse(source, None).unwrap()
+    }
+
+    #[test]
+    fn the_whole_file_shape_still_types_the_base() {
+        let source = "struct inode { int i_state; struct rcu_head i_rcu; };\n\
+                      static void i_callback(struct rcu_head *head) { }\n\
+                      static void destroy_inode(struct inode *inode)\n\
+                      {\n\
+                      \tcall_rcu(&inode->i_rcu, i_callback);\n\
+                      }\n";
+        let tree = parse(source);
+        let locals = TreeSitterAnalyzer::collect_local_struct_types(tree.root_node(), source);
+        println!("locals: {locals:?}");
+        let found = TreeSitterAnalyzer::collect_argument_functions(tree.root_node(), source);
+        println!("rows: {found:?}");
+        let row = found.iter().find(|r| r.target == "i_callback").unwrap();
+        assert_eq!(row.subject_type.as_deref(), Some("inode"), "{row:?}");
+    }
+
+    #[test]
+    fn the_analysis_keeps_the_subject() {
+        let source = "struct inode { int i_state; struct rcu_head i_rcu; };\n\
+                      static void i_callback(struct rcu_head *head) { }\n\
+                      static void destroy_inode(struct inode *inode)\n\
+                      {\n\
+                      \tcall_rcu(&inode->i_rcu, i_callback);\n\
+                      }\n";
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(source, std::path::Path::new("rcu.c"), "hash", None)
+            .unwrap();
+        println!("argument_functions: {:?}", analysis.argument_functions);
+        let row = analysis
+            .argument_functions
+            .iter()
+            .find(|r| r.target == "i_callback")
+            .unwrap();
+        assert_eq!(row.subject_type.as_deref(), Some("inode"), "{row:?}");
+    }
+
+    #[test]
+    fn a_callback_is_attached_to_the_object_holding_the_head() {
+        let source = "static void destroy_inode(struct inode *inode)\n\
+                      {\n\
+                      \tcall_rcu(&inode->i_rcu, i_callback);\n\
+                      }\n";
+        let tree = parse(source);
+        let found = TreeSitterAnalyzer::collect_argument_functions(tree.root_node(), source);
+        let row = found
+            .iter()
+            .find(|row| row.target == "i_callback")
+            .unwrap_or_else(|| panic!("i_callback not recorded: {found:?}"));
+        assert_eq!(row.subject_type.as_deref(), Some("inode"), "{row:?}");
+        assert_eq!(row.subject_member.as_deref(), Some("i_rcu"), "{row:?}");
     }
 }

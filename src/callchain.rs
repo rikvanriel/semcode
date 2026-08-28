@@ -578,6 +578,17 @@ pub async fn show_registrations_to_writer(
 
             // Where that call puts it, and by what route: the slot is a
             // claim about the registrar, not about this call site.
+            if let (Some(subject_type), Some(subject_member)) =
+                (&argument.subject_type, &argument.subject_member)
+            {
+                writeln!(
+                    writer,
+                    "     attached to {}::{}",
+                    subject_type.cyan(),
+                    subject_member.cyan(),
+                )?;
+            }
+
             match db
                 .follow_handed_parameter(&argument.callee, argument.argument_index, git_sha)
                 .await?

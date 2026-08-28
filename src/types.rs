@@ -307,6 +307,12 @@ pub struct ArgumentFunction {
     /// `&handler` rather than `handler`. Both install a function; the address
     /// form also appears where the argument is an object, so it is kept.
     pub taken_address: bool,
+    /// The object the function is being attached to, where another argument
+    /// names one: `call_rcu(&inode->i_rcu, i_callback)` attaches the callback
+    /// to an inode through `i_rcu`. Set together, and only where the file
+    /// declares the base's type.
+    pub subject_type: Option<String>,
+    pub subject_member: Option<String>,
     pub file_path: String,
     pub git_file_hash: String,
     pub byte_start: u64,

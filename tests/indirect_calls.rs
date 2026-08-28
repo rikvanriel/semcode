@@ -216,6 +216,16 @@ fn write_argument_fixture(repo: &Path) {
     )
     .unwrap();
     std::fs::write(
+        repo.join("rcu.c"),
+        "struct inode { int i_state; struct rcu_head i_rcu; };\n\
+         static void i_callback(struct rcu_head *head) { }\n\
+         static void destroy_inode(struct inode *inode)\n\
+         {\n\
+         \tcall_rcu(&inode->i_rcu, i_callback);\n\
+         }\n",
+    )
+    .unwrap();
+    std::fs::write(
         repo.join("nic.c"),
         "#include \"irq.h\"\n\
          static int nic_intr(int irq, void *dev) { return 0; }\n\
@@ -304,6 +314,23 @@ async fn a_function_handed_to_a_call_is_recorded() {
     // where some other tree defines a function of that name.
     let local = db.find_argument_functions_of("flags").await.unwrap();
     assert!(local.is_empty(), "a local was recorded: {local:?}");
+
+    // An RCU callback is attached to the object holding the head, which is
+    // the only place that says which type the callback frees.
+    let rcu = db.find_argument_functions_of("i_callback").await.unwrap();
+    assert_eq!(rcu.len(), 1, "{rcu:?}");
+    assert_eq!(
+        rcu[0].subject_type.as_deref(),
+        Some("inode"),
+        "{:?}",
+        rcu[0]
+    );
+    assert_eq!(
+        rcu[0].subject_member.as_deref(),
+        Some("i_rcu"),
+        "{:?}",
+        rcu[0]
+    );
 
     // The identifier has to name a function: an enum constant in the same
     // argument position does not.
@@ -611,5 +638,42 @@ async fn a_function_with_ordinary_callers_gets_no_pointer_chain() {
         rendered.is_empty(),
         "{}",
         String::from_utf8_lossy(&rendered)
+    );
+}
+
+#[tokio::test]
+async fn the_subject_survives_a_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseManager::new(
+        dir.path().join(".semcode.db").to_str().unwrap(),
+        dir.path().to_string_lossy().into_owned(),
+    )
+    .await
+    .unwrap();
+    db.create_tables().await.unwrap();
+
+    db.insert_argument_functions(vec![semcode::ArgumentFunction {
+        target: "i_callback".to_string(),
+        callee: "call_rcu".to_string(),
+        argument_index: 1,
+        taken_address: false,
+        subject_type: Some("inode".to_string()),
+        subject_member: Some("i_rcu".to_string()),
+        file_path: "rcu.c".to_string(),
+        git_file_hash: "hash".to_string(),
+        byte_start: 178,
+        line: 5,
+        enclosing_function: "destroy_inode".to_string(),
+    }])
+    .await
+    .unwrap();
+
+    let back = db.find_argument_functions_of("i_callback").await.unwrap();
+    assert_eq!(back.len(), 1, "{back:?}");
+    assert_eq!(
+        back[0].subject_type.as_deref(),
+        Some("inode"),
+        "{:?}",
+        back[0]
     );
 }

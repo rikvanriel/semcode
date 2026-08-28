@@ -33,7 +33,7 @@ pub enum OptimizeOutcome {
 /// 4: a registration can be recorded before its container type is known,
 ///    carrying the base and field path instead. A version 3 index has no
 ///    such rows at all: it dropped those registrations.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 pub struct SchemaManager {
     connection: Connection,
@@ -251,6 +251,10 @@ impl SchemaManager {
             Field::new("callee", DataType::Utf8, false),
             Field::new("argument_index", DataType::Int64, false),
             Field::new("taken_address", DataType::Boolean, false),
+            // The object the function is attached to, where the call names
+            // one. Absent where the file does not declare the base's type.
+            Field::new("subject_type", DataType::Utf8, true),
+            Field::new("subject_member", DataType::Utf8, true),
             Field::new("file_path", DataType::Utf8, false),
             Field::new("git_file_hash", DataType::Utf8, false),
             Field::new("byte_start", DataType::Int64, false),

@@ -5,8 +5,8 @@
 // is answered against the functions table, which is complete only once the
 // tree has been indexed.
 use anyhow::Result;
+use arrow::array::{Array, RecordBatchIterator, StringArray};
 use arrow::array::{ArrayRef, BooleanBuilder, Int64Builder, RecordBatch, StringBuilder};
-use arrow::array::{RecordBatchIterator, StringArray};
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
@@ -42,6 +42,8 @@ impl ArgumentFunctionStore {
         let mut callee = StringBuilder::new();
         let mut argument_index = Int64Builder::new();
         let mut taken_address = BooleanBuilder::new();
+        let mut subject_type = StringBuilder::new();
+        let mut subject_member = StringBuilder::new();
         let mut file_path = StringBuilder::new();
         let mut git_file_hash = StringBuilder::new();
         let mut byte_start = Int64Builder::new();
@@ -53,6 +55,8 @@ impl ArgumentFunctionStore {
             callee.append_value(&argument.callee);
             argument_index.append_value(argument.argument_index as i64);
             taken_address.append_value(argument.taken_address);
+            subject_type.append_option(argument.subject_type.as_deref());
+            subject_member.append_option(argument.subject_member.as_deref());
             file_path.append_value(&argument.file_path);
             git_file_hash.append_value(&argument.git_file_hash);
             byte_start.append_value(argument.byte_start as i64);
@@ -70,6 +74,11 @@ impl ArgumentFunctionStore {
             (
                 "taken_address",
                 Arc::new(taken_address.finish()) as ArrayRef,
+            ),
+            ("subject_type", Arc::new(subject_type.finish()) as ArrayRef),
+            (
+                "subject_member",
+                Arc::new(subject_member.finish()) as ArrayRef,
             ),
             ("file_path", Arc::new(file_path.finish()) as ArrayRef),
             (
@@ -123,6 +132,8 @@ impl ArgumentFunctionStore {
                     callee: callee.value(row).to_string(),
                     argument_index: index.value(row) as u32,
                     taken_address: false,
+                    subject_type: None,
+                    subject_member: None,
                     file_path: String::new(),
                     git_file_hash: String::new(),
                     byte_start: 0,
@@ -161,12 +172,18 @@ impl ArgumentFunctionStore {
             let byte_start = get_column::<arrow::array::Int64Array>(batch, "byte_start")?;
             let line = get_column::<arrow::array::Int64Array>(batch, "line")?;
             let enclosing = get_column::<StringArray>(batch, "enclosing_function")?;
+            let subject_type = get_column::<StringArray>(batch, "subject_type")?;
+            let subject_member = get_column::<StringArray>(batch, "subject_member")?;
             for row in 0..batch.num_rows() {
                 out.push(ArgumentFunction {
                     target: target.value(row).to_string(),
                     callee: callee.value(row).to_string(),
                     argument_index: index.value(row) as u32,
                     taken_address: address.value(row),
+                    subject_type: (!subject_type.is_null(row))
+                        .then(|| subject_type.value(row).to_string()),
+                    subject_member: (!subject_member.is_null(row))
+                        .then(|| subject_member.value(row).to_string()),
                     file_path: file_path.value(row).to_string(),
                     git_file_hash: git_file_hash.value(row).to_string(),
                     byte_start: byte_start.value(row) as u64,

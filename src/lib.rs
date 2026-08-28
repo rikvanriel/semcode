@@ -38,9 +38,9 @@ pub use text_utils::preprocess_code;
 pub use treesitter_analyzer::{ParameterFate, TreeSitterAnalyzer};
 pub use types::Handover;
 pub use types::{
-    DispatchKind, DispatchSite, FieldInfo, FunctionInfo, GitCommitInfo, GitFileEntry,
-    GitFileManifestEntry, GlobalTypeRegistry, LoreEmailInfo, ParameterInfo, Registration,
-    RegistrationKind, TypeInfo, TypedefInfo,
+    ArgumentFunction, DispatchKind, DispatchSite, FieldInfo, FunctionInfo, GitCommitInfo,
+    GitFileEntry, GitFileManifestEntry, GlobalTypeRegistry, LoreEmailInfo, ParameterInfo,
+    Registration, RegistrationKind, TypeInfo, TypedefInfo,
 };
 pub use vectorizer::CodeVectorizer;
 pub use workdir::WorkdirIndex;
