@@ -1656,8 +1656,16 @@ impl TreeSitterAnalyzer {
             // is stored and resolution walks it.
             if let Some((base, fields)) = field_path(receiver) {
                 if let Some(base_type) = declared_type(base) {
-                    site.receiver_base_type = Some(base_type);
-                    site.receiver_field = Some(fields);
+                    // A table held in a field is keyed by the type and the
+                    // field together, which is what the initializer recorded.
+                    // Anything else needs the field's own type, which lives
+                    // with whichever file declares the struct.
+                    if site.kind == DispatchKind::ArrayElement {
+                        site.receiver_type = Some(format!("{base_type}.{fields}"));
+                    } else {
+                        site.receiver_base_type = Some(base_type);
+                        site.receiver_field = Some(fields);
+                    }
                 }
             }
         }
@@ -2146,6 +2154,21 @@ impl TreeSitterAnalyzer {
                         .filter(|a| a.kind() == "identifier"),
                     _ => None,
                 };
+                // `.demod_attach = { demod_attach_stv0900, cineS2_probe }`
+                // is a table the struct holds. The field is the container and
+                // every element is a way in, the same shape a standalone
+                // table has, so the key names both: a field holds one table
+                // per struct type, and the type alone would collide with
+                // every other struct that has a field of that name.
+                if value.kind() == "initializer_list" && !container_type.is_empty() {
+                    found.extend(Self::held_table_elements(
+                        value,
+                        source,
+                        &format!("{container_type}.{member}"),
+                    ));
+                    continue;
+                }
+
                 let Some(target_node) = target_node else {
                     continue;
                 };
@@ -2704,6 +2727,37 @@ impl TreeSitterAnalyzer {
         }
 
         found
+    }
+
+    /// Elements of a table held in a struct field.
+    ///
+    /// Every element has to be a plain name for the list to be a table of
+    /// functions; a list with a value in it is initialising something else,
+    /// and recording half of it would claim a table that is not there.
+    fn held_table_elements(
+        list: tree_sitter::Node,
+        source: &str,
+        container: &str,
+    ) -> Vec<RawRegistration> {
+        let mut cursor = list.walk();
+        let elements: Vec<tree_sitter::Node> = list.named_children(&mut cursor).collect();
+        if elements.is_empty() || elements.iter().any(|e| e.kind() != "identifier") {
+            return Vec::new();
+        }
+
+        elements
+            .iter()
+            .map(|element| RawRegistration {
+                container_type: container.to_string(),
+                container_base_type: None,
+                container_field: None,
+                member: ARRAY_ELEMENT_MEMBER.to_string(),
+                target: source[element.byte_range()].to_string(),
+                byte_start: element.start_byte(),
+                line: element.start_position().row as u32 + 1,
+                kind: RegistrationKind::DesignatedInit,
+            })
+            .collect()
     }
 
     /// The type an initializer list fills in, and the path of fields to reach
@@ -6568,10 +6622,10 @@ mod tests {
     }
 
     #[test]
-    fn a_table_held_in_a_field_is_recorded_without_inventing_a_container() {
+    fn a_table_held_in_a_field_is_keyed_by_the_type_and_the_field() {
         // `chip->get_delay[i]()` dispatches through an array a struct holds.
-        // The site is worth recording; the container is not knowable from
-        // the array name, because there is not one.
+        // The array has no name of its own, so the key is the type and the
+        // field, which is what the initializer of such a field records.
         let (_functions, sites) = analyze(
             "int azx_get_position(struct azx *chip, int i)\n\
              {\n\
@@ -6585,10 +6639,26 @@ mod tests {
             .find(|s| s.kind == DispatchKind::ArrayElement)
             .expect("no array dispatch site");
         assert_eq!(site.receiver_expr.as_deref(), Some("chip->get_delay"));
-        assert_eq!(
-            site.receiver_type, None,
-            "a field is not a table name: {site:?}"
+        assert_eq!(site.receiver_type.as_deref(), Some("azx.get_delay"));
+    }
+
+    #[test]
+    fn a_field_table_on_an_untyped_base_names_no_container() {
+        // Nothing here says what `chip` is, and a key built from a guess
+        // joins with whatever else guessed the same way.
+        let (_functions, sites) = analyze(
+            "int azx_get_position(int i)\n\
+             {\n\
+             \treturn chip->get_delay[i](chip);\n\
+             }\n",
+            "hda.c",
         );
+
+        let site = sites
+            .iter()
+            .find(|s| s.kind == DispatchKind::ArrayElement)
+            .expect("no array dispatch site");
+        assert_eq!(site.receiver_type, None, "{site:?}");
     }
 
     #[test]
@@ -7397,5 +7467,54 @@ mod argument_subject_tests {
             .unwrap_or_else(|| panic!("i_callback not recorded: {found:?}"));
         assert_eq!(row.subject_type.as_deref(), Some("inode"), "{row:?}");
         assert_eq!(row.subject_member.as_deref(), Some("i_rcu"), "{row:?}");
+    }
+}
+
+#[cfg(test)]
+mod held_table_tests {
+    use super::*;
+
+    #[test]
+    fn a_table_held_in_a_field_joins_its_sites() {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "struct ngene_info {\n\
+                 \tint (*demod_attach[4])(struct ngene_channel *);\n\
+                 };\n\
+                 static int demod_attach_stv0900(struct ngene_channel *c) { return 0; }\n\
+                 static struct ngene_info ngene_info_duoflex = {\n\
+                 \t.demod_attach = { demod_attach_stv0900, demod_attach_stv0900 },\n\
+                 };\n\
+                 static int probe(struct ngene_info *info, struct ngene_channel *c, int i)\n\
+                 {\n\
+                 \treturn info->demod_attach[i](c);\n\
+                 }\n",
+                std::path::Path::new("ngene.c"),
+                "hash",
+                None,
+            )
+            .unwrap();
+
+        let installed: Vec<&crate::types::Registration> = analysis
+            .registrations
+            .iter()
+            .filter(|r| r.target == "demod_attach_stv0900")
+            .collect();
+        assert_eq!(installed.len(), 2, "{:?}", analysis.registrations);
+        assert_eq!(installed[0].container_type, "ngene_info.demod_attach");
+        assert_eq!(installed[0].member, ARRAY_ELEMENT_MEMBER);
+
+        // The site has to arrive at the same key or the two never meet.
+        let site = analysis
+            .dispatch_sites
+            .iter()
+            .find(|s| s.member == ARRAY_ELEMENT_MEMBER)
+            .unwrap_or_else(|| panic!("{:?}", analysis.dispatch_sites));
+        assert_eq!(
+            site.receiver_type.as_deref(),
+            Some("ngene_info.demod_attach"),
+            "{site:?}"
+        );
     }
 }
