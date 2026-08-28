@@ -261,11 +261,9 @@ fn find_paths_bfs(
 /// function runs when the module is inserted, which is boot only for a
 /// built-in. Saying "at boot" for either is wrong for a loadable module.
 fn when_it_runs(level: &str) -> &'static str {
-    match level {
-        "module_exit" => "runs when the module is removed",
-        "module_init" => "runs when the module is inserted, or at boot if built in",
-        _ => "runs at boot",
-    }
+    crate::TreeSitterAnalyzer::entry_point_macro(level)
+        .map(|(_, when)| when)
+        .unwrap_or("runs at boot")
 }
 
 pub async fn show_callers_to_writer(
