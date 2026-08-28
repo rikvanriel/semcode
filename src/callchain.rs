@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+use crate::types::Handover;
 use crate::{DatabaseManager, FunctionInfo};
 use anstream::stdout;
 use anyhow::Result;
@@ -578,22 +579,37 @@ pub async fn show_registrations_to_writer(
 
             // Where that call puts it, and by what route: the slot is a
             // claim about the registrar, not about this call site.
-            if let (Some(subject_type), Some(subject_member)) =
-                (&argument.subject_type, &argument.subject_member)
+            let handover = db
+                .follow_handed_parameter(&argument.callee, argument.argument_index, git_sha)
+                .await?;
+
+            // The object is only the one this function was attached to if it
+            // holds the thing the callee stored into. `call_rcu(&inode->i_rcu,
+            // cb)` passes an rcu_head and the callback lands in
+            // rcu_head::func, so the inode is the subject. `request_irq(...,
+            // handler, ..., netdev->name, ...)` also passes a member, and the
+            // handler has nothing to do with it.
+            if let (
+                Some(subject_type),
+                Some(subject_member),
+                Some(Handover::StoredIn { container_type, .. }),
+            ) = (&argument.subject_type, &argument.subject_member, &handover)
             {
-                writeln!(
-                    writer,
-                    "     attached to {}::{}",
-                    subject_type.cyan(),
-                    subject_member.cyan(),
-                )?;
+                let holds = db
+                    .member_aggregate_git_aware(subject_type, subject_member, git_sha)
+                    .await?;
+                if holds.as_deref() == Some(container_type.as_str()) {
+                    writeln!(
+                        writer,
+                        "     attached to {}::{}",
+                        subject_type.cyan(),
+                        subject_member.cyan(),
+                    )?;
+                }
             }
 
-            match db
-                .follow_handed_parameter(&argument.callee, argument.argument_index, git_sha)
-                .await?
-            {
-                Some(crate::types::Handover::StoredIn {
+            match handover {
+                Some(Handover::StoredIn {
                     path,
                     container_type,
                     member,
@@ -605,7 +621,7 @@ pub async fn show_registrations_to_writer(
                     "called later".yellow(),
                     path.join(" -> ").bright_black(),
                 )?,
-                Some(crate::types::Handover::Invoked { path }) => writeln!(
+                Some(Handover::Invoked { path }) => writeln!(
                     writer,
                     "     calls it {} through {}",
                     "before returning".yellow(),
