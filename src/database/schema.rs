@@ -33,7 +33,7 @@ pub enum OptimizeOutcome {
 /// 4: a registration can be recorded before its container type is known,
 ///    carrying the base and field path instead. A version 3 index has no
 ///    such rows at all: it dropped those registrations.
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 pub struct SchemaManager {
     connection: Connection,
@@ -87,6 +87,10 @@ impl SchemaManager {
                 &["container_base_type", "container_field"],
             )
             .await?;
+        }
+
+        if !table_names.iter().any(|n| n == "globals") {
+            self.create_globals_table().await?;
         }
 
         if !table_names.iter().any(|n| n == "argument_functions") {
@@ -238,6 +242,31 @@ impl SchemaManager {
             .create_table("object_macros", vec![RecordBatch::new_empty(schema)])
             .execute()
             .await?;
+
+        Ok(())
+    }
+
+    pub async fn create_globals_table(&self) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("type_name", DataType::Utf8, false),
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("git_file_hash", DataType::Utf8, false),
+            Field::new("line", DataType::Int64, false),
+        ]));
+
+        let table = self
+            .connection
+            .create_table("globals", vec![RecordBatch::new_empty(schema)])
+            .execute()
+            .await?;
+
+        // Typing a receiver asks for one name.
+        table
+            .create_index(&["name"], lancedb::index::Index::Auto)
+            .execute()
+            .await
+            .ok();
 
         Ok(())
     }
@@ -633,6 +662,7 @@ impl SchemaManager {
         match name {
             "processed_files" => self.create_processed_files_table().await,
             "argument_functions" => self.create_argument_functions_table().await,
+            "globals" => self.create_globals_table().await,
             "registrations" => self.create_registrations_table().await,
             "dispatch_sites" => self.create_dispatch_sites_table().await,
             other => Err(anyhow::anyhow!("no way to recreate {other}")),

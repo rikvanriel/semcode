@@ -215,6 +215,30 @@ fn write_argument_fixture(repo: &Path) {
          }\n",
     )
     .unwrap();
+    // An ops table declared in a header and dispatched from a file that
+    // includes it: the calling file cannot type the receiver.
+    std::fs::write(
+        repo.join("delay.h"),
+        "struct arm_delay_ops { void (*delay)(unsigned long); };\n\
+         extern struct arm_delay_ops arm_delay_ops;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("delay.c"),
+        "#include \"delay.h\"\n\
+         static void loop_delay(unsigned long n) { }\n\
+         struct arm_delay_ops arm_delay_ops = { .delay = loop_delay };\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("use_delay.c"),
+        "#include \"delay.h\"\n\
+         void spin(unsigned long n)\n\
+         {\n\
+         \tarm_delay_ops.delay(n);\n\
+         }\n",
+    )
+    .unwrap();
     std::fs::write(
         repo.join("rcu.c"),
         "struct rcu_head { void (*func)(struct rcu_head *head); };\n\
@@ -275,26 +299,24 @@ async fn index_fixture(repo: &Path) -> (Arc<DatabaseManager>, String) {
     (db, git_sha)
 }
 
-#[tokio::test]
-async fn a_function_handed_to_a_call_is_recorded() {
-    let dir = tempfile::tempdir().unwrap();
-    git_run(dir.path(), &["init", "-q"]);
-    write_argument_fixture(dir.path());
-    git_run(dir.path(), &["add", "."]);
-    git_run(dir.path(), &["commit", "-q", "-m", "fixture"]);
+async fn index_argument_fixture(repo: &Path) -> (Arc<DatabaseManager>, String) {
+    git_run(repo, &["init", "-q"]);
+    write_argument_fixture(repo);
+    git_run(repo, &["add", "."]);
+    git_run(repo, &["commit", "-q", "-m", "fixture"]);
 
-    let git_sha = git::get_git_sha(dir.path()).unwrap().unwrap();
+    let git_sha = git::get_git_sha(repo).unwrap().unwrap();
     let db = Arc::new(
         DatabaseManager::new(
-            dir.path().join(".semcode.db").to_str().unwrap(),
-            dir.path().to_string_lossy().into_owned(),
+            repo.join(".semcode.db").to_str().unwrap(),
+            repo.to_string_lossy().into_owned(),
         )
         .await
         .unwrap(),
     );
     db.create_tables().await.unwrap();
     semcode::git_range::process_git_tree(
-        dir.path(),
+        repo,
         &git_sha,
         &["c".to_string(), "h".to_string()],
         db.clone(),
@@ -303,6 +325,13 @@ async fn a_function_handed_to_a_call_is_recorded() {
     )
     .await
     .unwrap();
+    (db, git_sha)
+}
+
+#[tokio::test]
+async fn a_function_handed_to_a_call_is_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, git_sha) = index_argument_fixture(dir.path()).await;
 
     let handed = db.find_argument_functions_of("nic_intr").await.unwrap();
     assert_eq!(
@@ -391,6 +420,28 @@ async fn a_function_handed_to_a_call_is_recorded() {
     assert!(
         output.contains("attached to inode::i_rcu"),
         "the rcu_head's owner was not reported:\n{output}"
+    );
+}
+
+#[tokio::test]
+async fn a_receiver_declared_in_a_header_is_typed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, git_sha) = index_argument_fixture(dir.path()).await;
+
+    // `arm_delay_ops.delay(n)` is written where only the header declares the
+    // variable, so the type comes from the index rather than the file.
+    let callers = db
+        .find_indirect_callers("loop_delay", &git_sha)
+        .await
+        .unwrap();
+    let matched: Vec<_> = callers
+        .iter()
+        .filter(|c| c.evidence.is_type_matched())
+        .collect();
+    assert_eq!(
+        matched.len(),
+        1,
+        "expected the header-declared receiver to match: {callers:?}"
     );
 }
 

@@ -156,6 +156,7 @@ pub struct DatabaseManager {
     dispatch_site_store: crate::database::dispatch_sites::DispatchSiteStore,
     registration_store: crate::database::registrations::RegistrationStore,
     argument_function_store: crate::database::argument_functions::ArgumentFunctionStore,
+    global_store: crate::database::globals::GlobalStore,
     object_macro_store: crate::database::object_macros::ObjectMacroStore,
     symbol_filename_store: SymbolFilenameStore,
     branch_store: IndexedBranchStore,
@@ -217,6 +218,7 @@ impl DatabaseManager {
             ),
             argument_function_store:
                 crate::database::argument_functions::ArgumentFunctionStore::new(connection.clone()),
+            global_store: crate::database::globals::GlobalStore::new(connection.clone()),
             symbol_filename_store: SymbolFilenameStore::new(connection.clone()),
             object_macro_store: crate::database::object_macros::ObjectMacroStore::new(
                 connection.clone(),
@@ -995,6 +997,11 @@ impl DatabaseManager {
         self.registration_store.insert_batch(registrations).await
     }
 
+    /// Record file-scope variables of aggregate type.
+    pub async fn insert_globals(&self, globals: Vec<crate::types::GlobalVariable>) -> Result<()> {
+        self.global_store.insert_batch(globals).await
+    }
+
     /// Record functions named as call arguments.
     pub async fn insert_argument_functions(
         &self,
@@ -1041,6 +1048,7 @@ impl DatabaseManager {
                 continue;
             }
             self.type_chained_receivers(&mut sites, &manifest).await?;
+            self.type_global_receivers(&mut sites, &manifest).await?;
 
             let mut dispatches = Vec::new();
             for site in sites {
@@ -1515,6 +1523,7 @@ impl DatabaseManager {
         }
 
         self.type_chained_receivers(&mut sites, &manifest).await?;
+        self.type_global_receivers(&mut sites, &manifest).await?;
 
         Ok(indirect_callers(
             &registrations,
@@ -1529,6 +1538,67 @@ impl DatabaseManager {
     /// field `f_op`. What `f_op` is declared as lives with struct file, in a
     /// header the analyzer was not looking at, so the last hop happens here,
     /// where the whole tree's types are available.
+    /// Type a receiver that names a file-scope variable declared elsewhere.
+    ///
+    /// `ppc_md.memory_block_size()` is written in a file that includes
+    /// machdep.h rather than containing it, so the analyzer sees a plain name
+    /// it cannot type. The declaration is in the index; the join happens here.
+    ///
+    /// A name declared with two different aggregates at one revision is left
+    /// alone: filing a site under the wrong type joins it with the wrong
+    /// registrations, which is worse than admitting the type is unknown.
+    async fn type_global_receivers(
+        &self,
+        sites: &mut [crate::types::DispatchSite],
+        manifest: &crate::database::resolution::RevisionPaths,
+    ) -> Result<()> {
+        let mut resolved: std::collections::HashMap<String, Option<String>> =
+            std::collections::HashMap::new();
+
+        for site in sites.iter_mut() {
+            if site.receiver_type.is_some() || site.receiver_base_type.is_some() {
+                continue;
+            }
+            let Some(receiver) = site.receiver_expr.as_deref() else {
+                continue;
+            };
+            let receiver = receiver.trim();
+            if receiver.is_empty()
+                || !receiver.chars().all(|c| c.is_alphanumeric() || c == '_')
+                || receiver.chars().next().is_some_and(|c| c.is_numeric())
+            {
+                continue;
+            }
+
+            let type_name = match resolved.get(receiver) {
+                Some(known) => known.clone(),
+                None => {
+                    let declarations = crate::database::resolution::at_revision(
+                        self.global_store.find_by_name(receiver).await?,
+                        manifest,
+                        |global| (global.file_path.as_str(), global.git_file_hash.as_str()),
+                    );
+                    let mut types: Vec<String> = declarations
+                        .into_iter()
+                        .map(|global| global.type_name)
+                        .collect();
+                    types.sort();
+                    types.dedup();
+                    let answer = match types.len() {
+                        1 => types.pop(),
+                        _ => None,
+                    };
+                    resolved.insert(receiver.to_string(), answer.clone());
+                    answer
+                }
+            };
+
+            site.receiver_type = type_name;
+        }
+
+        Ok(())
+    }
+
     async fn type_chained_receivers(
         &self,
         sites: &mut [crate::types::DispatchSite],
