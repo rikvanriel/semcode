@@ -1431,7 +1431,32 @@ impl TreeSitterAnalyzer {
                     node = node.child_by_field_name("type")?;
                 }
                 "generic_type" => {
-                    node = node.child_by_field_name("type")?;
+                    // A call through a smart pointer dispatches on what it
+                    // holds: `Arc<TagSet>::raw_tag_set` is a method of
+                    // TagSet, reached by Deref. Only pointers that deref to
+                    // their argument are seen through; `Vec<T>` has methods
+                    // of its own and is not one.
+                    let base = node.child_by_field_name("type")?;
+                    let base_name = Self::rust_type_name(base, source)?;
+                    if !matches!(
+                        base_name.as_str(),
+                        "Arc" | "Rc" | "Box" | "Pin" | "ARef" | "KBox" | "UniqueArc" | "Owned"
+                    ) {
+                        return Some(base_name);
+                    }
+                    let held = node
+                        .child_by_field_name("type_arguments")
+                        .and_then(|arguments| {
+                            let mut cursor = arguments.walk();
+                            let found = arguments
+                                .named_children(&mut cursor)
+                                .find(|child| child.kind() != "lifetime");
+                            found
+                        });
+                    match held {
+                        Some(held) => node = held,
+                        None => return Some(base_name),
+                    }
                 }
                 "scoped_type_identifier" => {
                     node = node.child_by_field_name("name")?;
@@ -7017,6 +7042,27 @@ mod rust_receiver_tests {
         assert_eq!(
             receiver_type_of(&sites, "write_str").as_deref(),
             Some("Formatter"),
+            "{sites:?}"
+        );
+    }
+
+    #[test]
+    fn a_smart_pointer_is_the_type_it_holds() {
+        let sites = sites_of("fn f(tagset: Arc<TagSet<T>>) { tagset.raw_tag_set(); }\n");
+        assert_eq!(
+            receiver_type_of(&sites, "raw_tag_set").as_deref(),
+            Some("TagSet"),
+            "{sites:?}"
+        );
+    }
+
+    #[test]
+    fn a_container_is_not_the_type_it_holds() {
+        // Vec has methods of its own; `.len()` is one of them.
+        let sites = sites_of("fn f(items: Vec<Request>) { items.len(); }\n");
+        assert_eq!(
+            receiver_type_of(&sites, "len").as_deref(),
+            Some("Vec"),
             "{sites:?}"
         );
     }
