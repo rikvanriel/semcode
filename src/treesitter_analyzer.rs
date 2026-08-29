@@ -3180,6 +3180,8 @@ impl TreeSitterAnalyzer {
             let mut line_end = 0;
             let mut function_start_byte = 0;
             let mut function_end_byte = 0;
+            let mut body_start_byte = 0;
+            let mut function_node = None;
 
             for capture in m.captures {
                 let node = capture.node;
@@ -3208,11 +3210,13 @@ impl TreeSitterAnalyzer {
                     }
                     "body" => {
                         line_end = node.end_position().row as u32 + 1;
+                        body_start_byte = node.start_byte();
                     }
                     "function" | "function_ptr" | "function_ptr2" => {
                         // All function types with bodies - process fully
                         function_start_byte = node.start_byte();
                         function_end_byte = node.end_byte();
+                        function_node = Some(node);
                         if line_end == 0 {
                             line_end = node.end_position().row as u32 + 1;
                         }
@@ -3278,6 +3282,24 @@ impl TreeSitterAnalyzer {
                     || matched_patterns.contains("function")
                     || matched_patterns.contains("function_ptr")
                     || matched_patterns.contains("function_ptr2");
+
+                // A body the parser stopped reading early ends at the break
+                // rather than at its closing brace, and the statements after
+                // it are reparented to file scope where they belong to nobody.
+                // Counting braces recovers the end, and the range is all the
+                // attribution below needs.
+                if has_body && body_start_byte > 0 {
+                    if let Some(recovered) = Self::body_end_by_braces(
+                        ctx.source,
+                        body_start_byte,
+                        function_node.map_or(ctx.source.len(), Self::next_definition_start),
+                    ) {
+                        if recovered > function_end_byte {
+                            function_end_byte = recovered;
+                            line_end = ctx.source[..recovered].lines().count() as u32;
+                        }
+                    }
+                }
 
                 // Extract complete function text including top comments
                 let complete_body = self.extract_function_with_comments(
@@ -4226,6 +4248,78 @@ impl TreeSitterAnalyzer {
             type_file_path: None, // resolved later in the type resolution phase
             type_git_file_hash: None, // resolved later in the type resolution phase
         })
+    }
+
+    /// Where the next definition begins, which bounds how far a broken body
+    /// may be read. Without a bound, a body holding an unbalanced brace inside
+    /// a conditional would swallow the rest of the file. `usize::MAX` means no
+    /// definition follows; the caller clamps to the source's length.
+    fn next_definition_start(node: tree_sitter::Node) -> usize {
+        let mut sibling = node.next_sibling();
+        while let Some(current) = sibling {
+            if current.kind() == "function_definition" {
+                return current.start_byte();
+            }
+            sibling = current.next_sibling();
+        }
+        usize::MAX
+    }
+
+    /// The closing brace of the block opening at `open`, found by counting
+    /// braces rather than by asking the parser, which is the point: the parser
+    /// is what gave up.
+    ///
+    /// A declaration built by a macro -- `TRAILING_OVERLAP(...) x = {...};` --
+    /// is not parseable C, so the grammar ends the function at that line and
+    /// makes the remaining statements children of the translation unit. The
+    /// function then records the calls above the break and none below it, and
+    /// says nothing about the difference. 1,176 statements across the tree sit
+    /// at file scope this way, holding 687 call sites, 451 of them outside
+    /// tools/.
+    ///
+    /// Strings, character literals and comments are skipped, since a brace
+    /// inside any of them is text rather than structure.
+    fn body_end_by_braces(source: &str, open: usize, limit: usize) -> Option<usize> {
+        let bytes = source.as_bytes();
+        if bytes.get(open) != Some(&b'{') {
+            return None;
+        }
+        let end = limit.min(bytes.len());
+        let mut depth = 0usize;
+        let mut index = open;
+        while index < end {
+            match bytes[index] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(index + 1);
+                    }
+                }
+                b'"' | b'\'' => {
+                    let quote = bytes[index];
+                    index += 1;
+                    while index < end && bytes[index] != quote {
+                        index += if bytes[index] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                    while index < end && bytes[index] != b'\n' {
+                        index += 1;
+                    }
+                }
+                b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                    index += 2;
+                    while index + 1 < end && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
+                        index += 1;
+                    }
+                    index += 1;
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        None
     }
 
     /// A preprocessor conditional does not nest what it holds: a definition
@@ -7780,6 +7874,77 @@ mod macro_defined_tests {
                 .is_some_and(|c| c.iter().any(|n| n == "iterate_dir")),
             "{syscall:?}"
         );
+    }
+
+    #[test]
+    fn a_body_the_parser_abandoned_keeps_its_calls() {
+        // `TRAILING_OVERLAP(...) x = {...};` is not parseable C. The grammar
+        // ends the function at that line and makes the statements after it
+        // children of the translation unit, so the calls below the break
+        // belong to nobody and nothing says so.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "static int freeze(struct nvdimm *nvdimm)\n\
+                 {\n\
+                 \tstruct nfit_mem *mem = provider_data(nvdimm);\n\
+                 \tTRAILING_OVERLAP(struct nd_cmd_pkg, pkg, nd_payload,\n\
+                 \t\tstruct nd_intel_freeze_lock cmd;\n\
+                 \t) nd_cmd = {\n\
+                 \t\t.pkg = { .nd_size_out = 4, },\n\
+                 \t};\n\
+                 \n\
+                 \tif (!test_bit(0, &mem->dsm_mask))\n\
+                 \t\treturn -ENOTTY;\n\
+                 \treturn nvdimm_ctl(nvdimm, &nd_cmd);\n\
+                 }\n",
+                std::path::Path::new("intel.c"),
+                "hash",
+                None,
+            )
+            .unwrap();
+
+        let freeze = analysis
+            .functions
+            .iter()
+            .find(|f| f.name == "freeze")
+            .unwrap();
+        let calls = freeze.calls.clone().unwrap_or_default();
+        for expected in ["provider_data", "test_bit", "nvdimm_ctl"] {
+            assert!(calls.iter().any(|c| c == expected), "{calls:?}");
+        }
+    }
+
+    #[test]
+    fn a_body_the_parser_read_whole_is_unchanged() {
+        // The recovery must not extend a function whose body parsed, or every
+        // range in the file would drift by whatever follows it.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "static int first(void)\n\
+                 {\n\
+                 \treturn one();\n\
+                 }\n\
+                 \n\
+                 static int second(void)\n\
+                 {\n\
+                 \treturn two();\n\
+                 }\n",
+                std::path::Path::new("plain.c"),
+                "hash",
+                None,
+            )
+            .unwrap();
+        let first = analysis
+            .functions
+            .iter()
+            .find(|f| f.name == "first")
+            .unwrap();
+        assert_eq!(first.line_end, 4, "{first:?}");
+        let calls = first.calls.clone().unwrap_or_default();
+        assert!(calls.iter().any(|c| c == "one"), "{calls:?}");
+        assert!(!calls.iter().any(|c| c == "two"), "{calls:?}");
     }
 
     #[test]
