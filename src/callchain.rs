@@ -696,6 +696,49 @@ pub async fn show_registrations(db: &DatabaseManager, name: &str, git_sha: &str)
     show_registrations_to_writer(db, name, &mut stdout(), git_sha).await
 }
 
+/// The callees of each definition of a name, kept apart.
+///
+/// The workdir overlay is not consulted here: it answers for one file, and this
+/// reports every file that defines the name.
+fn write_callees_per_definition(
+    name: &str,
+    total: usize,
+    answering: &[crate::types::CalleeDefinition],
+    writer: &mut dyn Write,
+) -> Result<()> {
+    writeln!(
+        writer,
+        "\n{} defines '{}' {} times, {} of them definitions. Which one a call\n\
+         reaches depends on the file it is written in and on the configuration\n\
+         it is built with, so each is reported separately:",
+        "This revision".bold(),
+        name.cyan(),
+        total,
+        answering.len()
+    )?;
+    for definition in answering {
+        writeln!(
+            writer,
+            "\n  {}:{}",
+            definition.file_path.bright_black(),
+            definition.line_start
+        )?;
+        if definition.callees.is_empty() {
+            writeln!(writer, "    calls nothing")?;
+            continue;
+        }
+        for (i, callee) in definition.callees.iter().enumerate() {
+            writeln!(
+                writer,
+                "    {}. {}",
+                (i + 1).to_string().yellow(),
+                callee.cyan()
+            )?;
+        }
+    }
+    Ok(())
+}
+
 pub async fn show_callees_to_writer(
     db: &DatabaseManager,
     name: &str,
@@ -711,8 +754,40 @@ pub async fn show_callees_to_writer(
 
     match func_opt {
         Some(func) => {
-            // Always use git-aware callees query
-            let callees = db.get_function_callees_git_aware(name, git_sha).await?;
+            // Every definition, not the one a heuristic prefers: a name with
+            // more than one definition has more than one answer, and picking
+            // silently reports a caller nobody asked about.
+            let definitions = db
+                .get_function_callees_by_definition_git_aware(name, git_sha)
+                .await?;
+            // A prototype answers nothing about what a name calls, and nearly
+            // every exported function has one. A definition that calls nothing
+            // is a different matter: it is a second answer, and reporting only
+            // the other one hides that the tree disagrees with itself.
+            let answering: Vec<crate::types::CalleeDefinition> = definitions
+                .iter()
+                .filter(|definition| definition.is_definition)
+                .cloned()
+                .collect();
+            if answering.len() > 1 {
+                write_callees_per_definition(name, definitions.len(), &answering, writer)?;
+                return Ok(());
+            }
+            if definitions.len() > answering.len() {
+                writeln!(
+                    writer,
+                    "{} {} of the {} rows for '{}' declare it without defining it.",
+                    "Note:".yellow(),
+                    definitions.len() - answering.len(),
+                    definitions.len(),
+                    name
+                )?;
+            }
+            let callees = answering
+                .into_iter()
+                .next()
+                .map(|definition| definition.callees)
+                .unwrap_or_default();
             if callees.is_empty() {
                 let info_msg = format!(
                     "{} Function '{}' doesn't call any other functions",

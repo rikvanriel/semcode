@@ -2,6 +2,59 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// One definition of a name, with what that definition calls.
+///
+/// A name in C is not one thing. `pr_warn` has nine definitions in the Linux
+/// tree; a caller in `mm/` reaches the one in `include/linux/printk.h` and a
+/// caller under `tools/` reaches a different one. Answering with a single
+/// definition's callees means answering for a caller nobody asked about, so the
+/// definitions are kept apart and the file each came from is reported with it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalleeDefinition {
+    pub file_path: String,
+    pub line_start: u32,
+    pub line_end: u32,
+    pub callees: Vec<String>,
+    /// False where the row is a prototype. A prototype answers nothing about
+    /// what a name calls, and nearly every exported function has one, so
+    /// counting it as a second definition would call almost every name
+    /// ambiguous. A definition that calls nothing is not a prototype: it is a
+    /// second answer, and a different one.
+    pub is_definition: bool,
+}
+
+/// Whether stored text declares a function without defining it.
+///
+/// The row's own text is the only thing that separates the two: a prototype
+/// stores `extern ssize_t vfs_read(struct file *, ...);` and a definition
+/// stores its braces. Comments are removed first, since a brace inside one is
+/// prose, and a macro is a definition however it is written.
+pub fn text_is_prototype(body: &str) -> bool {
+    let mut code = String::with_capacity(body.len());
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        code.push(bytes[i] as char);
+        i += 1;
+    }
+    let code = code.trim();
+    !code.starts_with('#') && !code.contains('{') && code.ends_with(';')
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionInfo {
     pub name: String,
