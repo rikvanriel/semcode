@@ -1952,26 +1952,8 @@ impl TreeSitterAnalyzer {
         // The invocation and its block are siblings, and a conditional makes
         // them siblings of each other inside it rather than of the file.
         // `SYSCALL_DEFINE3(old_readdir, ...)` sits inside
-        // `#ifdef __ARCH_WANT_OLD_READDIR`, and looking only at the
-        // translation unit's own children skips every syscall written that
-        // way.
-        let mut groups = vec![root];
-        let mut sequences: Vec<Vec<tree_sitter::Node>> = Vec::new();
-        while let Some(parent) = groups.pop() {
-            let mut cursor = parent.walk();
-            let children: Vec<tree_sitter::Node> = parent.children(&mut cursor).collect();
-            for child in &children {
-                if matches!(
-                    child.kind(),
-                    "preproc_ifdef" | "preproc_if" | "preproc_else" | "preproc_elif"
-                ) {
-                    groups.push(*child);
-                }
-            }
-            sequences.push(children);
-        }
-
-        for children in &sequences {
+        // `#ifdef __ARCH_WANT_OLD_READDIR`.
+        for children in &Self::file_scope_sequences(root) {
             for (index, node) in children.iter().enumerate() {
                 if node.kind() != "expression_statement" {
                     continue;
@@ -2644,19 +2626,8 @@ impl TreeSitterAnalyzer {
     fn initcall(node: tree_sitter::Node, source: &str) -> Option<RawRegistration> {
         // File scope: an initcall inside a function is something else. A
         // conditional is still file scope — `subsys_initcall(cgwb_init)` sits
-        // inside `#ifdef CONFIG_CGROUP_WRITEBACK`, and requiring the parent to
-        // be the translation unit skipped every initcall written that way.
-        if node.kind() != "expression_statement" {
-            return None;
-        }
-        let mut parent = node.parent()?;
-        while matches!(
-            parent.kind(),
-            "preproc_ifdef" | "preproc_if" | "preproc_else" | "preproc_elif"
-        ) {
-            parent = parent.parent()?;
-        }
-        if parent.kind() != "translation_unit" {
+        // inside `#ifdef CONFIG_CGROUP_WRITEBACK`.
+        if node.kind() != "expression_statement" || !Self::at_file_scope(node) {
             return None;
         }
 
@@ -4257,6 +4228,55 @@ impl TreeSitterAnalyzer {
         })
     }
 
+    /// A preprocessor conditional does not nest what it holds: a definition
+    /// inside `#ifdef` belongs to the scope the `#ifdef` itself sits in.
+    ///
+    /// Every walk over a scope has to look through these nodes, and each one
+    /// that decided so for itself spelled the set differently. Two listed four
+    /// kinds by name and so dropped everything under `#elifdef` and
+    /// `#elifndef`; a third matched every `preproc_` node. Three copies cost
+    /// 345 initcalls, 16,223 `dev_dbg` call sites and 213 syscall bodies
+    /// before this was one definition.
+    fn is_conditional_group(kind: &str) -> bool {
+        kind.starts_with("preproc_if") || kind.starts_with("preproc_el")
+    }
+
+    /// Whether the node sits at file scope, reading through conditionals.
+    fn at_file_scope(node: tree_sitter::Node) -> bool {
+        let mut parent = node.parent();
+        while let Some(current) = parent {
+            if !Self::is_conditional_group(current.kind()) {
+                return current.kind() == "translation_unit";
+            }
+            parent = current.parent();
+        }
+        false
+    }
+
+    /// Every run of siblings at file scope: the translation unit's children,
+    /// and the children of each conditional it holds, recursively.
+    ///
+    /// A pair of siblings is what identifies a body a macro opens, and a
+    /// conditional makes the pair siblings of each other inside it rather than
+    /// of the file, so the runs have to be kept apart rather than flattened.
+    fn file_scope_sequences<'tree>(
+        root: tree_sitter::Node<'tree>,
+    ) -> Vec<Vec<tree_sitter::Node<'tree>>> {
+        let mut groups = vec![root];
+        let mut sequences: Vec<Vec<tree_sitter::Node>> = Vec::new();
+        while let Some(parent) = groups.pop() {
+            let mut cursor = parent.walk();
+            let children: Vec<tree_sitter::Node> = parent.children(&mut cursor).collect();
+            for child in &children {
+                if Self::is_conditional_group(child.kind()) {
+                    groups.push(*child);
+                }
+            }
+            sequences.push(children);
+        }
+        sequences
+    }
+
     /// The field declarations of a struct or union body, including the ones a
     /// preprocessor conditional holds.
     ///
@@ -4284,7 +4304,7 @@ impl TreeSitterAnalyzer {
             for child in node.children(&mut cursor) {
                 match child.kind() {
                     "field_declaration" => declarations.push(child),
-                    kind if kind.starts_with("preproc_") => stack.push(child),
+                    kind if Self::is_conditional_group(kind) => stack.push(child),
                     _ => {}
                 }
             }
@@ -7759,6 +7779,74 @@ mod macro_defined_tests {
                 .as_ref()
                 .is_some_and(|c| c.iter().any(|n| n == "iterate_dir")),
             "{syscall:?}"
+        );
+    }
+
+    #[test]
+    fn a_body_under_elifdef_becomes_a_function() {
+        // `#elifdef` is a conditional like any other, and a walk that lists
+        // conditional kinds by name rather than asking one question drops
+        // whatever the list omits.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "#ifdef CONFIG_A\n\
+                 SYSCALL_DEFINE1(alpha, int, x)\n\
+                 {\n\
+                 \treturn one(x);\n\
+                 }\n\
+                 #elifdef CONFIG_B\n\
+                 SYSCALL_DEFINE1(beta, int, x)\n\
+                 {\n\
+                 \treturn two(x);\n\
+                 }\n\
+                 #endif\n",
+                std::path::Path::new("alpha.c"),
+                "hash",
+                None,
+            )
+            .unwrap();
+
+        let names: Vec<&String> = analysis.functions.iter().map(|f| &f.name).collect();
+        assert!(names.iter().any(|n| *n == "sys_alpha"), "{names:?}");
+        assert!(names.iter().any(|n| *n == "sys_beta"), "{names:?}");
+        let beta = analysis
+            .functions
+            .iter()
+            .find(|f| f.name == "sys_beta")
+            .unwrap();
+        assert!(
+            beta.calls
+                .as_ref()
+                .is_some_and(|c| c.iter().any(|n| n == "two")),
+            "{beta:?}"
+        );
+    }
+
+    #[test]
+    fn an_initcall_under_elifdef_is_recorded() {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "#ifdef CONFIG_A\n\
+                 static int early_init(void) { return 0; }\n\
+                 subsys_initcall(early_init);\n\
+                 #elifdef CONFIG_B\n\
+                 static int late_init(void) { return 0; }\n\
+                 subsys_initcall(late_init);\n\
+                 #endif\n",
+                std::path::Path::new("init.c"),
+                "hash",
+                None,
+            )
+            .unwrap();
+        assert!(
+            analysis
+                .registrations
+                .iter()
+                .any(|r| r.target == "late_init" && r.container_type == "subsys_initcall"),
+            "{:?}",
+            analysis.registrations
         );
     }
 
