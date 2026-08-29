@@ -155,6 +155,16 @@ struct ExtractedFunctions {
     argument_functions: Vec<ArgumentFunction>,
 }
 
+/// A function whose definition a macro opens.
+#[derive(Debug, Clone)]
+struct MacroDefinedFunction {
+    name: String,
+    start_byte: usize,
+    end_byte: usize,
+    line_start: u32,
+    line_end: u32,
+}
+
 /// A file-scope variable, before its file is known.
 #[derive(Debug, Clone)]
 struct RawGlobal {
@@ -1906,6 +1916,163 @@ impl TreeSitterAnalyzer {
         fates
     }
 
+    /// Macros that define a function, and how the function is named.
+    ///
+    /// `SYSCALL_DEFINE3(old_readdir, ...)` defines `sys_old_readdir`, whose
+    /// body follows the invocation. The prefix is convention held in the
+    /// macro, not in the call, so the families are listed; the shape they
+    /// share — an invocation followed by a block — is what the extractor
+    /// recognises.
+    fn body_defining_macro(name: &str) -> Option<&'static str> {
+        if let Some(rest) = name.strip_prefix("COMPAT_SYSCALL_DEFINE") {
+            return rest.parse::<u8>().is_ok().then_some("compat_sys_");
+        }
+        if let Some(rest) = name.strip_prefix("SYSCALL_DEFINE") {
+            return rest.parse::<u8>().is_ok().then_some("sys_");
+        }
+        None
+    }
+
+    /// Functions a macro defines, whose body follows the invocation.
+    ///
+    /// ```text
+    /// SYSCALL_DEFINE3(old_readdir, unsigned int, fd, ...)
+    /// {
+    ///         ...
+    /// }
+    /// ```
+    ///
+    /// The parser reads the invocation as an expression statement and the
+    /// block as an unrelated compound statement, so neither the name nor the
+    /// body reaches the functions table and every call the body makes is
+    /// lost with it.
+    fn macro_defined_functions(root: tree_sitter::Node, source: &str) -> Vec<MacroDefinedFunction> {
+        let mut found = Vec::new();
+
+        // The invocation and its block are siblings, and a conditional makes
+        // them siblings of each other inside it rather than of the file.
+        // `SYSCALL_DEFINE3(old_readdir, ...)` sits inside
+        // `#ifdef __ARCH_WANT_OLD_READDIR`, and looking only at the
+        // translation unit's own children skips every syscall written that
+        // way.
+        let mut groups = vec![root];
+        let mut sequences: Vec<Vec<tree_sitter::Node>> = Vec::new();
+        while let Some(parent) = groups.pop() {
+            let mut cursor = parent.walk();
+            let children: Vec<tree_sitter::Node> = parent.children(&mut cursor).collect();
+            for child in &children {
+                if matches!(
+                    child.kind(),
+                    "preproc_ifdef" | "preproc_if" | "preproc_else" | "preproc_elif"
+                ) {
+                    groups.push(*child);
+                }
+            }
+            sequences.push(children);
+        }
+
+        for children in &sequences {
+            for (index, node) in children.iter().enumerate() {
+                if node.kind() != "expression_statement" {
+                    continue;
+                }
+                let Some(call) = node
+                    .named_child(0)
+                    .filter(|c| c.kind() == "call_expression")
+                else {
+                    continue;
+                };
+                let Some(callee) = call.child_by_field_name("function") else {
+                    continue;
+                };
+                if callee.kind() != "identifier" {
+                    continue;
+                }
+                let Some(prefix) = Self::body_defining_macro(&source[callee.byte_range()]) else {
+                    continue;
+                };
+                // The block has to be next, and has to be a body rather than an
+                // initializer: a macro that opens a struct is the same shape.
+                let Some(body) = children
+                    .get(index + 1)
+                    .filter(|next| next.kind() == "compound_statement")
+                else {
+                    continue;
+                };
+                let Some(arguments) = call.child_by_field_name("arguments") else {
+                    continue;
+                };
+                let mut argument_cursor = arguments.walk();
+                let Some(first) = arguments
+                    .named_children(&mut argument_cursor)
+                    .find(|argument| argument.kind() == "identifier")
+                else {
+                    continue;
+                };
+
+                found.push(MacroDefinedFunction {
+                    name: format!("{prefix}{}", &source[first.byte_range()]),
+                    start_byte: node.start_byte(),
+                    end_byte: body.end_byte(),
+                    line_start: node.start_position().row as u32 + 1,
+                    line_end: body.end_position().row as u32 + 1,
+                });
+            }
+        }
+
+        found
+    }
+
+    /// The functions called between two byte offsets, with calls through a
+    /// declared function pointer diverted to dispatch sites.
+    ///
+    /// Taken from the file's pre-computed call list rather than walking the
+    /// body again, so a body found by any means can be attributed the same
+    /// way.
+    fn calls_in_range(
+        ctx: &ExtractionContext,
+        extraction: &CallExtraction,
+        start: usize,
+        end: usize,
+        pointer_call_sites: &mut Vec<RawDispatchSite>,
+    ) -> Vec<String> {
+        let pointers: HashMap<&str, &PointerVar> = extraction
+            .pointer_vars
+            .iter()
+            .filter(|var| var.byte_start >= start && var.byte_start < end)
+            .map(|var| (var.name.as_str(), var))
+            .collect();
+
+        let mut calls: Vec<String> = Vec::new();
+        for (call_name, call_start, call_end) in &extraction.calls {
+            if *call_start < start || *call_end > end {
+                continue;
+            }
+            match pointers.get(call_name.as_str()) {
+                Some(var) => pointer_call_sites.push(RawDispatchSite {
+                    member: String::new(),
+                    receiver_expr: Some(var.name.clone()),
+                    receiver_type: None,
+                    receiver_base_type: None,
+                    receiver_field: None,
+                    kind: if var.is_parameter {
+                        DispatchKind::PointerParam
+                    } else {
+                        DispatchKind::PointerLocal
+                    },
+                    byte_start: *call_start,
+                    line: ctx.source[..*call_start].lines().count() as u32,
+                    target: var.target.clone(),
+                }),
+                None => calls.push(call_name.clone()),
+            }
+        }
+
+        calls.sort();
+        calls.dedup();
+        calls
+    }
+
     /// Names that a scope binds to a value rather than to a function.
     ///
     /// `min_t(u32, len, size)` names no function even where the tree defines
@@ -3155,46 +3322,13 @@ impl TreeSitterAnalyzer {
                     // Extract calls within this function from pre-computed list (O(m) instead of O(n))
                     // Function pointers declared by this function: a call
                     // naming one of them dispatches through a value.
-                    let pointers: std::collections::HashMap<&str, &PointerVar> = extraction
-                        .pointer_vars
-                        .iter()
-                        .filter(|var| {
-                            var.byte_start >= function_start_byte
-                                && var.byte_start < function_end_byte
-                        })
-                        .map(|var| (var.name.as_str(), var))
-                        .collect();
-
-                    let mut function_calls: Vec<String> = Vec::new();
-                    for (call_name, call_start, call_end) in &extraction.calls {
-                        if *call_start < function_start_byte || *call_end > function_end_byte {
-                            continue;
-                        }
-
-                        match pointers.get(call_name.as_str()) {
-                            Some(var) => pointer_call_sites.push(RawDispatchSite {
-                                member: String::new(),
-                                receiver_expr: Some(var.name.clone()),
-                                receiver_type: None,
-                                receiver_base_type: None,
-                                receiver_field: None,
-                                kind: if var.is_parameter {
-                                    DispatchKind::PointerParam
-                                } else {
-                                    DispatchKind::PointerLocal
-                                },
-                                byte_start: *call_start,
-                                line: ctx.source[..*call_start].lines().count() as u32,
-                                target: var.target.clone(),
-                            }),
-                            None => function_calls.push(call_name.clone()),
-                        }
-                    }
-
-                    // Remove duplicates and sort
-                    let mut unique_calls = function_calls;
-                    unique_calls.sort();
-                    unique_calls.dedup();
+                    let unique_calls = Self::calls_in_range(
+                        ctx,
+                        extraction,
+                        function_start_byte,
+                        function_end_byte,
+                        &mut pointer_call_sites,
+                    );
 
                     // Extract types used by this function (parameters and return type)
                     let default_void = "void".to_string();
@@ -3325,6 +3459,67 @@ impl TreeSitterAnalyzer {
                 &self.make_relative_path(ctx.file_path, ctx.source_root),
                 ctx.git_hash,
             ));
+        }
+
+        // A macro can open a function the query cannot match, and the body
+        // that follows carries every call the function makes.
+        if matches!(ctx.language, Language::C) {
+            for defined in Self::macro_defined_functions(ctx.tree.root_node(), ctx.source) {
+                if functions
+                    .iter()
+                    .any(|f: &FunctionInfo| f.name == defined.name)
+                {
+                    continue;
+                }
+                let calls = Self::calls_in_range(
+                    ctx,
+                    extraction,
+                    defined.start_byte,
+                    defined.end_byte,
+                    &mut pointer_call_sites,
+                );
+
+                for raw in extraction.registrations.iter().filter(|reg| {
+                    reg.byte_start >= defined.start_byte && reg.byte_start < defined.end_byte
+                }) {
+                    if !covered_registrations.insert(raw.byte_start) {
+                        continue;
+                    }
+                    registrations.push(raw.attribute(
+                        &defined.name,
+                        &self.make_relative_path(ctx.file_path, ctx.source_root),
+                        ctx.git_hash,
+                    ));
+                }
+
+                for raw in extraction.member_sites.iter().filter(|site| {
+                    site.byte_start >= defined.start_byte && site.byte_start < defined.end_byte
+                }) {
+                    if !covered_sites.insert(raw.byte_start) {
+                        continue;
+                    }
+                    dispatch_sites.push(raw.attribute(
+                        &defined.name,
+                        &self.make_relative_path(ctx.file_path, ctx.source_root),
+                        ctx.git_hash,
+                    ));
+                }
+
+                functions.push(FunctionInfo {
+                    name: defined.name,
+                    file_path: self.make_relative_path(ctx.file_path, ctx.source_root),
+                    git_file_hash: ctx.git_hash.to_string(),
+                    line_start: defined.line_start,
+                    line_end: defined.line_end,
+                    // What the macro expands to is not in this file, and a
+                    // guessed return type would be read as a fact.
+                    return_type: String::new(),
+                    parameters: Vec::new(),
+                    body: ctx.source[defined.start_byte..defined.end_byte].to_string(),
+                    calls: (!calls.is_empty()).then_some(calls),
+                    types: None,
+                });
+            }
         }
 
         Ok(ExtractedFunctions {
@@ -7515,6 +7710,84 @@ mod held_table_tests {
             site.receiver_type.as_deref(),
             Some("ngene_info.demod_attach"),
             "{site:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod macro_defined_tests {
+    use super::*;
+
+    #[test]
+    fn a_syscall_body_becomes_a_function() {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "SYSCALL_DEFINE3(old_readdir, unsigned int, fd,\n\
+                 \t\tstruct old_linux_dirent __user *, dirent, unsigned int, count)\n\
+                 {\n\
+                 \tint error;\n\
+                 \terror = iterate_dir(f, &buf.ctx);\n\
+                 \treturn error;\n\
+                 }\n",
+                std::path::Path::new("readdir.c"),
+                "hash",
+                None,
+            )
+            .unwrap();
+
+        let syscall = analysis
+            .functions
+            .iter()
+            .find(|f| f.name == "sys_old_readdir")
+            .unwrap_or_else(|| {
+                panic!(
+                    "{:?}",
+                    analysis
+                        .functions
+                        .iter()
+                        .map(|f| &f.name)
+                        .collect::<Vec<_>>()
+                )
+            });
+
+        // The body's calls are what make everything below the syscall
+        // reachable from it, in both directions.
+        assert!(
+            syscall
+                .calls
+                .as_ref()
+                .is_some_and(|c| c.iter().any(|n| n == "iterate_dir")),
+            "{syscall:?}"
+        );
+    }
+
+    #[test]
+    fn a_macro_opening_an_initializer_is_not_a_function() {
+        // `define_machine(pseries) { .memory_block_size = ... }` is the same
+        // shape with a struct in the braces.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "define_machine(pseries) {\n\
+                 \t.name = \"pSeries\",\n\
+                 };\n",
+                std::path::Path::new("setup.c"),
+                "hash",
+                None,
+            )
+            .unwrap();
+        assert!(
+            !analysis
+                .functions
+                .iter()
+                .any(|f| f.name.starts_with("sys_")),
+            "{:?}",
+            analysis
+                .functions
+                .iter()
+                .map(|f| &f.name)
+                .collect::<Vec<_>>()
         );
     }
 }
