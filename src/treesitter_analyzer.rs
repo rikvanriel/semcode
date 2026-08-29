@@ -1906,6 +1906,56 @@ impl TreeSitterAnalyzer {
         fates
     }
 
+    /// The functions called between two byte offsets, with calls through a
+    /// declared function pointer diverted to dispatch sites.
+    ///
+    /// Taken from the file's pre-computed call list rather than walking the
+    /// body again, so a body found by any means can be attributed the same
+    /// way.
+    fn calls_in_range(
+        ctx: &ExtractionContext,
+        extraction: &CallExtraction,
+        start: usize,
+        end: usize,
+        pointer_call_sites: &mut Vec<RawDispatchSite>,
+    ) -> Vec<String> {
+        let pointers: HashMap<&str, &PointerVar> = extraction
+            .pointer_vars
+            .iter()
+            .filter(|var| var.byte_start >= start && var.byte_start < end)
+            .map(|var| (var.name.as_str(), var))
+            .collect();
+
+        let mut calls: Vec<String> = Vec::new();
+        for (call_name, call_start, call_end) in &extraction.calls {
+            if *call_start < start || *call_end > end {
+                continue;
+            }
+            match pointers.get(call_name.as_str()) {
+                Some(var) => pointer_call_sites.push(RawDispatchSite {
+                    member: String::new(),
+                    receiver_expr: Some(var.name.clone()),
+                    receiver_type: None,
+                    receiver_base_type: None,
+                    receiver_field: None,
+                    kind: if var.is_parameter {
+                        DispatchKind::PointerParam
+                    } else {
+                        DispatchKind::PointerLocal
+                    },
+                    byte_start: *call_start,
+                    line: ctx.source[..*call_start].lines().count() as u32,
+                    target: var.target.clone(),
+                }),
+                None => calls.push(call_name.clone()),
+            }
+        }
+
+        calls.sort();
+        calls.dedup();
+        calls
+    }
+
     /// Names that a scope binds to a value rather than to a function.
     ///
     /// `min_t(u32, len, size)` names no function even where the tree defines
@@ -3155,46 +3205,13 @@ impl TreeSitterAnalyzer {
                     // Extract calls within this function from pre-computed list (O(m) instead of O(n))
                     // Function pointers declared by this function: a call
                     // naming one of them dispatches through a value.
-                    let pointers: std::collections::HashMap<&str, &PointerVar> = extraction
-                        .pointer_vars
-                        .iter()
-                        .filter(|var| {
-                            var.byte_start >= function_start_byte
-                                && var.byte_start < function_end_byte
-                        })
-                        .map(|var| (var.name.as_str(), var))
-                        .collect();
-
-                    let mut function_calls: Vec<String> = Vec::new();
-                    for (call_name, call_start, call_end) in &extraction.calls {
-                        if *call_start < function_start_byte || *call_end > function_end_byte {
-                            continue;
-                        }
-
-                        match pointers.get(call_name.as_str()) {
-                            Some(var) => pointer_call_sites.push(RawDispatchSite {
-                                member: String::new(),
-                                receiver_expr: Some(var.name.clone()),
-                                receiver_type: None,
-                                receiver_base_type: None,
-                                receiver_field: None,
-                                kind: if var.is_parameter {
-                                    DispatchKind::PointerParam
-                                } else {
-                                    DispatchKind::PointerLocal
-                                },
-                                byte_start: *call_start,
-                                line: ctx.source[..*call_start].lines().count() as u32,
-                                target: var.target.clone(),
-                            }),
-                            None => function_calls.push(call_name.clone()),
-                        }
-                    }
-
-                    // Remove duplicates and sort
-                    let mut unique_calls = function_calls;
-                    unique_calls.sort();
-                    unique_calls.dedup();
+                    let unique_calls = Self::calls_in_range(
+                        ctx,
+                        extraction,
+                        function_start_byte,
+                        function_end_byte,
+                        &mut pointer_call_sites,
+                    );
 
                     // Extract types used by this function (parameters and return type)
                     let default_void = "void".to_string();
