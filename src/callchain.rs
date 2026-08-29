@@ -313,11 +313,68 @@ pub async fn show_callers_to_writer(
                 }
             }
 
+            // A name handed to another call is reached through that call, not
+            // by anyone naming it. `printk(fmt, ...)` hands `_printk` to
+            // `printk_index_wrap`, so nothing in the tree calls `_printk` by
+            // name and 5,729 functions reach it. Saying "no functions call it"
+            // and stopping there ends a search that should continue at the
+            // macro named here.
+            let handed = db
+                .find_argument_functions_of_git_aware(name, git_sha)
+                .await?;
+            if !handed.is_empty() {
+                let mut sites: Vec<String> = handed
+                    .iter()
+                    .map(|argument| {
+                        let inside = if argument.enclosing_function.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" in {}", argument.enclosing_function)
+                        };
+                        format!(
+                            "{}() argument {} at {}:{}{}",
+                            argument.callee,
+                            argument.argument_index,
+                            argument.file_path,
+                            argument.line,
+                            inside
+                        )
+                    })
+                    .collect();
+                sites.sort();
+                sites.dedup();
+                writeln!(
+                    writer,
+                    "{} it is handed to {} as an argument, so a caller of that reaches it:",
+                    "Handed over:".bold().green(),
+                    if sites.len() == 1 {
+                        "another call".to_string()
+                    } else {
+                        format!("{} calls", sites.len())
+                    }
+                )?;
+                for site in sites.iter().take(10) {
+                    writeln!(writer, "  {}", site.bright_black())?;
+                }
+                if sites.len() > 10 {
+                    writeln!(writer, "  ... and {} more", sites.len() - 10)?;
+                }
+            }
+
             if callers.is_empty() && indirect.is_empty() {
-                if boot_levels.is_empty() {
+                if !boot_levels.is_empty() {
+                } else if !handed.is_empty() {
+                    writeln!(
+                        writer,
+                        "{} nothing calls '{}' by name; follow the handover above",
+                        "Info:".yellow(),
+                        name
+                    )?;
+                } else {
                     let info_msg = format!("{} No functions call '{}'", "Info:".yellow(), name);
                     writeln!(writer, "{info_msg}")?;
-                } else {
+                }
+                if !boot_levels.is_empty() {
                     writeln!(
                         writer,
                         "{} nothing in the source calls it",

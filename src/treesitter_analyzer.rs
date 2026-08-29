@@ -95,6 +95,7 @@ struct MacroBodyFacts {
     types: Vec<String>,
     sites: Vec<RawDispatchSite>,
     registrations: Vec<RawRegistration>,
+    argument_functions: Vec<RawArgumentFunction>,
 }
 
 /// A designated initializer before it is attributed to a function.
@@ -952,14 +953,15 @@ impl TreeSitterAnalyzer {
 
         // Extract macros; the sites in their bodies are dropped on this
         // path, which serves callers that want definitions only.
-        let (extracted_macros, _macro_sites, _macro_registrations) = self.extract_macros(
-            &tree,
-            &source_code,
-            file_path,
-            &git_hash,
-            source_root,
-            language,
-        )?;
+        let (extracted_macros, _macro_sites, _macro_registrations, _macro_arguments) = self
+            .extract_macros(
+                &tree,
+                &source_code,
+                file_path,
+                &git_hash,
+                source_root,
+                language,
+            )?;
         raw_macros.extend(extracted_macros);
 
         // Call relationships are now embedded in function/macro JSON columns during parsing
@@ -1087,7 +1089,7 @@ impl TreeSitterAnalyzer {
             functions,
             mut dispatch_sites,
             mut registrations,
-            argument_functions,
+            mut argument_functions,
         } = self.extract_functions_with_calls(&ctx, &extraction)?;
 
         // Extract types (single traversal as before)
@@ -1101,16 +1103,18 @@ impl TreeSitterAnalyzer {
         )?;
 
         // Extract macros with embedded data (single traversal)
-        let (macros, macro_sites, macro_registrations) = self.extract_macros_with_embedded_data(
-            tree,
-            source_code,
-            file_path,
-            git_hash,
-            source_root,
-            language,
-        )?;
+        let (macros, macro_sites, macro_registrations, macro_arguments) = self
+            .extract_macros_with_embedded_data(
+                tree,
+                source_code,
+                file_path,
+                git_hash,
+                source_root,
+                language,
+            )?;
         dispatch_sites.extend(macro_sites);
         registrations.extend(macro_registrations);
+        argument_functions.extend(macro_arguments);
 
         // Only C states a variable's aggregate this way; other languages get
         // their receivers typed by their own pass.
@@ -3532,7 +3536,12 @@ impl TreeSitterAnalyzer {
         git_hash: &str,
         source_root: Option<&Path>,
         language: Language,
-    ) -> Result<(Vec<FunctionInfo>, Vec<DispatchSite>, Vec<Registration>)> {
+    ) -> Result<(
+        Vec<FunctionInfo>,
+        Vec<DispatchSite>,
+        Vec<Registration>,
+        Vec<ArgumentFunction>,
+    )> {
         // This is the same as extract_macros but named differently for clarity
         // Macros are not as performance-critical as functions since they're fewer in number
         self.extract_macros(tree, source, file_path, git_hash, source_root, language)
@@ -3906,12 +3915,18 @@ impl TreeSitterAnalyzer {
         git_hash: &str,
         source_root: Option<&Path>,
         language: Language,
-    ) -> Result<(Vec<FunctionInfo>, Vec<DispatchSite>, Vec<Registration>)> {
+    ) -> Result<(
+        Vec<FunctionInfo>,
+        Vec<DispatchSite>,
+        Vec<Registration>,
+        Vec<ArgumentFunction>,
+    )> {
         // Macro bodies are re-parsed as C; one parser serves the whole file.
         let mut body_parser = tree_sitter::Parser::new();
         body_parser.set_language(&tree_sitter_c::LANGUAGE.into())?;
         let mut dispatch_sites: Vec<DispatchSite> = Vec::new();
         let mut registrations: Vec<Registration> = Vec::new();
+        let mut argument_functions: Vec<ArgumentFunction> = Vec::new();
         let queries = self.get_queries(language);
         let mut cursor = QueryCursor::new();
         // matches(), not captures(): a match arrives once with every capture
@@ -3977,10 +3992,17 @@ impl TreeSitterAnalyzer {
                         // that nowhere.
                         if let Some(names) = parameters.as_ref() {
                             facts.registrations.retain(|r| !names.contains(&r.target));
+                            facts
+                                .argument_functions
+                                .retain(|a| !names.contains(&a.target));
                         }
                         for registration in &mut facts.registrations {
                             registration.byte_start += body_start;
                             registration.line = body_line + registration.line.saturating_sub(1);
+                        }
+                        for argument in &mut facts.argument_functions {
+                            argument.byte_start += body_start;
+                            argument.line = body_line + argument.line.saturating_sub(1);
                         }
 
                         facts
@@ -3999,6 +4021,12 @@ impl TreeSitterAnalyzer {
                 registrations.extend(
                     facts
                         .registrations
+                        .iter()
+                        .map(|raw| raw.attribute(&name, &relative_path, git_hash)),
+                );
+                argument_functions.extend(
+                    facts
+                        .argument_functions
                         .iter()
                         .map(|raw| raw.attribute(&name, &relative_path, git_hash)),
                 );
@@ -4035,7 +4063,7 @@ impl TreeSitterAnalyzer {
             }
         }
 
-        Ok((macros, dispatch_sites, registrations))
+        Ok((macros, dispatch_sites, registrations, argument_functions))
     }
 
     /// Whether an object-like macro body is, or leads to, a compiler attribute.
@@ -5306,11 +5334,28 @@ impl TreeSitterAnalyzer {
             registration.byte_start -= prefix_len;
         }
 
+        // A macro body hands a function over as well as calling one:
+        //
+        //     #define printk(fmt, ...) printk_index_wrap(_printk, fmt, ...)
+        //
+        // Reading the handover only outside macros is why `callers _printk`
+        // named four functions in a tree where 5,729 call it.
+        let mut argument_functions = Self::collect_argument_functions(tree.root_node(), &wrapped);
+        argument_functions.retain(|argument| {
+            !argument.callee.starts_with("__semcode_")
+                && !argument.target.starts_with("__semcode_")
+                && argument.byte_start >= prefix_len
+        });
+        for argument in &mut argument_functions {
+            argument.byte_start -= prefix_len;
+        }
+
         MacroBodyFacts {
             calls,
             types,
             sites,
             registrations,
+            argument_functions,
         }
     }
 
@@ -7873,6 +7918,55 @@ mod macro_defined_tests {
                 .as_ref()
                 .is_some_and(|c| c.iter().any(|n| n == "iterate_dir")),
             "{syscall:?}"
+        );
+    }
+
+    #[test]
+    fn a_macro_body_records_the_function_it_hands_over() {
+        // `printk(fmt, ...)` hands `_printk` to `printk_index_wrap`, which
+        // calls it. Reading handovers only outside macro bodies is why
+        // `callers _printk` named four functions in a tree where 5,729 call it.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "#define printk_index_wrap(_p_func, fmt, ...) _p_func(fmt, ##__VA_ARGS__)\n\
+                 #define printk(fmt, ...) printk_index_wrap(_printk, fmt, ##__VA_ARGS__)\n",
+                std::path::Path::new("printk.h"),
+                "hash",
+                None,
+            )
+            .unwrap();
+
+        let handover = analysis
+            .argument_functions
+            .iter()
+            .find(|a| a.target == "_printk")
+            .unwrap_or_else(|| panic!("{:?}", analysis.argument_functions));
+        assert_eq!(handover.callee, "printk_index_wrap", "{handover:?}");
+        assert_eq!(handover.enclosing_function, "printk", "{handover:?}");
+        assert_eq!(handover.line, 2, "{handover:?}");
+    }
+
+    #[test]
+    fn a_macro_parameter_is_not_a_handover() {
+        // `_p_func` is the macro's own parameter: whatever a caller passes is
+        // named nowhere in this file.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "#define call_it(_p_func, fmt) helper(_p_func, fmt)\n",
+                std::path::Path::new("wrap.h"),
+                "hash",
+                None,
+            )
+            .unwrap();
+        assert!(
+            !analysis
+                .argument_functions
+                .iter()
+                .any(|a| a.target == "_p_func"),
+            "{:?}",
+            analysis.argument_functions
         );
     }
 
