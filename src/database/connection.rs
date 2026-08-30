@@ -156,6 +156,7 @@ pub struct DatabaseManager {
     dispatch_site_store: crate::database::dispatch_sites::DispatchSiteStore,
     registration_store: crate::database::registrations::RegistrationStore,
     argument_function_store: crate::database::argument_functions::ArgumentFunctionStore,
+    unresolved_edge_store: crate::database::unresolved_edges::UnresolvedEdgeStore,
     global_store: crate::database::globals::GlobalStore,
     object_macro_store: crate::database::object_macros::ObjectMacroStore,
     symbol_filename_store: SymbolFilenameStore,
@@ -218,6 +219,9 @@ impl DatabaseManager {
             ),
             argument_function_store:
                 crate::database::argument_functions::ArgumentFunctionStore::new(connection.clone()),
+            unresolved_edge_store: crate::database::unresolved_edges::UnresolvedEdgeStore::new(
+                connection.clone(),
+            ),
             global_store: crate::database::globals::GlobalStore::new(connection.clone()),
             symbol_filename_store: SymbolFilenameStore::new(connection.clone()),
             object_macro_store: crate::database::object_macros::ObjectMacroStore::new(
@@ -1008,6 +1012,34 @@ impl DatabaseManager {
         arguments: Vec<crate::types::ArgumentFunction>,
     ) -> Result<()> {
         self.argument_function_store.insert_batch(arguments).await
+    }
+
+    pub async fn insert_unresolved_edges(
+        &self,
+        edges: Vec<crate::types::UnresolvedEdge>,
+    ) -> Result<()> {
+        self.unresolved_edge_store.insert_batch(edges).await
+    }
+
+    /// What the index cannot say about this name, and where to look instead.
+    pub async fn find_unresolved_edges_git_aware(
+        &self,
+        name: &str,
+        git_sha: &str,
+    ) -> Result<Vec<crate::types::UnresolvedEdge>> {
+        let edges = self.unresolved_edge_store.find_by_name(name).await?;
+        let manifest = self.git_manifest_cached(git_sha).await?;
+        if manifest.is_empty() {
+            return Ok(edges);
+        }
+        Ok(edges
+            .into_iter()
+            .filter(|edge| {
+                manifest
+                    .hash_of(&edge.file_path)
+                    .is_some_and(|hash| hash == edge.git_file_hash)
+            })
+            .collect())
     }
 
     /// Every call handed this name.

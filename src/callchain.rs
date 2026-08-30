@@ -753,6 +753,15 @@ pub async fn show_registrations(db: &DatabaseManager, name: &str, git_sha: &str)
     show_registrations_to_writer(db, name, &mut stdout(), git_sha).await
 }
 
+/// Where to look, as one line: role and place, in the order stored.
+fn describe_locations(locations: &[crate::types::EdgeLocation]) -> String {
+    locations
+        .iter()
+        .map(|location| format!("{} {}:{}", location.role, location.file_path, location.line))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The callees of each definition of a name, kept apart.
 ///
 /// The workdir overlay is not consulted here: it answers for one file, and this
@@ -811,6 +820,21 @@ pub async fn show_callees_to_writer(
 
     match func_opt {
         Some(func) => {
+            // An edge the index cannot record is still an edge. Printing the
+            // callees it does have and stopping there says the rest is not
+            // there; naming the mechanism and where to look says it is
+            // somewhere else.
+            let unresolved = db.find_unresolved_edges_git_aware(name, git_sha).await?;
+            for edge in unresolved.iter().filter(|e| e.direction == "out") {
+                writeln!(
+                    writer,
+                    "{} a call here goes to {}, which this file does not name: {}",
+                    "Unresolved:".bold().green(),
+                    edge.evidence.cyan(),
+                    describe_locations(&edge.locations).bright_black()
+                )?;
+            }
+
             // Every definition, not the one a heuristic prefers: a name with
             // more than one definition has more than one answer, and picking
             // silently reports a caller nobody asked about.

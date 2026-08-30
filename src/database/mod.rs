@@ -12,6 +12,7 @@ pub mod processed_files;
 pub mod registrations;
 pub mod resolution;
 pub(crate) mod schema;
+pub mod unresolved_edges;
 pub use schema::SCHEMA_VERSION;
 pub mod search;
 mod symbol_filename;

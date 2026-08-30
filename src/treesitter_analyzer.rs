@@ -58,6 +58,16 @@ struct LanguageQueries {
     call_query: Query,
 }
 
+/// What macro extraction yields: the macros themselves and the facts their
+/// bodies hold, which belong to the same tables as any other code's.
+type ExtractedMacros = (
+    Vec<FunctionInfo>,
+    Vec<DispatchSite>,
+    Vec<Registration>,
+    Vec<ArgumentFunction>,
+    Vec<crate::types::UnresolvedEdge>,
+);
+
 /// What one file yields.
 #[derive(Debug, Default)]
 pub struct FileAnalysis {
@@ -70,6 +80,8 @@ pub struct FileAnalysis {
     pub registrations: Vec<Registration>,
     /// Functions named as call arguments: what a callee was handed.
     pub argument_functions: Vec<ArgumentFunction>,
+    /// Edges that cannot be recorded, with where to look for the other side.
+    pub unresolved_edges: Vec<crate::types::UnresolvedEdge>,
     /// File-scope variables of aggregate type.
     pub globals: Vec<GlobalVariable>,
 }
@@ -953,8 +965,8 @@ impl TreeSitterAnalyzer {
 
         // Extract macros; the sites in their bodies are dropped on this
         // path, which serves callers that want definitions only.
-        let (extracted_macros, _macro_sites, _macro_registrations, _macro_arguments) = self
-            .extract_macros(
+        let (extracted_macros, _macro_sites, _macro_registrations, _macro_arguments, _macro_edges) =
+            self.extract_macros(
                 &tree,
                 &source_code,
                 file_path,
@@ -1016,6 +1028,7 @@ impl TreeSitterAnalyzer {
             dispatch_sites,
             registrations,
             argument_functions,
+            unresolved_edges,
             globals,
         } = self.extract_all_with_embedded_data(
             &tree,
@@ -1051,6 +1064,7 @@ impl TreeSitterAnalyzer {
             dispatch_sites,
             registrations,
             argument_functions,
+            unresolved_edges,
             globals,
         })
     }
@@ -1103,7 +1117,7 @@ impl TreeSitterAnalyzer {
         )?;
 
         // Extract macros with embedded data (single traversal)
-        let (macros, macro_sites, macro_registrations, macro_arguments) = self
+        let (macros, macro_sites, macro_registrations, macro_arguments, unresolved_edges) = self
             .extract_macros_with_embedded_data(
                 tree,
                 source_code,
@@ -1140,6 +1154,7 @@ impl TreeSitterAnalyzer {
             dispatch_sites,
             registrations,
             argument_functions,
+            unresolved_edges,
             globals,
         })
     }
@@ -3536,12 +3551,7 @@ impl TreeSitterAnalyzer {
         git_hash: &str,
         source_root: Option<&Path>,
         language: Language,
-    ) -> Result<(
-        Vec<FunctionInfo>,
-        Vec<DispatchSite>,
-        Vec<Registration>,
-        Vec<ArgumentFunction>,
-    )> {
+    ) -> Result<ExtractedMacros> {
         // This is the same as extract_macros but named differently for clarity
         // Macros are not as performance-critical as functions since they're fewer in number
         self.extract_macros(tree, source, file_path, git_hash, source_root, language)
@@ -3915,18 +3925,14 @@ impl TreeSitterAnalyzer {
         git_hash: &str,
         source_root: Option<&Path>,
         language: Language,
-    ) -> Result<(
-        Vec<FunctionInfo>,
-        Vec<DispatchSite>,
-        Vec<Registration>,
-        Vec<ArgumentFunction>,
-    )> {
+    ) -> Result<ExtractedMacros> {
         // Macro bodies are re-parsed as C; one parser serves the whole file.
         let mut body_parser = tree_sitter::Parser::new();
         body_parser.set_language(&tree_sitter_c::LANGUAGE.into())?;
         let mut dispatch_sites: Vec<DispatchSite> = Vec::new();
         let mut registrations: Vec<Registration> = Vec::new();
         let mut argument_functions: Vec<ArgumentFunction> = Vec::new();
+        let mut unresolved_edges: Vec<crate::types::UnresolvedEdge> = Vec::new();
         let queries = self.get_queries(language);
         let mut cursor = QueryCursor::new();
         // matches(), not captures(): a match arrives once with every capture
@@ -3995,6 +4001,44 @@ impl TreeSitterAnalyzer {
                             facts
                                 .argument_functions
                                 .retain(|a| !names.contains(&a.target));
+
+                            // A macro that calls one of its own parameters
+                            //
+                            //     #define printk_index_wrap(_p_func, fmt, ...) \
+                            //             _p_func(fmt, ##__VA_ARGS__)
+                            //
+                            // calls whatever its caller passed. Recording
+                            // `_p_func` as the callee names a function that
+                            // does not exist, and recording nothing says the
+                            // macro calls only what is left. The edge is real
+                            // and its other end is at the invocation site.
+                            let called_parameters: Vec<String> = facts
+                                .calls
+                                .iter()
+                                .filter(|call| names.contains(call))
+                                .cloned()
+                                .collect();
+                            facts.calls.retain(|call| !names.contains(call));
+                            for parameter in called_parameters {
+                                let position = names
+                                    .iter()
+                                    .position(|name| *name == parameter)
+                                    .unwrap_or(0);
+                                unresolved_edges.push(crate::types::UnresolvedEdge {
+                                    name: name.clone(),
+                                    direction: "out".to_string(),
+                                    kind: "c:macro_parameter_call".to_string(),
+                                    evidence: format!("{parameter} (parameter {position})"),
+                                    locations: vec![crate::types::EdgeLocation {
+                                        role: "definition".to_string(),
+                                        file_path: self.make_relative_path(file_path, source_root),
+                                        line: body_line,
+                                    }],
+                                    file_path: self.make_relative_path(file_path, source_root),
+                                    git_file_hash: git_hash.to_string(),
+                                    line: body_line,
+                                });
+                            }
                         }
                         for registration in &mut facts.registrations {
                             registration.byte_start += body_start;
@@ -4063,7 +4107,13 @@ impl TreeSitterAnalyzer {
             }
         }
 
-        Ok((macros, dispatch_sites, registrations, argument_functions))
+        Ok((
+            macros,
+            dispatch_sites,
+            registrations,
+            argument_functions,
+            unresolved_edges,
+        ))
     }
 
     /// Whether an object-like macro body is, or leads to, a compiler attribute.
@@ -7945,6 +7995,49 @@ mod macro_defined_tests {
         assert_eq!(handover.callee, "printk_index_wrap", "{handover:?}");
         assert_eq!(handover.enclosing_function, "printk", "{handover:?}");
         assert_eq!(handover.line, 2, "{handover:?}");
+    }
+
+    #[test]
+    fn a_macro_that_calls_its_parameter_records_where_to_look() {
+        // The call is real and its callee is whatever the invocation passed.
+        // Recording `_p_func` as a callee names a function no tree has.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "#define printk_index_wrap(_p_func, fmt, ...) _p_func(fmt, ##__VA_ARGS__)\n",
+                std::path::Path::new("printk.h"),
+                "hash",
+                None,
+            )
+            .unwrap();
+
+        let edge = analysis
+            .unresolved_edges
+            .iter()
+            .find(|e| e.name == "printk_index_wrap")
+            .unwrap_or_else(|| panic!("{:?}", analysis.unresolved_edges));
+        assert_eq!(edge.direction, "out", "{edge:?}");
+        assert_eq!(edge.kind, "c:macro_parameter_call", "{edge:?}");
+        assert!(edge.evidence.contains("_p_func"), "{edge:?}");
+        // A reason with no place to look is a shrug.
+        assert!(!edge.locations.is_empty(), "{edge:?}");
+        assert_eq!(edge.locations[0].role, "definition", "{edge:?}");
+        assert_eq!(edge.locations[0].line, 1, "{edge:?}");
+
+        let macro_row = analysis
+            .macros
+            .iter()
+            .find(|m| m.name == "printk_index_wrap")
+            .unwrap();
+        assert!(
+            !macro_row
+                .calls
+                .clone()
+                .unwrap_or_default()
+                .iter()
+                .any(|c| c == "_p_func"),
+            "{macro_row:?}"
+        );
     }
 
     #[test]

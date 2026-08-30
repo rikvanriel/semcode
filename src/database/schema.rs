@@ -33,7 +33,10 @@ pub enum OptimizeOutcome {
 /// 4: a registration can be recorded before its container type is known,
 ///    carrying the base and field path instead. A version 3 index has no
 ///    such rows at all: it dropped those registrations.
-pub const SCHEMA_VERSION: u32 = 8;
+/// 9: a call in a macro body to one of the macro's own parameters is recorded
+///    as an unresolved edge naming the parameter, instead of as a call to a
+///    name no function has. A version 8 index holds the wrong edge.
+pub const SCHEMA_VERSION: u32 = 9;
 
 pub struct SchemaManager {
     connection: Connection,
@@ -95,6 +98,10 @@ impl SchemaManager {
 
         if !table_names.iter().any(|n| n == "argument_functions") {
             self.create_argument_functions_table().await?;
+        }
+
+        if !table_names.iter().any(|n| n == "unresolved_edges") {
+            self.create_unresolved_edges_table().await?;
         }
 
         if !table_names.iter().any(|n| n == "object_macros") {
@@ -301,6 +308,49 @@ impl SchemaManager {
         // Asking what a function was handed to filters on the target; asking
         // what a registrar receives filters on the callee.
         for column in ["target", "callee"] {
+            table
+                .create_index(&[column], lancedb::index::Index::Auto)
+                .execute()
+                .await
+                .ok();
+        }
+
+        Ok(())
+    }
+
+    /// Edges the index cannot record, and where to look for the other side.
+    pub async fn create_unresolved_edges_table(&self) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            // The end of the edge that is known.
+            Field::new("name", DataType::Utf8, false),
+            // "in" or "out", from that end.
+            Field::new("direction", DataType::Utf8, false),
+            // The mechanism, namespaced by language. An open string: the
+            // vocabulary differs per language even where the row shape does
+            // not.
+            Field::new("kind", DataType::Utf8, false),
+            // What the source writes where the name would be.
+            Field::new("evidence", DataType::Utf8, false),
+            // Every place worth looking, as JSON [{role, file_path, line}].
+            // A list because a macro needs its definition and its invocation,
+            // and a hardware gate needs the table that installs it as well as
+            // the stub. The first is duplicated below, since a JSON list
+            // carries no index.
+            Field::new("locations", DataType::Utf8, false),
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("git_file_hash", DataType::Utf8, false),
+            Field::new("line", DataType::Int64, false),
+        ]));
+
+        let table = self
+            .connection
+            .create_table("unresolved_edges", vec![RecordBatch::new_empty(schema)])
+            .execute()
+            .await?;
+
+        // Asked from either end of a search: what is unresolved about this
+        // name, and which mechanism accounts for how many.
+        for column in ["name", "kind"] {
             table
                 .create_index(&[column], lancedb::index::Index::Auto)
                 .execute()
