@@ -36,6 +36,13 @@ impl ObjectMacroStore {
         if macros.is_empty() {
             return Ok(());
         }
+        let macros = crate::database::one_row_per_key(macros, |row| {
+            (
+                row.name.clone(),
+                row.file_path.clone(),
+                row.git_file_hash.clone(),
+            )
+        });
 
         let mut names = StringBuilder::new();
         let mut expansions = StringBuilder::new();

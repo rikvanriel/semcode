@@ -40,6 +40,7 @@ The database consists of the following tables:
 11. **content_0 through content_15** - Deduplicated content storage (16 shards)
 12. **dispatch_sites** - Calls that go through a value rather than naming a function
 13. **registrations** - Functions installed in a struct member
+14. **unresolved_edges** - Edges that cannot be recorded, and where to look
 14. **schema_meta** - What wrote the index
 
 ## Table Schemas
@@ -482,7 +483,46 @@ kind                (Utf8, NOT NULL)     - designated_init or assignment
 **Indices:**
 - BTree on `target`, `member` and `container_type`
 
-### 14. schema_meta
+### 14. unresolved_edges
+
+Edges the index cannot record, with what it takes to find the other side.
+`callers bdi_debug_stats_show` answering "No functions call it" ends a search;
+naming the mechanism and a place to look lets it continue.
+
+**Schema:**
+```
+name                (Utf8, NOT NULL)     - The end of the edge that is known
+direction           (Utf8, NOT NULL)     - in or out, from that end
+kind                (Utf8, NOT NULL)     - Mechanism, namespaced by language:
+                                           c:macro_parameter_call, and others as
+                                           they are recorded
+evidence            (Utf8, NOT NULL)     - What the source writes where the name
+                                           would be: a macro parameter, a pasted
+                                           fragment, an attribute string
+locations           (Utf8, NOT NULL)     - JSON [{role, file_path, line}]; role is
+                                           definition, invocation, declaration,
+                                           installation or stub
+file_path           (Utf8, NOT NULL)     - The first location, for indexing
+git_file_hash       (Utf8, NOT NULL)     - Content hash of that file
+line                (Int64, NOT NULL)    - Line of the first location
+```
+
+**Notes:**
+- Locations are a list because one place is often not enough: a macro needs the
+  definition that hides the call and the invocation that supplied the name, and
+  a hardware gate needs the table entry that installs the handler as well as the
+  assembly stub. A single pair of columns would make every consumer re-derive
+  the rest, and each would derive it differently
+- `kind` is an open string rather than an enum. The row shape holds across
+  languages; the vocabulary does not, and a set common to C macros, Rust trait
+  objects and Python attribute lookup would describe none of them
+- A row keyed by `(file_path, git_file_hash, line, name, direction)`, so
+  re-indexing unchanged content rewrites it rather than adding a second
+
+**Indices:**
+- BTree on `name` and `kind`
+
+### 15. schema_meta
 
 What wrote the index.
 

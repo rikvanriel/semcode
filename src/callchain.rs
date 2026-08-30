@@ -313,11 +313,68 @@ pub async fn show_callers_to_writer(
                 }
             }
 
+            // A name handed to another call is reached through that call, not
+            // by anyone naming it. `printk(fmt, ...)` hands `_printk` to
+            // `printk_index_wrap`, so nothing in the tree calls `_printk` by
+            // name and 5,729 functions reach it. Saying "no functions call it"
+            // and stopping there ends a search that should continue at the
+            // macro named here.
+            let handed = db
+                .find_argument_functions_of_git_aware(name, git_sha)
+                .await?;
+            if !handed.is_empty() {
+                let mut sites: Vec<String> = handed
+                    .iter()
+                    .map(|argument| {
+                        let inside = if argument.enclosing_function.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" in {}", argument.enclosing_function)
+                        };
+                        format!(
+                            "{}() argument {} at {}:{}{}",
+                            argument.callee,
+                            argument.argument_index,
+                            argument.file_path,
+                            argument.line,
+                            inside
+                        )
+                    })
+                    .collect();
+                sites.sort();
+                sites.dedup();
+                writeln!(
+                    writer,
+                    "{} it is handed to {} as an argument, so a caller of that reaches it:",
+                    "Handed over:".bold().green(),
+                    if sites.len() == 1 {
+                        "another call".to_string()
+                    } else {
+                        format!("{} calls", sites.len())
+                    }
+                )?;
+                for site in sites.iter().take(10) {
+                    writeln!(writer, "  {}", site.bright_black())?;
+                }
+                if sites.len() > 10 {
+                    writeln!(writer, "  ... and {} more", sites.len() - 10)?;
+                }
+            }
+
             if callers.is_empty() && indirect.is_empty() {
-                if boot_levels.is_empty() {
+                if !boot_levels.is_empty() {
+                } else if !handed.is_empty() {
+                    writeln!(
+                        writer,
+                        "{} nothing calls '{}' by name; follow the handover above",
+                        "Info:".yellow(),
+                        name
+                    )?;
+                } else {
                     let info_msg = format!("{} No functions call '{}'", "Info:".yellow(), name);
                     writeln!(writer, "{info_msg}")?;
-                } else {
+                }
+                if !boot_levels.is_empty() {
                     writeln!(
                         writer,
                         "{} nothing in the source calls it",
@@ -696,6 +753,58 @@ pub async fn show_registrations(db: &DatabaseManager, name: &str, git_sha: &str)
     show_registrations_to_writer(db, name, &mut stdout(), git_sha).await
 }
 
+/// Where to look, as one line: role and place, in the order stored.
+fn describe_locations(locations: &[crate::types::EdgeLocation]) -> String {
+    locations
+        .iter()
+        .map(|location| format!("{} {}:{}", location.role, location.file_path, location.line))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The callees of each definition of a name, kept apart.
+///
+/// The workdir overlay is not consulted here: it answers for one file, and this
+/// reports every file that defines the name.
+fn write_callees_per_definition(
+    name: &str,
+    total: usize,
+    answering: &[crate::types::CalleeDefinition],
+    writer: &mut dyn Write,
+) -> Result<()> {
+    writeln!(
+        writer,
+        "\n{} defines '{}' {} times, {} of them definitions. Which one a call\n\
+         reaches depends on the file it is written in and on the configuration\n\
+         it is built with, so each is reported separately:",
+        "This revision".bold(),
+        name.cyan(),
+        total,
+        answering.len()
+    )?;
+    for definition in answering {
+        writeln!(
+            writer,
+            "\n  {}:{}",
+            definition.file_path.bright_black(),
+            definition.line_start
+        )?;
+        if definition.callees.is_empty() {
+            writeln!(writer, "    calls nothing")?;
+            continue;
+        }
+        for (i, callee) in definition.callees.iter().enumerate() {
+            writeln!(
+                writer,
+                "    {}. {}",
+                (i + 1).to_string().yellow(),
+                callee.cyan()
+            )?;
+        }
+    }
+    Ok(())
+}
+
 pub async fn show_callees_to_writer(
     db: &DatabaseManager,
     name: &str,
@@ -711,8 +820,55 @@ pub async fn show_callees_to_writer(
 
     match func_opt {
         Some(func) => {
-            // Always use git-aware callees query
-            let callees = db.get_function_callees_git_aware(name, git_sha).await?;
+            // An edge the index cannot record is still an edge. Printing the
+            // callees it does have and stopping there says the rest is not
+            // there; naming the mechanism and where to look says it is
+            // somewhere else.
+            let unresolved = db.find_unresolved_edges_git_aware(name, git_sha).await?;
+            for edge in unresolved.iter().filter(|e| e.direction == "out") {
+                writeln!(
+                    writer,
+                    "{} a call here goes to {}, which this file does not name: {}",
+                    "Unresolved:".bold().green(),
+                    edge.evidence.cyan(),
+                    describe_locations(&edge.locations).bright_black()
+                )?;
+            }
+
+            // Every definition, not the one a heuristic prefers: a name with
+            // more than one definition has more than one answer, and picking
+            // silently reports a caller nobody asked about.
+            let definitions = db
+                .get_function_callees_by_definition_git_aware(name, git_sha)
+                .await?;
+            // A prototype answers nothing about what a name calls, and nearly
+            // every exported function has one. A definition that calls nothing
+            // is a different matter: it is a second answer, and reporting only
+            // the other one hides that the tree disagrees with itself.
+            let answering: Vec<crate::types::CalleeDefinition> = definitions
+                .iter()
+                .filter(|definition| definition.is_definition)
+                .cloned()
+                .collect();
+            if answering.len() > 1 {
+                write_callees_per_definition(name, definitions.len(), &answering, writer)?;
+                return Ok(());
+            }
+            if definitions.len() > answering.len() {
+                writeln!(
+                    writer,
+                    "{} {} of the {} rows for '{}' declare it without defining it.",
+                    "Note:".yellow(),
+                    definitions.len() - answering.len(),
+                    definitions.len(),
+                    name
+                )?;
+            }
+            let callees = answering
+                .into_iter()
+                .next()
+                .map(|definition| definition.callees)
+                .unwrap_or_default();
             if callees.is_empty() {
                 let info_msg = format!(
                     "{} Function '{}' doesn't call any other functions",

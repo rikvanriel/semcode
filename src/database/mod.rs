@@ -12,6 +12,7 @@ pub mod processed_files;
 pub mod registrations;
 pub mod resolution;
 pub(crate) mod schema;
+pub mod unresolved_edges;
 pub use schema::SCHEMA_VERSION;
 pub mod search;
 mod symbol_filename;
@@ -22,6 +23,36 @@ pub use connection::DatabaseManager;
 
 use anyhow::Result;
 use arrow::array::RecordBatch;
+
+/// One row per merge key, keeping the last.
+///
+/// `merge_insert` refuses a batch in which two source rows match the same
+/// target row, so a duplicate is not a duplicate row in the table: it is a
+/// failed insert of everything batched alongside it, reported as
+///
+/// ```text
+/// Ambiguous merge inserts are prohibited: multiple source rows match the
+/// same target row on (file_path = "fs/aio.c", ...)
+/// ```
+///
+/// A batch built from several commits holds the same file at the same content
+/// hash more than once, since a file unchanged between two commits is analysed
+/// under each. Those rows are identical, so which one is kept does not matter;
+/// that one is kept does.
+pub fn one_row_per_key<T, K: std::hash::Hash + Eq>(rows: Vec<T>, key: impl Fn(&T) -> K) -> Vec<T> {
+    let mut seen: std::collections::HashMap<K, usize> = std::collections::HashMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        seen.insert(key(row), index);
+    }
+    let mut keep: Vec<bool> = vec![false; rows.len()];
+    for index in seen.into_values() {
+        keep[index] = true;
+    }
+    rows.into_iter()
+        .zip(keep)
+        .filter_map(|(row, keep)| keep.then_some(row))
+        .collect()
+}
 
 /// Look up a column by name and downcast to the expected Arrow array type.
 pub(crate) fn get_column<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> Result<&'a T> {

@@ -156,6 +156,7 @@ pub struct DatabaseManager {
     dispatch_site_store: crate::database::dispatch_sites::DispatchSiteStore,
     registration_store: crate::database::registrations::RegistrationStore,
     argument_function_store: crate::database::argument_functions::ArgumentFunctionStore,
+    unresolved_edge_store: crate::database::unresolved_edges::UnresolvedEdgeStore,
     global_store: crate::database::globals::GlobalStore,
     object_macro_store: crate::database::object_macros::ObjectMacroStore,
     symbol_filename_store: SymbolFilenameStore,
@@ -218,6 +219,9 @@ impl DatabaseManager {
             ),
             argument_function_store:
                 crate::database::argument_functions::ArgumentFunctionStore::new(connection.clone()),
+            unresolved_edge_store: crate::database::unresolved_edges::UnresolvedEdgeStore::new(
+                connection.clone(),
+            ),
             global_store: crate::database::globals::GlobalStore::new(connection.clone()),
             symbol_filename_store: SymbolFilenameStore::new(connection.clone()),
             object_macro_store: crate::database::object_macros::ObjectMacroStore::new(
@@ -1008,6 +1012,34 @@ impl DatabaseManager {
         arguments: Vec<crate::types::ArgumentFunction>,
     ) -> Result<()> {
         self.argument_function_store.insert_batch(arguments).await
+    }
+
+    pub async fn insert_unresolved_edges(
+        &self,
+        edges: Vec<crate::types::UnresolvedEdge>,
+    ) -> Result<()> {
+        self.unresolved_edge_store.insert_batch(edges).await
+    }
+
+    /// What the index cannot say about this name, and where to look instead.
+    pub async fn find_unresolved_edges_git_aware(
+        &self,
+        name: &str,
+        git_sha: &str,
+    ) -> Result<Vec<crate::types::UnresolvedEdge>> {
+        let edges = self.unresolved_edge_store.find_by_name(name).await?;
+        let manifest = self.git_manifest_cached(git_sha).await?;
+        if manifest.is_empty() {
+            return Ok(edges);
+        }
+        Ok(edges
+            .into_iter()
+            .filter(|edge| {
+                manifest
+                    .hash_of(&edge.file_path)
+                    .is_some_and(|hash| hash == edge.git_file_hash)
+            })
+            .collect())
     }
 
     /// Every call handed this name.
@@ -3763,6 +3795,67 @@ impl DatabaseManager {
             .await
     }
 
+    /// Every definition of the name at this commit, with what each calls.
+    pub async fn get_function_callees_by_definition_git_aware(
+        &self,
+        function_name: &str,
+        git_sha: &str,
+    ) -> Result<Vec<crate::types::CalleeDefinition>> {
+        let git_manifest = self.git_manifest_cached(git_sha).await?;
+        let mut definitions = if git_manifest.is_empty() {
+            Vec::new()
+        } else {
+            self.get_function_callees_by_definition(function_name, &git_manifest)
+                .await?
+        };
+
+        // What the working directory says overrides what the commit said about
+        // the same file, and a definition that exists only in an edited file
+        // exists. Reporting the committed rows here would answer about a file
+        // the reader has already changed.
+        let dirty = self.workdir_callee_definitions(function_name, git_sha);
+        if !dirty.is_empty() {
+            definitions.retain(|definition| {
+                !dirty
+                    .iter()
+                    .any(|edited| edited.file_path == definition.file_path)
+            });
+            definitions.extend(dirty);
+            definitions.sort_by(|a, b| {
+                a.file_path
+                    .cmp(&b.file_path)
+                    .then(a.line_start.cmp(&b.line_start))
+            });
+        }
+        Ok(definitions)
+    }
+
+    /// The definitions of a name in files the working directory has edited.
+    fn workdir_callee_definitions(
+        &self,
+        name: &str,
+        git_sha: &str,
+    ) -> Vec<crate::types::CalleeDefinition> {
+        self.ensure_workdir_index_built(git_sha);
+        let guard = self.workdir_index.read().unwrap();
+        guard
+            .as_ref()
+            .map(|workdir| {
+                workdir
+                    .find_all_functions(name)
+                    .into_iter()
+                    .map(|function| crate::types::CalleeDefinition {
+                        file_path: function.file_path.clone(),
+                        line_start: function.line_start,
+                        line_end: function.line_end,
+                        callees: function.calls.clone().unwrap_or_default(),
+                        is_definition: !crate::types::text_is_prototype(&function.body),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub async fn get_all_call_relationships(&self) -> Result<Vec<CallRelationship>> {
         // New schema: reconstruct call relationships from embedded JSON in functions table
         let table = self.connection.open_table("functions").execute().await?;
@@ -5317,11 +5410,19 @@ impl DatabaseManager {
     }
 
     /// Get function callees using pre-generated manifest (fast)
-    pub async fn get_function_callees_with_manifest(
+    /// Every definition of the name that this revision holds, with what each
+    /// one calls.
+    ///
+    /// Collapsing these to one answer is how `calls pr_warn` came to report
+    /// `fprintf` and `va_end`: nine definitions exist, and the one picked was a
+    /// userspace copy no kernel caller can reach. A reader given the file each
+    /// set came from can tell which applies; a reader given one set cannot tell
+    /// there was a choice.
+    pub async fn get_function_callees_by_definition(
         &self,
         function_name: &str,
         git_manifest: &crate::database::resolution::RevisionPaths,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<crate::types::CalleeDefinition>> {
         // Query functions table directly - efficient, doesn't fetch bodies
         let escaped_name = function_name.replace("'", "''");
         let table = self.connection.open_table("functions").execute().await?;
@@ -5372,10 +5473,27 @@ impl DatabaseManager {
                     .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
                     .unwrap();
+                let body_hash_array = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == "body_hash")
+                    .and_then(|index| {
+                        batch
+                            .column(index)
+                            .as_any()
+                            .downcast_ref::<arrow::array::StringArray>()
+                    });
 
                 for i in 0..batch.num_rows() {
                     let file_path = file_path_array.value(i);
                     let git_file_hash = git_file_hash_array.value(i);
+                    let body_hash = body_hash_array.and_then(|array| {
+                        array
+                            .is_valid(i)
+                            .then(|| array.value(i).to_string())
+                            .filter(|hash| !hash.is_empty())
+                    });
 
                     // Fast manifest lookup
                     if let Some(expected_hash) = git_manifest.hash_of(file_path) {
@@ -5393,6 +5511,7 @@ impl DatabaseManager {
                                 line_start_array.value(i) as u32,
                                 line_end_array.value(i) as u32,
                                 calls,
+                                body_hash,
                             ));
                         }
                     }
@@ -5400,23 +5519,56 @@ impl DatabaseManager {
             }
         }
 
-        if matches.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Select best match (prefer implementation over declaration)
-        let best_match = matches
-            .into_iter()
-            .max_by_key(|(file_path, line_start, line_end, _)| {
-                let line_count = line_end.saturating_sub(*line_start);
-                let is_header = file_path.ends_with(".h");
-                (if is_header { 0 } else { 1 }, line_count)
+        // Whether each row defines the name or only declares it. The row's own
+        // text decides, so it is read here -- for the handful of rows that
+        // share one name, not for the table.
+        let mut definitions: Vec<crate::types::CalleeDefinition> = Vec::new();
+        for (file_path, line_start, line_end, calls, body_hash) in matches {
+            let text = match &body_hash {
+                Some(hash) => self.get_content(hash).await?.unwrap_or_default(),
+                None => String::new(),
+            };
+            definitions.push(crate::types::CalleeDefinition {
+                file_path,
+                line_start,
+                line_end,
+                callees: calls.unwrap_or_default(),
+                is_definition: !text.is_empty() && !crate::types::text_is_prototype(&text),
             });
-
-        match best_match {
-            Some((_, _, _, Some(calls))) => Ok(calls),
-            _ => Ok(Vec::new()),
         }
+        // A stable order, so two runs and two readers see the same list.
+        definitions.sort_by(|a, b| {
+            a.file_path
+                .cmp(&b.file_path)
+                .then(a.line_start.cmp(&b.line_start))
+        });
+        Ok(definitions)
+    }
+
+    /// The callees of the definition this revision most likely means: an
+    /// implementation over a declaration, and the longest body among equals.
+    ///
+    /// A single answer is what a call chain needs -- walking every definition of
+    /// every name multiplies a chain by the ambiguity at each step. Where the
+    /// choice is shown to a reader rather than walked,
+    /// `get_function_callees_by_definition` reports all of them instead.
+    pub async fn get_function_callees_with_manifest(
+        &self,
+        function_name: &str,
+        git_manifest: &crate::database::resolution::RevisionPaths,
+    ) -> Result<Vec<String>> {
+        let definitions = self
+            .get_function_callees_by_definition(function_name, git_manifest)
+            .await?;
+        Ok(definitions
+            .into_iter()
+            .max_by_key(|definition| {
+                let line_count = definition.line_end.saturating_sub(definition.line_start);
+                let is_header = definition.file_path.ends_with(".h");
+                (if is_header { 0 } else { 1 }, line_count)
+            })
+            .map(|definition| definition.callees)
+            .unwrap_or_default())
     }
 
     /// Build a complete caller index from the database in ONE scan.

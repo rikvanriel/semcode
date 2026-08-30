@@ -58,6 +58,16 @@ struct LanguageQueries {
     call_query: Query,
 }
 
+/// What macro extraction yields: the macros themselves and the facts their
+/// bodies hold, which belong to the same tables as any other code's.
+type ExtractedMacros = (
+    Vec<FunctionInfo>,
+    Vec<DispatchSite>,
+    Vec<Registration>,
+    Vec<ArgumentFunction>,
+    Vec<crate::types::UnresolvedEdge>,
+);
+
 /// What one file yields.
 #[derive(Debug, Default)]
 pub struct FileAnalysis {
@@ -70,6 +80,8 @@ pub struct FileAnalysis {
     pub registrations: Vec<Registration>,
     /// Functions named as call arguments: what a callee was handed.
     pub argument_functions: Vec<ArgumentFunction>,
+    /// Edges that cannot be recorded, with where to look for the other side.
+    pub unresolved_edges: Vec<crate::types::UnresolvedEdge>,
     /// File-scope variables of aggregate type.
     pub globals: Vec<GlobalVariable>,
 }
@@ -95,6 +107,7 @@ struct MacroBodyFacts {
     types: Vec<String>,
     sites: Vec<RawDispatchSite>,
     registrations: Vec<RawRegistration>,
+    argument_functions: Vec<RawArgumentFunction>,
 }
 
 /// A designated initializer before it is attributed to a function.
@@ -952,14 +965,15 @@ impl TreeSitterAnalyzer {
 
         // Extract macros; the sites in their bodies are dropped on this
         // path, which serves callers that want definitions only.
-        let (extracted_macros, _macro_sites, _macro_registrations) = self.extract_macros(
-            &tree,
-            &source_code,
-            file_path,
-            &git_hash,
-            source_root,
-            language,
-        )?;
+        let (extracted_macros, _macro_sites, _macro_registrations, _macro_arguments, _macro_edges) =
+            self.extract_macros(
+                &tree,
+                &source_code,
+                file_path,
+                &git_hash,
+                source_root,
+                language,
+            )?;
         raw_macros.extend(extracted_macros);
 
         // Call relationships are now embedded in function/macro JSON columns during parsing
@@ -1014,6 +1028,7 @@ impl TreeSitterAnalyzer {
             dispatch_sites,
             registrations,
             argument_functions,
+            unresolved_edges,
             globals,
         } = self.extract_all_with_embedded_data(
             &tree,
@@ -1049,6 +1064,7 @@ impl TreeSitterAnalyzer {
             dispatch_sites,
             registrations,
             argument_functions,
+            unresolved_edges,
             globals,
         })
     }
@@ -1087,7 +1103,7 @@ impl TreeSitterAnalyzer {
             functions,
             mut dispatch_sites,
             mut registrations,
-            argument_functions,
+            mut argument_functions,
         } = self.extract_functions_with_calls(&ctx, &extraction)?;
 
         // Extract types (single traversal as before)
@@ -1101,16 +1117,18 @@ impl TreeSitterAnalyzer {
         )?;
 
         // Extract macros with embedded data (single traversal)
-        let (macros, macro_sites, macro_registrations) = self.extract_macros_with_embedded_data(
-            tree,
-            source_code,
-            file_path,
-            git_hash,
-            source_root,
-            language,
-        )?;
+        let (macros, macro_sites, macro_registrations, macro_arguments, unresolved_edges) = self
+            .extract_macros_with_embedded_data(
+                tree,
+                source_code,
+                file_path,
+                git_hash,
+                source_root,
+                language,
+            )?;
         dispatch_sites.extend(macro_sites);
         registrations.extend(macro_registrations);
+        argument_functions.extend(macro_arguments);
 
         // Only C states a variable's aggregate this way; other languages get
         // their receivers typed by their own pass.
@@ -1129,6 +1147,24 @@ impl TreeSitterAnalyzer {
             Vec::new()
         };
 
+        // A fact inside a body a macro opens is found by two walks; the store
+        // keys rows by place, so the pair is one fact and a duplicate.
+        let dispatch_sites = Self::keep_innermost(
+            dispatch_sites,
+            |site| (site.byte_start, site.target.clone().unwrap_or_default()),
+            |site| site.caller_name.as_str(),
+        );
+        let registrations = Self::keep_innermost(
+            registrations,
+            |registration| (registration.byte_start, registration.target.clone()),
+            |registration| registration.enclosing_function.as_str(),
+        );
+        let argument_functions = Self::keep_innermost(
+            argument_functions,
+            |argument| (argument.byte_start, argument.target.clone()),
+            |argument| argument.enclosing_function.as_str(),
+        );
+
         Ok(FileAnalysis {
             functions,
             types,
@@ -1136,8 +1172,54 @@ impl TreeSitterAnalyzer {
             dispatch_sites,
             registrations,
             argument_functions,
+            unresolved_edges,
             globals,
         })
+    }
+
+    /// One place in a file yields one row, attributed to whatever encloses it.
+    ///
+    /// A body a macro opens is not a `function_definition`, so a fact inside
+    /// it is found twice: once by the walk over the function the macro
+    /// defines, and once by the walk that collects what no function encloses.
+    /// `kargs.set_tid = set_tid` inside `SYSCALL_DEFINE2(clone3, ...)` was
+    /// recorded as a registration in `sys_clone3` and as one at file scope,
+    /// both at kernel/fork.c:3060. A row is keyed by its place in the file, so
+    /// the second is not another fact but the same one, and the database
+    /// refuses the pair rather than storing it:
+    ///
+    /// ```text
+    /// Ambiguous merge inserts are prohibited: multiple source rows match
+    /// the same target row on (file_path = "kernel/fork.c", ...)
+    /// ```
+    ///
+    /// The row naming what encloses the fact is the one worth keeping.
+    fn keep_innermost<T>(
+        rows: Vec<T>,
+        place: impl Fn(&T) -> (u64, String),
+        enclosing: impl Fn(&T) -> &str,
+    ) -> Vec<T> {
+        let mut best: HashMap<(u64, String), usize> = HashMap::new();
+        let mut keep: Vec<bool> = vec![true; rows.len()];
+        for (index, row) in rows.iter().enumerate() {
+            match best.get(&place(row)) {
+                Some(&previous) => {
+                    if enclosing(&rows[previous]).is_empty() && !enclosing(row).is_empty() {
+                        keep[previous] = false;
+                        best.insert(place(row), index);
+                    } else {
+                        keep[index] = false;
+                    }
+                }
+                None => {
+                    best.insert(place(row), index);
+                }
+            }
+        }
+        rows.into_iter()
+            .zip(keep)
+            .filter_map(|(row, keep)| keep.then_some(row))
+            .collect()
     }
 
     /// Extract all calls in a single tree traversal and return with byte positions
@@ -1952,26 +2034,8 @@ impl TreeSitterAnalyzer {
         // The invocation and its block are siblings, and a conditional makes
         // them siblings of each other inside it rather than of the file.
         // `SYSCALL_DEFINE3(old_readdir, ...)` sits inside
-        // `#ifdef __ARCH_WANT_OLD_READDIR`, and looking only at the
-        // translation unit's own children skips every syscall written that
-        // way.
-        let mut groups = vec![root];
-        let mut sequences: Vec<Vec<tree_sitter::Node>> = Vec::new();
-        while let Some(parent) = groups.pop() {
-            let mut cursor = parent.walk();
-            let children: Vec<tree_sitter::Node> = parent.children(&mut cursor).collect();
-            for child in &children {
-                if matches!(
-                    child.kind(),
-                    "preproc_ifdef" | "preproc_if" | "preproc_else" | "preproc_elif"
-                ) {
-                    groups.push(*child);
-                }
-            }
-            sequences.push(children);
-        }
-
-        for children in &sequences {
+        // `#ifdef __ARCH_WANT_OLD_READDIR`.
+        for children in &Self::file_scope_sequences(root) {
             for (index, node) in children.iter().enumerate() {
                 if node.kind() != "expression_statement" {
                     continue;
@@ -2644,19 +2708,8 @@ impl TreeSitterAnalyzer {
     fn initcall(node: tree_sitter::Node, source: &str) -> Option<RawRegistration> {
         // File scope: an initcall inside a function is something else. A
         // conditional is still file scope — `subsys_initcall(cgwb_init)` sits
-        // inside `#ifdef CONFIG_CGROUP_WRITEBACK`, and requiring the parent to
-        // be the translation unit skipped every initcall written that way.
-        if node.kind() != "expression_statement" {
-            return None;
-        }
-        let mut parent = node.parent()?;
-        while matches!(
-            parent.kind(),
-            "preproc_ifdef" | "preproc_if" | "preproc_else" | "preproc_elif"
-        ) {
-            parent = parent.parent()?;
-        }
-        if parent.kind() != "translation_unit" {
+        // inside `#ifdef CONFIG_CGROUP_WRITEBACK`.
+        if node.kind() != "expression_statement" || !Self::at_file_scope(node) {
             return None;
         }
 
@@ -3209,6 +3262,8 @@ impl TreeSitterAnalyzer {
             let mut line_end = 0;
             let mut function_start_byte = 0;
             let mut function_end_byte = 0;
+            let mut body_start_byte = 0;
+            let mut function_node = None;
 
             for capture in m.captures {
                 let node = capture.node;
@@ -3237,11 +3292,13 @@ impl TreeSitterAnalyzer {
                     }
                     "body" => {
                         line_end = node.end_position().row as u32 + 1;
+                        body_start_byte = node.start_byte();
                     }
                     "function" | "function_ptr" | "function_ptr2" => {
                         // All function types with bodies - process fully
                         function_start_byte = node.start_byte();
                         function_end_byte = node.end_byte();
+                        function_node = Some(node);
                         if line_end == 0 {
                             line_end = node.end_position().row as u32 + 1;
                         }
@@ -3307,6 +3364,24 @@ impl TreeSitterAnalyzer {
                     || matched_patterns.contains("function")
                     || matched_patterns.contains("function_ptr")
                     || matched_patterns.contains("function_ptr2");
+
+                // A body the parser stopped reading early ends at the break
+                // rather than at its closing brace, and the statements after
+                // it are reparented to file scope where they belong to nobody.
+                // Counting braces recovers the end, and the range is all the
+                // attribution below needs.
+                if has_body && body_start_byte > 0 {
+                    if let Some(recovered) = Self::body_end_by_braces(
+                        ctx.source,
+                        body_start_byte,
+                        function_node.map_or(ctx.source.len(), Self::next_definition_start),
+                    ) {
+                        if recovered > function_end_byte {
+                            function_end_byte = recovered;
+                            line_end = ctx.source[..recovered].lines().count() as u32;
+                        }
+                    }
+                }
 
                 // Extract complete function text including top comments
                 let complete_body = self.extract_function_with_comments(
@@ -3539,7 +3614,7 @@ impl TreeSitterAnalyzer {
         git_hash: &str,
         source_root: Option<&Path>,
         language: Language,
-    ) -> Result<(Vec<FunctionInfo>, Vec<DispatchSite>, Vec<Registration>)> {
+    ) -> Result<ExtractedMacros> {
         // This is the same as extract_macros but named differently for clarity
         // Macros are not as performance-critical as functions since they're fewer in number
         self.extract_macros(tree, source, file_path, git_hash, source_root, language)
@@ -3913,12 +3988,14 @@ impl TreeSitterAnalyzer {
         git_hash: &str,
         source_root: Option<&Path>,
         language: Language,
-    ) -> Result<(Vec<FunctionInfo>, Vec<DispatchSite>, Vec<Registration>)> {
+    ) -> Result<ExtractedMacros> {
         // Macro bodies are re-parsed as C; one parser serves the whole file.
         let mut body_parser = tree_sitter::Parser::new();
         body_parser.set_language(&tree_sitter_c::LANGUAGE.into())?;
         let mut dispatch_sites: Vec<DispatchSite> = Vec::new();
         let mut registrations: Vec<Registration> = Vec::new();
+        let mut argument_functions: Vec<ArgumentFunction> = Vec::new();
+        let mut unresolved_edges: Vec<crate::types::UnresolvedEdge> = Vec::new();
         let queries = self.get_queries(language);
         let mut cursor = QueryCursor::new();
         // matches(), not captures(): a match arrives once with every capture
@@ -3984,10 +4061,55 @@ impl TreeSitterAnalyzer {
                         // that nowhere.
                         if let Some(names) = parameters.as_ref() {
                             facts.registrations.retain(|r| !names.contains(&r.target));
+                            facts
+                                .argument_functions
+                                .retain(|a| !names.contains(&a.target));
+
+                            // A macro that calls one of its own parameters
+                            //
+                            //     #define printk_index_wrap(_p_func, fmt, ...) \
+                            //             _p_func(fmt, ##__VA_ARGS__)
+                            //
+                            // calls whatever its caller passed. Recording
+                            // `_p_func` as the callee names a function that
+                            // does not exist, and recording nothing says the
+                            // macro calls only what is left. The edge is real
+                            // and its other end is at the invocation site.
+                            let called_parameters: Vec<String> = facts
+                                .calls
+                                .iter()
+                                .filter(|call| names.contains(call))
+                                .cloned()
+                                .collect();
+                            facts.calls.retain(|call| !names.contains(call));
+                            for parameter in called_parameters {
+                                let position = names
+                                    .iter()
+                                    .position(|name| *name == parameter)
+                                    .unwrap_or(0);
+                                unresolved_edges.push(crate::types::UnresolvedEdge {
+                                    name: name.clone(),
+                                    direction: "out".to_string(),
+                                    kind: "c:macro_parameter_call".to_string(),
+                                    evidence: format!("{parameter} (parameter {position})"),
+                                    locations: vec![crate::types::EdgeLocation {
+                                        role: "definition".to_string(),
+                                        file_path: self.make_relative_path(file_path, source_root),
+                                        line: body_line,
+                                    }],
+                                    file_path: self.make_relative_path(file_path, source_root),
+                                    git_file_hash: git_hash.to_string(),
+                                    line: body_line,
+                                });
+                            }
                         }
                         for registration in &mut facts.registrations {
                             registration.byte_start += body_start;
                             registration.line = body_line + registration.line.saturating_sub(1);
+                        }
+                        for argument in &mut facts.argument_functions {
+                            argument.byte_start += body_start;
+                            argument.line = body_line + argument.line.saturating_sub(1);
                         }
 
                         facts
@@ -4006,6 +4128,12 @@ impl TreeSitterAnalyzer {
                 registrations.extend(
                     facts
                         .registrations
+                        .iter()
+                        .map(|raw| raw.attribute(&name, &relative_path, git_hash)),
+                );
+                argument_functions.extend(
+                    facts
+                        .argument_functions
                         .iter()
                         .map(|raw| raw.attribute(&name, &relative_path, git_hash)),
                 );
@@ -4042,7 +4170,13 @@ impl TreeSitterAnalyzer {
             }
         }
 
-        Ok((macros, dispatch_sites, registrations))
+        Ok((
+            macros,
+            dispatch_sites,
+            registrations,
+            argument_functions,
+            unresolved_edges,
+        ))
     }
 
     /// Whether an object-like macro body is, or leads to, a compiler attribute.
@@ -4257,6 +4391,127 @@ impl TreeSitterAnalyzer {
         })
     }
 
+    /// Where the next definition begins, which bounds how far a broken body
+    /// may be read. Without a bound, a body holding an unbalanced brace inside
+    /// a conditional would swallow the rest of the file. `usize::MAX` means no
+    /// definition follows; the caller clamps to the source's length.
+    fn next_definition_start(node: tree_sitter::Node) -> usize {
+        let mut sibling = node.next_sibling();
+        while let Some(current) = sibling {
+            if current.kind() == "function_definition" {
+                return current.start_byte();
+            }
+            sibling = current.next_sibling();
+        }
+        usize::MAX
+    }
+
+    /// The closing brace of the block opening at `open`, found by counting
+    /// braces rather than by asking the parser, which is the point: the parser
+    /// is what gave up.
+    ///
+    /// A declaration built by a macro -- `TRAILING_OVERLAP(...) x = {...};` --
+    /// is not parseable C, so the grammar ends the function at that line and
+    /// makes the remaining statements children of the translation unit. The
+    /// function then records the calls above the break and none below it, and
+    /// says nothing about the difference. 1,176 statements across the tree sit
+    /// at file scope this way, holding 687 call sites, 451 of them outside
+    /// tools/.
+    ///
+    /// Strings, character literals and comments are skipped, since a brace
+    /// inside any of them is text rather than structure.
+    fn body_end_by_braces(source: &str, open: usize, limit: usize) -> Option<usize> {
+        let bytes = source.as_bytes();
+        if bytes.get(open) != Some(&b'{') {
+            return None;
+        }
+        let end = limit.min(bytes.len());
+        let mut depth = 0usize;
+        let mut index = open;
+        while index < end {
+            match bytes[index] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(index + 1);
+                    }
+                }
+                b'"' | b'\'' => {
+                    let quote = bytes[index];
+                    index += 1;
+                    while index < end && bytes[index] != quote {
+                        index += if bytes[index] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                    while index < end && bytes[index] != b'\n' {
+                        index += 1;
+                    }
+                }
+                b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                    index += 2;
+                    while index + 1 < end && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
+                        index += 1;
+                    }
+                    index += 1;
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        None
+    }
+
+    /// A preprocessor conditional does not nest what it holds: a definition
+    /// inside `#ifdef` belongs to the scope the `#ifdef` itself sits in.
+    ///
+    /// Every walk over a scope has to look through these nodes, and each one
+    /// that decided so for itself spelled the set differently. Two listed four
+    /// kinds by name and so dropped everything under `#elifdef` and
+    /// `#elifndef`; a third matched every `preproc_` node. Three copies cost
+    /// 345 initcalls, 16,223 `dev_dbg` call sites and 213 syscall bodies
+    /// before this was one definition.
+    fn is_conditional_group(kind: &str) -> bool {
+        kind.starts_with("preproc_if") || kind.starts_with("preproc_el")
+    }
+
+    /// Whether the node sits at file scope, reading through conditionals.
+    fn at_file_scope(node: tree_sitter::Node) -> bool {
+        let mut parent = node.parent();
+        while let Some(current) = parent {
+            if !Self::is_conditional_group(current.kind()) {
+                return current.kind() == "translation_unit";
+            }
+            parent = current.parent();
+        }
+        false
+    }
+
+    /// Every run of siblings at file scope: the translation unit's children,
+    /// and the children of each conditional it holds, recursively.
+    ///
+    /// A pair of siblings is what identifies a body a macro opens, and a
+    /// conditional makes the pair siblings of each other inside it rather than
+    /// of the file, so the runs have to be kept apart rather than flattened.
+    fn file_scope_sequences<'tree>(
+        root: tree_sitter::Node<'tree>,
+    ) -> Vec<Vec<tree_sitter::Node<'tree>>> {
+        let mut groups = vec![root];
+        let mut sequences: Vec<Vec<tree_sitter::Node>> = Vec::new();
+        while let Some(parent) = groups.pop() {
+            let mut cursor = parent.walk();
+            let children: Vec<tree_sitter::Node> = parent.children(&mut cursor).collect();
+            for child in &children {
+                if Self::is_conditional_group(child.kind()) {
+                    groups.push(*child);
+                }
+            }
+            sequences.push(children);
+        }
+        sequences
+    }
+
     /// The field declarations of a struct or union body, including the ones a
     /// preprocessor conditional holds.
     ///
@@ -4284,7 +4539,7 @@ impl TreeSitterAnalyzer {
             for child in node.children(&mut cursor) {
                 match child.kind() {
                     "field_declaration" => declarations.push(child),
-                    kind if kind.starts_with("preproc_") => stack.push(child),
+                    kind if Self::is_conditional_group(kind) => stack.push(child),
                     _ => {}
                 }
             }
@@ -5192,11 +5447,28 @@ impl TreeSitterAnalyzer {
             registration.byte_start -= prefix_len;
         }
 
+        // A macro body hands a function over as well as calling one:
+        //
+        //     #define printk(fmt, ...) printk_index_wrap(_printk, fmt, ...)
+        //
+        // Reading the handover only outside macros is why `callers _printk`
+        // named four functions in a tree where 5,729 call it.
+        let mut argument_functions = Self::collect_argument_functions(tree.root_node(), &wrapped);
+        argument_functions.retain(|argument| {
+            !argument.callee.starts_with("__semcode_")
+                && !argument.target.starts_with("__semcode_")
+                && argument.byte_start >= prefix_len
+        });
+        for argument in &mut argument_functions {
+            argument.byte_start -= prefix_len;
+        }
+
         MacroBodyFacts {
             calls,
             types,
             sites,
             registrations,
+            argument_functions,
         }
     }
 
@@ -7759,6 +8031,268 @@ mod macro_defined_tests {
                 .as_ref()
                 .is_some_and(|c| c.iter().any(|n| n == "iterate_dir")),
             "{syscall:?}"
+        );
+    }
+
+    #[test]
+    fn a_macro_body_records_the_function_it_hands_over() {
+        // `printk(fmt, ...)` hands `_printk` to `printk_index_wrap`, which
+        // calls it. Reading handovers only outside macro bodies is why
+        // `callers _printk` named four functions in a tree where 5,729 call it.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "#define printk_index_wrap(_p_func, fmt, ...) _p_func(fmt, ##__VA_ARGS__)\n\
+                 #define printk(fmt, ...) printk_index_wrap(_printk, fmt, ##__VA_ARGS__)\n",
+                std::path::Path::new("printk.h"),
+                "hash",
+                None,
+            )
+            .unwrap();
+
+        let handover = analysis
+            .argument_functions
+            .iter()
+            .find(|a| a.target == "_printk")
+            .unwrap_or_else(|| panic!("{:?}", analysis.argument_functions));
+        assert_eq!(handover.callee, "printk_index_wrap", "{handover:?}");
+        assert_eq!(handover.enclosing_function, "printk", "{handover:?}");
+        assert_eq!(handover.line, 2, "{handover:?}");
+    }
+
+    #[test]
+    fn a_fact_inside_a_macro_defined_body_is_recorded_once() {
+        // The body a SYSCALL_DEFINE opens is not a function_definition, so the
+        // walk that collects what no function encloses finds this assignment
+        // too. Two rows for one place in one file is what the database calls
+        // an ambiguous merge, and it refuses the whole batch.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "SYSCALL_DEFINE2(clone3, struct clone_args __user *, uargs, size_t, size)\n\
+                 {\n\
+                 \tstruct kernel_clone_args kargs;\n\
+                 \n\
+                 \tkargs.set_tid = set_tid;\n\
+                 \treturn kernel_clone(&kargs);\n\
+                 }\n",
+                std::path::Path::new("fork.c"),
+                "hash",
+                None,
+            )
+            .unwrap();
+
+        let rows: Vec<_> = analysis
+            .registrations
+            .iter()
+            .filter(|r| r.target == "set_tid")
+            .collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].enclosing_function, "sys_clone3", "{rows:?}");
+    }
+
+    #[test]
+    fn a_macro_that_calls_its_parameter_records_where_to_look() {
+        // The call is real and its callee is whatever the invocation passed.
+        // Recording `_p_func` as a callee names a function no tree has.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "#define printk_index_wrap(_p_func, fmt, ...) _p_func(fmt, ##__VA_ARGS__)\n",
+                std::path::Path::new("printk.h"),
+                "hash",
+                None,
+            )
+            .unwrap();
+
+        let edge = analysis
+            .unresolved_edges
+            .iter()
+            .find(|e| e.name == "printk_index_wrap")
+            .unwrap_or_else(|| panic!("{:?}", analysis.unresolved_edges));
+        assert_eq!(edge.direction, "out", "{edge:?}");
+        assert_eq!(edge.kind, "c:macro_parameter_call", "{edge:?}");
+        assert!(edge.evidence.contains("_p_func"), "{edge:?}");
+        // A reason with no place to look is a shrug.
+        assert!(!edge.locations.is_empty(), "{edge:?}");
+        assert_eq!(edge.locations[0].role, "definition", "{edge:?}");
+        assert_eq!(edge.locations[0].line, 1, "{edge:?}");
+
+        let macro_row = analysis
+            .macros
+            .iter()
+            .find(|m| m.name == "printk_index_wrap")
+            .unwrap();
+        assert!(
+            !macro_row
+                .calls
+                .clone()
+                .unwrap_or_default()
+                .iter()
+                .any(|c| c == "_p_func"),
+            "{macro_row:?}"
+        );
+    }
+
+    #[test]
+    fn a_macro_parameter_is_not_a_handover() {
+        // `_p_func` is the macro's own parameter: whatever a caller passes is
+        // named nowhere in this file.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "#define call_it(_p_func, fmt) helper(_p_func, fmt)\n",
+                std::path::Path::new("wrap.h"),
+                "hash",
+                None,
+            )
+            .unwrap();
+        assert!(
+            !analysis
+                .argument_functions
+                .iter()
+                .any(|a| a.target == "_p_func"),
+            "{:?}",
+            analysis.argument_functions
+        );
+    }
+
+    #[test]
+    fn a_body_the_parser_abandoned_keeps_its_calls() {
+        // `TRAILING_OVERLAP(...) x = {...};` is not parseable C. The grammar
+        // ends the function at that line and makes the statements after it
+        // children of the translation unit, so the calls below the break
+        // belong to nobody and nothing says so.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "static int freeze(struct nvdimm *nvdimm)\n\
+                 {\n\
+                 \tstruct nfit_mem *mem = provider_data(nvdimm);\n\
+                 \tTRAILING_OVERLAP(struct nd_cmd_pkg, pkg, nd_payload,\n\
+                 \t\tstruct nd_intel_freeze_lock cmd;\n\
+                 \t) nd_cmd = {\n\
+                 \t\t.pkg = { .nd_size_out = 4, },\n\
+                 \t};\n\
+                 \n\
+                 \tif (!test_bit(0, &mem->dsm_mask))\n\
+                 \t\treturn -ENOTTY;\n\
+                 \treturn nvdimm_ctl(nvdimm, &nd_cmd);\n\
+                 }\n",
+                std::path::Path::new("intel.c"),
+                "hash",
+                None,
+            )
+            .unwrap();
+
+        let freeze = analysis
+            .functions
+            .iter()
+            .find(|f| f.name == "freeze")
+            .unwrap();
+        let calls = freeze.calls.clone().unwrap_or_default();
+        for expected in ["provider_data", "test_bit", "nvdimm_ctl"] {
+            assert!(calls.iter().any(|c| c == expected), "{calls:?}");
+        }
+    }
+
+    #[test]
+    fn a_body_the_parser_read_whole_is_unchanged() {
+        // The recovery must not extend a function whose body parsed, or every
+        // range in the file would drift by whatever follows it.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "static int first(void)\n\
+                 {\n\
+                 \treturn one();\n\
+                 }\n\
+                 \n\
+                 static int second(void)\n\
+                 {\n\
+                 \treturn two();\n\
+                 }\n",
+                std::path::Path::new("plain.c"),
+                "hash",
+                None,
+            )
+            .unwrap();
+        let first = analysis
+            .functions
+            .iter()
+            .find(|f| f.name == "first")
+            .unwrap();
+        assert_eq!(first.line_end, 4, "{first:?}");
+        let calls = first.calls.clone().unwrap_or_default();
+        assert!(calls.iter().any(|c| c == "one"), "{calls:?}");
+        assert!(!calls.iter().any(|c| c == "two"), "{calls:?}");
+    }
+
+    #[test]
+    fn a_body_under_elifdef_becomes_a_function() {
+        // `#elifdef` is a conditional like any other, and a walk that lists
+        // conditional kinds by name rather than asking one question drops
+        // whatever the list omits.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "#ifdef CONFIG_A\n\
+                 SYSCALL_DEFINE1(alpha, int, x)\n\
+                 {\n\
+                 \treturn one(x);\n\
+                 }\n\
+                 #elifdef CONFIG_B\n\
+                 SYSCALL_DEFINE1(beta, int, x)\n\
+                 {\n\
+                 \treturn two(x);\n\
+                 }\n\
+                 #endif\n",
+                std::path::Path::new("alpha.c"),
+                "hash",
+                None,
+            )
+            .unwrap();
+
+        let names: Vec<&String> = analysis.functions.iter().map(|f| &f.name).collect();
+        assert!(names.iter().any(|n| *n == "sys_alpha"), "{names:?}");
+        assert!(names.iter().any(|n| *n == "sys_beta"), "{names:?}");
+        let beta = analysis
+            .functions
+            .iter()
+            .find(|f| f.name == "sys_beta")
+            .unwrap();
+        assert!(
+            beta.calls
+                .as_ref()
+                .is_some_and(|c| c.iter().any(|n| n == "two")),
+            "{beta:?}"
+        );
+    }
+
+    #[test]
+    fn an_initcall_under_elifdef_is_recorded() {
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "#ifdef CONFIG_A\n\
+                 static int early_init(void) { return 0; }\n\
+                 subsys_initcall(early_init);\n\
+                 #elifdef CONFIG_B\n\
+                 static int late_init(void) { return 0; }\n\
+                 subsys_initcall(late_init);\n\
+                 #endif\n",
+                std::path::Path::new("init.c"),
+                "hash",
+                None,
+            )
+            .unwrap();
+        assert!(
+            analysis
+                .registrations
+                .iter()
+                .any(|r| r.target == "late_init" && r.container_type == "subsys_initcall"),
+            "{:?}",
+            analysis.registrations
         );
     }
 
