@@ -31,6 +31,16 @@ impl ArgumentFunctionStore {
         if arguments.is_empty() {
             return Ok(());
         }
+        // A batch spanning commits holds the same file at the same hash twice,
+        // and merge_insert refuses a batch with two source rows for one target.
+        let arguments = crate::database::one_row_per_key(arguments, |row| {
+            (
+                row.file_path.clone(),
+                row.git_file_hash.clone(),
+                row.byte_start,
+                row.target.clone(),
+            )
+        });
 
         let table = self
             .connection

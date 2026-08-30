@@ -77,6 +77,15 @@ impl FunctionStore {
         if functions.is_empty() {
             return Ok(());
         }
+        // A batch spanning commits holds the same file at the same hash twice,
+        // and merge_insert refuses a batch with two source rows for one target.
+        let functions = crate::database::one_row_per_key(functions, |row| {
+            (
+                row.name.clone(),
+                row.file_path.clone(),
+                row.git_file_hash.clone(),
+            )
+        });
 
         // Check for extremely large functions that might cause issues
         let max_body_size = 10 * 1024 * 1024; // 10MB limit per function
@@ -111,6 +120,15 @@ impl FunctionStore {
         if functions.is_empty() {
             return Ok(());
         }
+        // A batch spanning commits holds the same file at the same hash twice,
+        // and merge_insert refuses a batch with two source rows for one target.
+        let functions = crate::database::one_row_per_key(functions, |row| {
+            (
+                row.name.clone(),
+                row.file_path.clone(),
+                row.git_file_hash.clone(),
+            )
+        });
 
         let table = self.connection.open_table("functions").execute().await?;
 

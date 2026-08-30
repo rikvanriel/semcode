@@ -27,6 +27,17 @@ impl UnresolvedEdgeStore {
         if edges.is_empty() {
             return Ok(());
         }
+        // A batch spanning commits holds the same file at the same hash twice,
+        // and merge_insert refuses a batch with two source rows for one target.
+        let edges = crate::database::one_row_per_key(edges, |row| {
+            (
+                row.file_path.clone(),
+                row.git_file_hash.clone(),
+                row.line,
+                row.name.clone(),
+                row.direction.clone(),
+            )
+        });
         let table = self
             .connection
             .open_table("unresolved_edges")
