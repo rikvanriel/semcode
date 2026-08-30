@@ -5590,10 +5590,21 @@ impl TreeSitterAnalyzer {
     ) -> Vec<FunctionInfo> {
         use std::collections::HashMap;
 
-        let mut seen_functions = HashMap::<String, FunctionInfo>::new();
+        let mut seen_functions = HashMap::<(String, u32), FunctionInfo>::new();
 
         for func in raw_functions {
-            let key = func.name.clone();
+            // A name is not one definition. `sev_es_play_dead` is a function
+            // under CONFIG_HOTPLUG_CPU and a macro in the #else arm of the
+            // same file, and keeping one row per name discarded whichever
+            // arrived first along with every call it makes. Definitions are
+            // kept apart by where they are written; a declaration keeps the
+            // old behaviour of one row per name, since a file may repeat a
+            // prototype and those rows say nothing a reader needs twice.
+            let key = if crate::types::text_is_prototype(&func.body) {
+                (func.name.clone(), 0)
+            } else {
+                (func.name.clone(), func.line_start)
+            };
 
             if let Some(existing) = seen_functions.get(&key) {
                 // Skip if bodies are identical
@@ -5671,10 +5682,12 @@ impl TreeSitterAnalyzer {
     fn deduplicate_macros_within_file(&self, raw_macros: Vec<FunctionInfo>) -> Vec<FunctionInfo> {
         use std::collections::HashMap;
 
-        let mut seen_macros = HashMap::<String, FunctionInfo>::new();
+        let mut seen_macros = HashMap::<(String, u32), FunctionInfo>::new();
 
         for macro_info in raw_macros {
-            let key = macro_info.name.clone();
+            // Two arms of a conditional define the same macro differently, and
+            // both are what the file says.
+            let key = (macro_info.name.clone(), macro_info.line_start);
 
             if let Some(existing) = seen_macros.get(&key) {
                 // If bodies are identical, skip
@@ -8058,6 +8071,132 @@ mod macro_defined_tests {
         assert_eq!(handover.callee, "printk_index_wrap", "{handover:?}");
         assert_eq!(handover.enclosing_function, "printk", "{handover:?}");
         assert_eq!(handover.line, 2, "{handover:?}");
+    }
+
+    #[test]
+    fn a_function_and_a_macro_of_one_name_are_both_kept() {
+        // arch/x86/coco/sev/core.c defines sev_es_play_dead twice: a function
+        // under CONFIG_HOTPLUG_CPU and a macro in the #else arm. Keeping one
+        // row per name in a file discarded whichever arrived second, along
+        // with every call it makes, and which one that was depended on
+        // arrival order.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "#ifdef CONFIG_HOTPLUG_CPU\n\
+                 static void play_dead(void)\n\
+                 {\n\
+                 \tplay_dead_common();\n\
+                 \tsoft_restart_cpu();\n\
+                 }\n\
+                 #else\n\
+                 #define play_dead\tnative_play_dead\n\
+                 #endif\n",
+                std::path::Path::new("core.c"),
+                "hash",
+                None,
+            )
+            .unwrap();
+
+        let rows: Vec<&FunctionInfo> = analysis
+            .functions
+            .iter()
+            .chain(analysis.macros.iter())
+            .filter(|f| f.name == "play_dead")
+            .collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let body = rows
+            .iter()
+            .find(|f| f.line_start == 2)
+            .unwrap_or_else(|| panic!("{rows:?}"));
+        assert!(
+            body.calls
+                .clone()
+                .unwrap_or_default()
+                .iter()
+                .any(|c| c == "soft_restart_cpu"),
+            "{body:?}"
+        );
+    }
+
+    #[test]
+    fn a_prototype_does_not_displace_the_body_it_declares() {
+        // drivers/gpu/drm/radeon/r600.c declares r600_gpu_init at line 112 and
+        // defines it at 1989. The declaration arriving first is what used to
+        // decide that the body was not worth keeping.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "static void gpu_init(struct device *dev);\n\
+                 \n\
+                 static void other(struct device *dev)\n\
+                 {\n\
+                 \tgpu_init(dev);\n\
+                 }\n\
+                 \n\
+                 static void gpu_init(struct device *dev)\n\
+                 {\n\
+                 \tsetup_ring(dev);\n\
+                 \tsetup_irq(dev);\n\
+                 }\n",
+                std::path::Path::new("r600.c"),
+                "hash",
+                None,
+            )
+            .unwrap();
+
+        let body = analysis
+            .functions
+            .iter()
+            .filter(|f| f.name == "gpu_init")
+            .find(|f| f.calls.clone().unwrap_or_default().len() == 2)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{:?}",
+                    analysis
+                        .functions
+                        .iter()
+                        .filter(|f| f.name == "gpu_init")
+                        .map(|f| (f.line_start, f.calls.clone()))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(body.line_start, 8, "{body:?}");
+    }
+
+    #[test]
+    fn two_classes_may_define_the_same_method() {
+        // The same defect, and the reason it has to be fixed before a language
+        // with classes: every class in a Python file defines __init__, and one
+        // row per name in a file keeps one of them.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "class Alpha:\n\
+                 \tdef run(self):\n\
+                 \t\treturn alpha_step()\n\
+                 \n\
+                 class Beta:\n\
+                 \tdef run(self):\n\
+                 \t\treturn beta_step()\n",
+                std::path::Path::new("thing.py"),
+                "hash",
+                None,
+            )
+            .unwrap();
+
+        let runs: Vec<&FunctionInfo> = analysis
+            .functions
+            .iter()
+            .filter(|f| f.name == "run")
+            .collect();
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        let calls: Vec<String> = runs
+            .iter()
+            .flat_map(|f| f.calls.clone().unwrap_or_default())
+            .collect();
+        assert!(calls.iter().any(|c| c == "alpha_step"), "{calls:?}");
+        assert!(calls.iter().any(|c| c == "beta_step"), "{calls:?}");
     }
 
     #[test]

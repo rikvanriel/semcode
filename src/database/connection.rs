@@ -2483,13 +2483,13 @@ impl DatabaseManager {
         for (file_path, git_hash) in &resolved_hashes {
             match self.candidate_state(file_path, git_hash, git_sha) {
                 CandidateFile::Indexed => {
-                    if let Some(func) = self
-                        .function_store
-                        .find_by_name_file_and_hash(name, file_path, git_hash)
-                        .await?
-                    {
-                        matches.push(func);
-                    }
+                    // Every row, not the first: a file may define the name
+                    // twice, and asking for all of them is what this is for.
+                    matches.extend(
+                        self.function_store
+                            .find_all_by_name_file_and_hash(name, file_path, git_hash)
+                            .await?,
+                    );
                 }
                 CandidateFile::Edited => matches.extend(self.reparse_functions(file_path, name)),
                 CandidateFile::Deleted => {}

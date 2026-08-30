@@ -36,7 +36,10 @@ pub enum OptimizeOutcome {
 /// 9: a call in a macro body to one of the macro's own parameters is recorded
 ///    as an unresolved edge naming the parameter, instead of as a call to a
 ///    name no function has. A version 8 index holds the wrong edge.
-pub const SCHEMA_VERSION: u32 = 9;
+/// 10: a function and a macro of the same name in one file are two rows, keyed
+///     by line as well as by name. A version 9 index holds whichever the
+///     insert wrote last and nothing recording that the other exists.
+pub const SCHEMA_VERSION: u32 = 10;
 
 pub struct SchemaManager {
     connection: Connection,

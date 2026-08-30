@@ -44,10 +44,19 @@ fn one_per_key(functions: &[FunctionInfo]) -> Vec<FunctionInfo> {
     let mut seen = std::collections::HashSet::new();
     let mut kept = Vec::with_capacity(functions.len());
     for function in functions {
+        // Keyed by where it is written as well as by its name. A name is not
+        // one definition within a file: `sev_es_play_dead` is a function under
+        // CONFIG_HOTPLUG_CPU and a macro in the #else arm of the same file, and
+        // `r600_gpu_init` is a prototype at r600.c:112 and a body at 1989.
+        // Keeping the first row per name silently discarded the other, along
+        // with every call it makes -- and since the surviving one depended on
+        // which arrived first, the same tree indexed one way today and the
+        // other way tomorrow.
         let key = (
             function.name.clone(),
             function.file_path.clone(),
             function.git_file_hash.clone(),
+            function.line_start,
         );
         if seen.insert(key) {
             kept.push(function.clone());
@@ -84,6 +93,7 @@ impl FunctionStore {
                 row.name.clone(),
                 row.file_path.clone(),
                 row.git_file_hash.clone(),
+                row.line_start,
             )
         });
 
@@ -127,6 +137,7 @@ impl FunctionStore {
                 row.name.clone(),
                 row.file_path.clone(),
                 row.git_file_hash.clone(),
+                row.line_start,
             )
         });
 
@@ -239,7 +250,13 @@ impl FunctionStore {
         ])?;
 
         // Use merge_insert to handle duplicates
-        let mut merge_insert = table.merge_insert(&["name", "file_path", "git_file_hash"]);
+        // A name is not unique within a file. `sev_es_play_dead` is a function
+        // under CONFIG_HOTPLUG_CPU and a macro in the #else arm, both in
+        // arch/x86/coco/sev/core.c; keyed without the line, the two rows
+        // collide and one is lost with everything it calls. 2,446 names in
+        // Linux are defined as both a macro and a function in one file.
+        let mut merge_insert =
+            table.merge_insert(&["name", "file_path", "git_file_hash", "line_start"]);
         merge_insert
             .when_matched_update_all(None) // Update existing rows (prevents duplicates)
             .when_not_matched_insert_all(); // Insert new rows
@@ -336,7 +353,13 @@ impl FunctionStore {
         ])?;
 
         // Use merge_insert to handle duplicates
-        let mut merge_insert = table.merge_insert(&["name", "file_path", "git_file_hash"]);
+        // A name is not unique within a file. `sev_es_play_dead` is a function
+        // under CONFIG_HOTPLUG_CPU and a macro in the #else arm, both in
+        // arch/x86/coco/sev/core.c; keyed without the line, the two rows
+        // collide and one is lost with everything it calls. 2,446 names in
+        // Linux are defined as both a macro and a function in one file.
+        let mut merge_insert =
+            table.merge_insert(&["name", "file_path", "git_file_hash", "line_start"]);
         merge_insert
             .when_matched_update_all(None) // Update existing rows (prevents duplicates)
             .when_not_matched_insert_all(); // Insert new rows
@@ -412,6 +435,38 @@ impl FunctionStore {
     }
 
     /// Find function by name, file path, and exact git file hash - for targeted git-aware lookups
+    /// Every row for the name in that file at that content hash.
+    ///
+    /// A file defines a name more than once: a function under one arm of a
+    /// conditional and a macro under the other, a prototype and the body it
+    /// declares. Returning the first row makes the answer depend on storage
+    /// order, which is what hid the body of `sev_es_play_dead` behind the
+    /// `#define` in the #else arm.
+    pub async fn find_all_by_name_file_and_hash(
+        &self,
+        name: &str,
+        file_path: &str,
+        git_file_hash: &str,
+    ) -> Result<Vec<FunctionInfo>> {
+        let table = self.connection.open_table("functions").execute().await?;
+        let escaped_name = name.replace("'", "''");
+        let escaped_file_path = file_path.replace("'", "''");
+        let results = table
+            .query()
+            .only_if(format!(
+                "name = '{escaped_name}' AND file_path = '{escaped_file_path}'"
+            ))
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let functions = self.extract_functions_from_batches(&results).await?;
+        Ok(functions
+            .into_iter()
+            .filter(|f| f.git_file_hash == git_file_hash)
+            .collect())
+    }
+
     pub async fn find_by_name_file_and_hash(
         &self,
         name: &str,
