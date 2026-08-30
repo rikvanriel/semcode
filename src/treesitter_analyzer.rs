@@ -1147,6 +1147,24 @@ impl TreeSitterAnalyzer {
             Vec::new()
         };
 
+        // A fact inside a body a macro opens is found by two walks; the store
+        // keys rows by place, so the pair is one fact and a duplicate.
+        let dispatch_sites = Self::keep_innermost(
+            dispatch_sites,
+            |site| (site.byte_start, site.target.clone().unwrap_or_default()),
+            |site| site.caller_name.as_str(),
+        );
+        let registrations = Self::keep_innermost(
+            registrations,
+            |registration| (registration.byte_start, registration.target.clone()),
+            |registration| registration.enclosing_function.as_str(),
+        );
+        let argument_functions = Self::keep_innermost(
+            argument_functions,
+            |argument| (argument.byte_start, argument.target.clone()),
+            |argument| argument.enclosing_function.as_str(),
+        );
+
         Ok(FileAnalysis {
             functions,
             types,
@@ -1157,6 +1175,51 @@ impl TreeSitterAnalyzer {
             unresolved_edges,
             globals,
         })
+    }
+
+    /// One place in a file yields one row, attributed to whatever encloses it.
+    ///
+    /// A body a macro opens is not a `function_definition`, so a fact inside
+    /// it is found twice: once by the walk over the function the macro
+    /// defines, and once by the walk that collects what no function encloses.
+    /// `kargs.set_tid = set_tid` inside `SYSCALL_DEFINE2(clone3, ...)` was
+    /// recorded as a registration in `sys_clone3` and as one at file scope,
+    /// both at kernel/fork.c:3060. A row is keyed by its place in the file, so
+    /// the second is not another fact but the same one, and the database
+    /// refuses the pair rather than storing it:
+    ///
+    /// ```text
+    /// Ambiguous merge inserts are prohibited: multiple source rows match
+    /// the same target row on (file_path = "kernel/fork.c", ...)
+    /// ```
+    ///
+    /// The row naming what encloses the fact is the one worth keeping.
+    fn keep_innermost<T>(
+        rows: Vec<T>,
+        place: impl Fn(&T) -> (u64, String),
+        enclosing: impl Fn(&T) -> &str,
+    ) -> Vec<T> {
+        let mut best: HashMap<(u64, String), usize> = HashMap::new();
+        let mut keep: Vec<bool> = vec![true; rows.len()];
+        for (index, row) in rows.iter().enumerate() {
+            match best.get(&place(row)) {
+                Some(&previous) => {
+                    if enclosing(&rows[previous]).is_empty() && !enclosing(row).is_empty() {
+                        keep[previous] = false;
+                        best.insert(place(row), index);
+                    } else {
+                        keep[index] = false;
+                    }
+                }
+                None => {
+                    best.insert(place(row), index);
+                }
+            }
+        }
+        rows.into_iter()
+            .zip(keep)
+            .filter_map(|(row, keep)| keep.then_some(row))
+            .collect()
     }
 
     /// Extract all calls in a single tree traversal and return with byte positions
@@ -7995,6 +8058,37 @@ mod macro_defined_tests {
         assert_eq!(handover.callee, "printk_index_wrap", "{handover:?}");
         assert_eq!(handover.enclosing_function, "printk", "{handover:?}");
         assert_eq!(handover.line, 2, "{handover:?}");
+    }
+
+    #[test]
+    fn a_fact_inside_a_macro_defined_body_is_recorded_once() {
+        // The body a SYSCALL_DEFINE opens is not a function_definition, so the
+        // walk that collects what no function encloses finds this assignment
+        // too. Two rows for one place in one file is what the database calls
+        // an ambiguous merge, and it refuses the whole batch.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "SYSCALL_DEFINE2(clone3, struct clone_args __user *, uargs, size_t, size)\n\
+                 {\n\
+                 \tstruct kernel_clone_args kargs;\n\
+                 \n\
+                 \tkargs.set_tid = set_tid;\n\
+                 \treturn kernel_clone(&kargs);\n\
+                 }\n",
+                std::path::Path::new("fork.c"),
+                "hash",
+                None,
+            )
+            .unwrap();
+
+        let rows: Vec<_> = analysis
+            .registrations
+            .iter()
+            .filter(|r| r.target == "set_tid")
+            .collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].enclosing_function, "sys_clone3", "{rows:?}");
     }
 
     #[test]
