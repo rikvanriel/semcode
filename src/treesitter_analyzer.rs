@@ -1237,6 +1237,14 @@ impl TreeSitterAnalyzer {
             source_code.as_bytes(),
         );
 
+        // A statement the grammar read as a declaration holds calls the query
+        // cannot match, because it matched no call.
+        if language == Language::C {
+            for call in Self::calls_in_misparsed_declarations(tree, source_code) {
+                extraction.calls.push(call);
+            }
+        }
+
         while let Some(call_match) = matches.next() {
             let mut member: Option<tree_sitter::Node> = None;
             let mut receiver: Option<tree_sitter::Node> = None;
@@ -3215,6 +3223,167 @@ impl TreeSitterAnalyzer {
 
     /// Turn one `function_name` capture into a call site: the called name and
     /// the byte range it occupies, which is what maps a call to its caller.
+    /// Calls in a statement the grammar read as a declaration.
+    ///
+    /// An attribute macro inside a cast is not a type the grammar knows, so
+    ///
+    /// ```text
+    /// __raw_writel((u32 __force)__cpu_to_le32(value), addr);
+    /// ```
+    ///
+    /// parses as a declaration: `__raw_writel` becomes a `type_identifier` and
+    /// `__cpu_to_le32(value)` becomes a `function_declarator`. A declarator is
+    /// not a call, so both edges were dropped without a word. Rather than
+    /// rewrite the source to make the cast parse -- which needs a list of
+    /// annotations that will always be short by one -- the calls are read out
+    /// of the shape the grammar produced.
+    ///
+    /// The ERROR node is what separates this from a declaration that means
+    /// what it says: `extern void ret_from_fork(void);` and
+    /// `static DEFINE_SPINLOCK(lock);` inside a body parse cleanly and are left
+    /// alone. Linux 0595459f has 658 of the broken shape and 1,045 of the
+    /// clean one.
+    fn calls_in_misparsed_declarations(
+        tree: &Tree,
+        source_code: &str,
+    ) -> Vec<(String, usize, usize)> {
+        let mut found = Vec::new();
+        let mut stack = vec![(tree.root_node(), false)];
+        while let Some((node, in_body)) = stack.pop() {
+            let inside = in_body || node.kind() == "compound_statement";
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push((child, inside));
+            }
+            // A declaration at file scope is a declaration.
+            if !inside || node.kind() != "declaration" {
+                continue;
+            }
+            let mut cursor = node.walk();
+            let declares_something_callable = node.children(&mut cursor).any(|child| {
+                matches!(
+                    child.kind(),
+                    "function_declarator" | "parenthesized_declarator"
+                )
+            });
+            if !declares_something_callable || !Self::holds_an_error(node) {
+                continue;
+            }
+
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "type_identifier" {
+                    Self::push_misparsed_call(child, source_code, &mut found);
+                }
+            }
+            let mut inner = vec![node];
+            while let Some(current) = inner.pop() {
+                let mut cursor = current.walk();
+                for child in current.children(&mut cursor) {
+                    inner.push(child);
+                }
+                if current.kind() != "function_declarator" {
+                    continue;
+                }
+                if let Some(name) = current.child_by_field_name("declarator") {
+                    if name.kind() == "identifier" {
+                        Self::push_misparsed_call(name, source_code, &mut found);
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    fn holds_an_error(node: tree_sitter::Node) -> bool {
+        let mut stack = vec![node];
+        while let Some(current) = stack.pop() {
+            if current.is_error() {
+                return true;
+            }
+            let mut cursor = current.walk();
+            for child in current.children(&mut cursor) {
+                stack.push(child);
+            }
+        }
+        false
+    }
+
+    /// A name read out of a misparse, unless it is not a call.
+    ///
+    /// Error recovery leaves debris: a keyword, a basic type, or a build
+    /// assertion that emits no code. Recording those as edges would add noise
+    /// to the very thing this exists to make trustworthy -- 104 `BUILD_BUG_ON`
+    /// and 60 `sizeof_field` among 933 names on a Linux tree.
+    fn push_misparsed_call(
+        node: tree_sitter::Node,
+        source_code: &str,
+        found: &mut Vec<(String, usize, usize)>,
+    ) {
+        let name = &source_code[node.byte_range()];
+        if name.is_empty()
+            || Self::is_c_keyword(name)
+            || Self::names_a_type(name)
+            || Self::emits_no_code(name)
+        {
+            return;
+        }
+        found.push((name.to_string(), node.start_byte(), node.end_byte()));
+    }
+
+    /// A type name, which error recovery hands over as readily as a callee:
+    /// `u8`, `unsigned`, `size_t`.
+    fn names_a_type(name: &str) -> bool {
+        matches!(
+            name,
+            "void"
+                | "char"
+                | "short"
+                | "int"
+                | "long"
+                | "unsigned"
+                | "signed"
+                | "float"
+                | "double"
+                | "bool"
+                | "_Bool"
+                | "size_t"
+                | "ssize_t"
+                | "ptrdiff_t"
+                | "intptr_t"
+                | "uintptr_t"
+                | "off_t"
+                | "loff_t"
+        ) || name.starts_with("__u")
+            || name.starts_with("__s")
+            || matches!(
+                name,
+                "u8" | "u16" | "u32" | "u64" | "s8" | "s16" | "s32" | "s64"
+            )
+    }
+
+    /// Names that state something at compile time and call nothing.
+    fn emits_no_code(name: &str) -> bool {
+        name.starts_with("__builtin_")
+            || name.starts_with("__compiletime")
+            || name.starts_with("BUILD_BUG")
+            || matches!(
+                name,
+                "offsetof"
+                    | "offsetofend"
+                    | "sizeof_field"
+                    | "static_assert"
+                    | "typecheck"
+                    | "__must_be_array"
+                    | "__same_type"
+                    | "__is_constexpr"
+                    | "ARRAY_SIZE"
+                    | "asmlinkage"
+                    | "__aligned"
+                    | "__packed"
+            )
+    }
+
     fn call_site_from_capture(
         node: tree_sitter::Node,
         source_code: &str,
@@ -8197,6 +8366,97 @@ mod macro_defined_tests {
             .collect();
         assert!(calls.iter().any(|c| c == "alpha_step"), "{calls:?}");
         assert!(calls.iter().any(|c| c == "beta_step"), "{calls:?}");
+    }
+
+    #[test]
+    fn a_call_the_grammar_read_as_a_declaration_is_still_a_call() {
+        // `__force` is not a type the grammar knows, so the cast makes the
+        // whole statement parse as a declaration: `__raw_writel` becomes a
+        // type_identifier and `__cpu_to_le32(value)` a function_declarator.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "static inline void writel(u32 value, volatile void __iomem *addr)\n\
+                 {\n\
+                 \t__io_bw();\n\
+                 \t__raw_writel((u32 __force)__cpu_to_le32(value), addr);\n\
+                 }\n",
+                std::path::Path::new("io.h"),
+                "hash",
+                None,
+            )
+            .unwrap();
+
+        let writel = analysis
+            .functions
+            .iter()
+            .find(|f| f.name == "writel")
+            .unwrap();
+        let calls = writel.calls.clone().unwrap_or_default();
+        for expected in ["__io_bw", "__raw_writel", "__cpu_to_le32"] {
+            assert!(calls.iter().any(|c| c == expected), "{calls:?}");
+        }
+    }
+
+    #[test]
+    fn a_build_assertion_read_out_of_a_misparse_is_not_a_call() {
+        // Error recovery hands over whatever it has. A build assertion emits
+        // no code, and recording it would add noise to the thing this exists
+        // to make trustworthy.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "static void check(struct header *h)\n\
+                 {\n\
+                 \tBUILD_BUG_ON(offsetof(typeof(*h), count) != 0);\n\
+                 }\n",
+                std::path::Path::new("check.c"),
+                "hash",
+                None,
+            )
+            .unwrap();
+        let calls = analysis
+            .functions
+            .iter()
+            .find(|f| f.name == "check")
+            .unwrap()
+            .calls
+            .clone()
+            .unwrap_or_default();
+        for unwanted in ["BUILD_BUG_ON", "offsetof", "typeof"] {
+            assert!(!calls.iter().any(|c| c == unwanted), "{calls:?}");
+        }
+    }
+
+    #[test]
+    fn a_declaration_that_parses_stays_a_declaration() {
+        // `extern void ret_from_fork(void);` inside a body means what it says.
+        // The ERROR node is what separates the two, and 1,045 statements on a
+        // Linux tree are of this kind.
+        let mut analyzer = TreeSitterAnalyzer::new().unwrap();
+        let analysis = analyzer
+            .analyze_source_with_metadata(
+                "static void plain(void)\n\
+                 {\n\
+                 \textern void ret_from_fork(void);\n\
+                 \n\
+                 \thelper();\n\
+                 }\n",
+                std::path::Path::new("plain.c"),
+                "hash",
+                None,
+            )
+            .unwrap();
+        let calls = analysis
+            .functions
+            .iter()
+            .find(|f| f.name == "plain")
+            .unwrap()
+            .calls
+            .clone()
+            .unwrap_or_default();
+        assert!(calls.iter().any(|c| c == "helper"), "{calls:?}");
+        assert!(!calls.iter().any(|c| c == "ret_from_fork"), "{calls:?}");
     }
 
     #[test]
