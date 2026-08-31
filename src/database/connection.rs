@@ -1042,6 +1042,107 @@ impl DatabaseManager {
             .collect())
     }
 
+    /// Calls a function makes through its own parameters, with the functions
+    /// its callers hand to those positions.
+    ///
+    /// The join is `(callee, argument_index)`, the second axis beside
+    /// `(container_type, member)`: a callback parameter is a slot, and its
+    /// fills are the arguments at call sites. A candidate is reported only
+    /// when the tree defines a function of that name, since an argument may
+    /// name a value rather than a function.
+    pub async fn find_parameter_dispatch_git_aware(
+        &self,
+        function_name: &str,
+        git_sha: &str,
+    ) -> Result<Vec<crate::types::ParameterDispatch>> {
+        use crate::database::resolution::at_revision;
+
+        let Some(function) = self.find_function_git_aware(function_name, git_sha).await? else {
+            return Ok(Vec::new());
+        };
+        let positions: std::collections::HashMap<String, u32> = function
+            .parameters
+            .iter()
+            .enumerate()
+            .map(|(index, parameter)| (parameter.name.clone(), index as u32))
+            .collect();
+        if positions.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let manifest = self.git_manifest_cached(git_sha).await?;
+        let sites = at_revision(
+            self.dispatch_site_store
+                .find_by_caller(function_name)
+                .await?,
+            &manifest,
+            |s| (s.file_path.as_str(), s.git_file_hash.as_str()),
+        );
+        let handed = at_revision(
+            self.argument_function_store
+                .find_by_callee(function_name)
+                .await?,
+            &manifest,
+            |a| (a.file_path.as_str(), a.git_file_hash.as_str()),
+        );
+        if sites.is_empty() || handed.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut out = Vec::new();
+        for site in sites {
+            if !matches!(
+                site.kind,
+                crate::types::DispatchKind::PointerParam | crate::types::DispatchKind::PointerDeref
+            ) {
+                continue;
+            }
+            let Some(name) = site.receiver_expr.as_deref() else {
+                continue;
+            };
+            let Some(&position) = positions.get(name) else {
+                continue;
+            };
+            let mut candidates: Vec<(String, String, u32)> = Vec::new();
+            for argument in handed.iter().filter(|a| a.argument_index == position) {
+                if candidates
+                    .iter()
+                    .any(|(name, _, _)| *name == argument.target)
+                {
+                    continue;
+                }
+                // An argument names a value as readily as a function; the
+                // functions table decides which this is.
+                if self
+                    .find_function_git_aware(&argument.target, git_sha)
+                    .await?
+                    .is_none()
+                {
+                    continue;
+                }
+                candidates.push((
+                    argument.target.clone(),
+                    argument.file_path.clone(),
+                    argument.line,
+                ));
+            }
+            if candidates.is_empty() {
+                continue;
+            }
+            candidates.sort();
+            out.push(crate::types::ParameterDispatch {
+                caller_name: function_name.to_string(),
+                parameter: name.to_string(),
+                position,
+                file_path: site.file_path.clone(),
+                line: site.line,
+                candidates,
+            });
+        }
+        out.sort_by_key(|d| (d.line, d.parameter.clone()));
+        Ok(out)
+    }
+
     /// Every call handed this name.
     pub async fn find_argument_functions_of(
         &self,

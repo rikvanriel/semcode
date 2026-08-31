@@ -155,6 +155,56 @@ impl ArgumentFunctionStore {
         Ok(out)
     }
 
+    /// Everything handed to a call, at each position.
+    ///
+    /// The other half of a call through a parameter: `fn(...)` inside `F`
+    /// where `fn` is F's parameter has no struct member to join on, and what
+    /// it can reach is whatever F's own callers pass at that position.
+    pub async fn find_by_callee(&self, callee: &str) -> Result<Vec<ArgumentFunction>> {
+        let table = self
+            .connection
+            .open_table("argument_functions")
+            .execute()
+            .await?;
+        let escaped = callee.replace('\'', "''");
+        let batches = table
+            .query()
+            .only_if(format!("callee = '{escaped}'"))
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut out = Vec::new();
+        for batch in &batches {
+            let target = get_column::<StringArray>(batch, "target")?;
+            let callee = get_column::<StringArray>(batch, "callee")?;
+            let index = get_column::<arrow::array::Int64Array>(batch, "argument_index")?;
+            let address = get_column::<arrow::array::BooleanArray>(batch, "taken_address")?;
+            let file_path = get_column::<StringArray>(batch, "file_path")?;
+            let git_file_hash = get_column::<StringArray>(batch, "git_file_hash")?;
+            let byte_start = get_column::<arrow::array::Int64Array>(batch, "byte_start")?;
+            let line = get_column::<arrow::array::Int64Array>(batch, "line")?;
+            let enclosing = get_column::<StringArray>(batch, "enclosing_function")?;
+            for row in 0..batch.num_rows() {
+                out.push(ArgumentFunction {
+                    target: target.value(row).to_string(),
+                    callee: callee.value(row).to_string(),
+                    argument_index: index.value(row) as u32,
+                    taken_address: address.value(row),
+                    subject_type: None,
+                    subject_member: None,
+                    file_path: file_path.value(row).to_string(),
+                    git_file_hash: git_file_hash.value(row).to_string(),
+                    byte_start: byte_start.value(row) as u64,
+                    line: line.value(row) as u32,
+                    enclosing_function: enclosing.value(row).to_string(),
+                });
+            }
+        }
+        Ok(out)
+    }
+
     /// Every call that was handed this name.
     pub async fn find_by_target(&self, target: &str) -> Result<Vec<ArgumentFunction>> {
         let table = self

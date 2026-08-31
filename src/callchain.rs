@@ -820,6 +820,33 @@ pub async fn show_callees_to_writer(
 
     match func_opt {
         Some(func) => {
+            // A call through one of this function's own parameters reaches
+            // whatever its callers hand to that position. Nothing is
+            // registered in a struct member, so the site would otherwise read
+            // as a dead end.
+            for dispatch in db.find_parameter_dispatch_git_aware(name, git_sha).await? {
+                writeln!(
+                    writer,
+                    "{} {}:{} calls through {} (parameter {}), which its callers hand:",
+                    "Through a parameter:".bold().green(),
+                    dispatch.file_path.bright_black(),
+                    dispatch.line,
+                    dispatch.parameter.cyan(),
+                    dispatch.position
+                )?;
+                for (candidate, file, line) in dispatch.candidates.iter().take(12) {
+                    writeln!(
+                        writer,
+                        "  {} {}",
+                        candidate.cyan(),
+                        format!("({file}:{line})").bright_black()
+                    )?;
+                }
+                if dispatch.candidates.len() > 12 {
+                    writeln!(writer, "  ... and {} more", dispatch.candidates.len() - 12)?;
+                }
+            }
+
             // An edge the index cannot record is still an edge. Printing the
             // callees it does have and stopping there says the rest is not
             // there; naming the mechanism and where to look says it is

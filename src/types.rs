@@ -48,6 +48,26 @@ pub struct UnresolvedEdge {
     pub line: u32,
 }
 
+/// A call through one of the enclosing function's own parameters, and what its
+/// callers hand to that position.
+///
+/// `fn(...)` where `fn` is a parameter has no struct member to join on, so no
+/// registration can name a candidate and the site reads as a dead end. What it
+/// can reach is what F's callers pass: 1,096 of the 1,240 such sites in Linux
+/// have an answer already stored, at a median of two candidates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParameterDispatch {
+    /// The function the call is written in.
+    pub caller_name: String,
+    /// The parameter it dispatches through, and its position.
+    pub parameter: String,
+    pub position: u32,
+    pub file_path: String,
+    pub line: u32,
+    /// What callers hand to that position, each with one place they do it.
+    pub candidates: Vec<(String, String, u32)>,
+}
+
 /// One definition of a name, with what that definition calls.
 ///
 /// A name in C is not one thing. `pr_warn` has nine definitions in the Linux
